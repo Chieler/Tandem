@@ -114,6 +114,76 @@ same "send to missing agent" "$(txt "$out")" "agent nope not found"
 out=$(rpc "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send","arguments":{"to":"b","text":"x"}}}' | tail -n 1)
 same "send outside tmux" "$(txt "$out")" "cntctr is not running inside a tmux pane"
 
+# ---- reply and blocking send ----
+S=$(newpane s)   # fresh sender, so screen checks only see this section's traffic
+out=$(call "$S" send '{"to":"b","text":"async question"}')
+id=$(txt "$out" | sed 's/sent id=//')
+out=$(call "$B" reply "{\"id\":\"$id\",\"text\":\"async answer\"}")
+same "reply ok" "$(txt "$out")" ok
+expect_screen "reply header lands in sender pane" "$S" "[cntctr reply from=b id=$id]"
+expect_screen "reply text lands in sender pane" "$S" "async answer"
+out=$(call "$B" reply "{\"id\":\"$id\",\"text\":\"again\"}")
+same "second reply to same id rejected" "$(txt "$out")" "unknown id $id"
+
+call "$S" send '{"to":"b","text":"blocking question","wait":true,"timeout":10}' > "$TMPD/block" &
+expect_screen "blocking send delivered" "$B" "blocking question"
+want=$'multi\nline "quoted" back\\slash ünï'
+call "$B" reply "$(jq -nc --arg id "$(lastid "$B")" --arg text "$want" '{id:$id,text:$text}')" >/dev/null
+wait
+same "blocking send returns the exact reply" "$(txt "$(cat "$TMPD/block")")" "$want"
+refute "blocking reply not also typed into sender" "$(screen "$S")" "back\\slash"
+
+call "$S" send '{"to":"b","text":"send me a lot","wait":true,"timeout":10}' > "$TMPD/big" &
+expect_screen "big request delivered" "$B" "send me a lot"
+big=$(head -c 100000 /dev/zero | tr '\0' x)
+call "$B" reply "$(jq -nc --arg id "$(lastid "$B")" --arg text "$big" '{id:$id,text:$text}')" >/dev/null
+wait
+got=$(txt "$(cat "$TMPD/big")")
+same "100 KB reply round-trips" "${#got}" 100000
+
+out=$(call "$S" send '{"to":"b","text":"slow question","wait":true,"timeout":1}')
+check "blocking send times out" "$(txt "$out")" "timed out; reply will arrive in your pane (id="
+id=$(txt "$out" | sed 's/.*id=\([0-9a-f]*\))$/\1/')
+out=$(call "$B" reply "{\"id\":\"$id\",\"text\":\"late answer\"}")
+same "late reply ok" "$(txt "$out")" ok
+expect_screen "late reply typed into sender pane" "$S" "[cntctr reply from=b id=$id]"
+expect_screen "late reply text" "$S" "late answer"
+
+C=$(newpane c)
+{ printf '%s\n' "$INIT"
+  printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send","arguments":{"to":"b","text":"first of two","wait":true,"timeout":10}}}'
+  printf '%s\n' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"send","arguments":{"to":"c","text":"second of two","wait":true,"timeout":10}}}'
+} | TMUX_PANE=$S "$BIN" > "$TMPD/pair" &
+expect_screen "first concurrent send delivered" "$B" "first of two"
+expect_screen "second concurrent send delivered" "$C" "second of two"
+call "$C" reply "{\"id\":\"$(lastid "$C")\",\"text\":\"answer two\"}" >/dev/null
+call "$B" reply "{\"id\":\"$(lastid "$B")\",\"text\":\"answer one\"}" >/dev/null
+wait
+same "concurrent call 2" "$(jq -r 'select(.id==2) | .result.content[0].text' "$TMPD/pair")" "answer one"
+same "concurrent call 3" "$(jq -r 'select(.id==3) | .result.content[0].text' "$TMPD/pair")" "answer two"
+
+D=$(newpane d)
+call "$S" send '{"to":"d","text":"never answered","wait":true,"timeout":30}' > "$TMPD/dead" &
+expect_screen "delivered to d" "$D" "never answered"
+# the paste echoes before Enter is sent; cat printing the hint line again means Enter landed
+for _ in $(seq 50); do [ "$(screen "$D" | grep -c 'when done')" -ge 2 ] && break; sleep 0.1; done
+t kill-pane -t "$D"
+wait
+out=$(cat "$TMPD/dead")
+check "worker exit ends blocking send" "$(txt "$out")" "agent d exited before replying (id="
+same "worker exit is a tool error" "$(iserr "$out")" true
+
+Z=$(newpane z)
+out=$(call "$Z" send '{"to":"b","text":"from a pane about to close"}')
+id=$(txt "$out" | sed 's/sent id=//')
+t kill-pane -t "$Z"
+out=$(call "$B" reply "{\"id\":\"$id\",\"text\":\"too late\"}")
+same "reply to closed sender" "$(txt "$out")" "sender gone"
+out=$(call "$B" reply '{"id":"deadbeef","text":"x"}')
+same "reply to unknown id" "$(txt "$out")" "unknown id deadbeef"
+out=$(call "$B" reply '{"id":"../../x","text":"x"}')
+same "reply rejects malformed id" "$(txt "$out")" "unknown id ../../x"
+
 # ---- summary ----
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

@@ -47,6 +47,18 @@ static const char *sarg(json_object *o, const char *key) {
         ? json_object_get_string(v) : NULL;
 }
 
+static int barg(json_object *o, const char *key) {
+    json_object *v;
+    return json_object_object_get_ex(o, key, &v) && json_object_get_boolean(v);
+}
+
+/* Blocking-wait timeout in seconds: default 600, clamped to 1 s .. 1 day. */
+static int targ(json_object *o) {
+    json_object *v;
+    int t = json_object_object_get_ex(o, "timeout", &v) ? json_object_get_int(v) : 600;
+    return t < 1 ? 1 : t > 86400 ? 86400 : t;
+}
+
 /* ---- processes ---- */
 
 /* Close-on-exec pipe, so children forked by other threads don't inherit it and
@@ -299,6 +311,95 @@ static char *envelope(const char *id, const char *text) {
     return fmt("[cntctr from=%s id=%s]\n%s\n[when done: cntctr reply id=%s]", self_name, id, text, id);
 }
 
+/* Nonzero if `pane` exists and its process is still running. */
+static int pane_alive(const char *pane) {
+    char *out;
+    int alive = TMUX(NULL, &out, "display", "-p", "-t", pane, "#{pane_dead}") == 0 && strcmp(out, "0") == 0;
+    free(out);
+    return alive;
+}
+
+/* Value of server option `name` (caller frees), or NULL if unset. */
+static char *sopt_get(const char *name) {
+    char *out;
+    if (TMUX(NULL, &out, "show", "-sv", name) == 0) return out;
+    free(out);
+    return NULL;
+}
+
+/* Block until channel `chan` is signalled (1) or `secs` pass (0). */
+static int wait_signal(const char *chan, int secs) {
+    int p[2];
+    pthread_mutex_lock(&fork_mu);
+    if (cloexec_pipe(p) < 0) {
+        pthread_mutex_unlock(&fork_mu);
+        return 0;
+    }
+    pid_t pid = start((const char *[]){"tmux", "wait-for", chan, NULL}, -1, p[1]);
+    pthread_mutex_unlock(&fork_mu);
+    close(p[1]);
+    struct pollfd pfd = {p[0], POLLIN, 0};
+    int ready;
+    while ((ready = poll(&pfd, 1, secs * 1000)) < 0 && errno == EINTR) {}
+    close(p[0]);
+    if (pid < 0) return 0;
+    if (ready == 0) kill(pid, SIGTERM);   /* its pipe closes only when it exits, so silence means still waiting */
+    return reap(pid) == 0 && ready > 0;
+}
+
+static int buffer_exists(const char *buf) {
+    char *err = TMUXE(NULL, "show-buffer", "-b", buf);
+    free(err);
+    return err == NULL;
+}
+
+/* Read and delete a paste buffer. The delete is the claim: when a timed-out
+ * waiter and a replier race for one reply, only the side whose delete-buffer
+ * succeeds delivers it, so every reply arrives exactly once. */
+static char *buffer_take(const char *buf) {
+    char *text, *err;
+    if (TMUX(NULL, &text, "show-buffer", "-b", buf) != 0) {
+        free(text);
+        return NULL;
+    }
+    if ((err = TMUXE(NULL, "delete-buffer", "-b", buf))) {
+        free(err);
+        free(text);
+        return NULL;
+    }
+    return text;
+}
+
+#define WAIT_SLICE 5   /* seconds between checks for a lost signal or a dead worker */
+
+/* Block for the reply to message `id`, sent to agent `who` in `pane`. */
+static int await_reply(const char *id, const char *pane, const char *who, int timeout, char **res) {
+    char chan[32], buf[40], opt[48];
+    snprintf(chan, sizeof chan, "cntctr-%s", id);
+    snprintf(buf, sizeof buf, "cntctr-reply-%s", id);
+    snprintf(opt, sizeof opt, "@cntctr_wait_%s", id);
+    int gone = 0;
+    for (time_t end = time(NULL) + timeout;;) {
+        int left = (int)(end - time(NULL));
+        if (left <= 0) break;
+        /* tmux keeps a killed wait-for queued, and it can swallow a later signal,
+         * so the buffer is checked after every slice as well. */
+        if (wait_signal(chan, left < WAIT_SLICE ? left : WAIT_SLICE) || buffer_exists(buf)) break;
+        if ((gone = !pane_alive(pane))) break;
+    }
+    free(TMUXE(NULL, "set", "-su", opt));   /* stop repliers from signalling us, then claim */
+    char *text = buffer_take(buf);
+    if (text) {
+        untrack(id);
+        return ok(res, text);
+    }
+    if (gone) {
+        untrack(id);
+        return fail(res, fmt("agent %s exited before replying (id=%s)", who, id));
+    }
+    return ok(res, fmt("timed out; reply will arrive in your pane (id=%s)", id));
+}
+
 /* ---- tools ---- */
 
 static int tool_list(json_object *args, char **res) {
@@ -327,18 +428,65 @@ static int tool_send(json_object *a, char **res) {
     if (!to || !text) return fail(res, fmt("send needs 'to' and 'text'"));
     char *pane = find_agent(to);
     if (!pane) return fail(res, fmt("agent %s not found", to));
+    int wait = barg(a, "wait");
     char id[9], *env, *err;
     new_id(id);
-    track(id, 0);
+    track(id, wait);
     env = envelope(id, text);
     err = inject(pane, to, env);
     free(env);
-    free(pane);
     if (err) {
         untrack(id);
+        free(pane);
         return fail(res, err);
     }
-    return ok(res, fmt("sent id=%s", id));
+    int r = wait ? await_reply(id, pane, to, targ(a), res) : ok(res, fmt("sent id=%s", id));
+    free(pane);
+    return r;
+}
+
+static int tool_reply(json_object *a, char **res) {
+    const char *id = sarg(a, "id"), *text = sarg(a, "text");
+    if (!id || !text) return fail(res, fmt("reply needs 'id' and 'text'"));
+    char opt[48], buf[40], chan[32], *sender = NULL, *waiting, *env, *err;
+    snprintf(opt, sizeof opt, "@cntctr_from_%s", id);
+    if (strlen(id) != 8 || strspn(id, "0123456789abcdef") != 8 || !(sender = sopt_get(opt)))
+        return fail(res, fmt("unknown id %s", id));
+
+    /* Write the buffer before checking the wait flag; await_reply clears the flag
+     * before claiming. That ordering means no reply is lost. */
+    snprintf(buf, sizeof buf, "cntctr-reply-%s", id);
+    if ((err = TMUXE(text, "load-buffer", "-b", buf, "-"))) {
+        free(sender);
+        return fail(res, err);
+    }
+    snprintf(opt, sizeof opt, "@cntctr_wait_%s", id);
+    if ((waiting = sopt_get(opt))) {   /* sender is blocked in await_reply: wake it */
+        free(waiting);
+        free(sender);
+        snprintf(chan, sizeof chan, "cntctr-%s", id);
+        free(TMUXE(NULL, "wait-for", "-S", chan));
+        return ok(res, fmt("ok"));
+    }
+    /* Nobody waiting: type the reply into the sender's pane, unless a timed-out
+     * waiter claimed the buffer first. */
+    if ((err = TMUXE(NULL, "delete-buffer", "-b", buf))) {
+        free(err);
+        free(sender);
+        return ok(res, fmt("ok"));
+    }
+    if (!pane_alive(sender)) {
+        free(sender);
+        untrack(id);
+        return fail(res, fmt("sender gone"));
+    }
+    env = fmt("[cntctr reply from=%s id=%s]\n%s", self_name, id, text);
+    err = inject(sender, "sender", env);
+    free(env);
+    free(sender);
+    if (err) return fail(res, err);   /* still tracked, so the replier can retry */
+    untrack(id);
+    return ok(res, fmt("ok"));
 }
 
 /* ---- dispatch ---- */
@@ -348,6 +496,8 @@ static const struct { const char *name; tool_fn fn; int needs_pane; } TOOL_FNS[]
     {"list", tool_list, 0},
 
     {"send", tool_send, 1},
+
+    {"reply", tool_reply, 1},
 
     {NULL, NULL, 0},
 };
