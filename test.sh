@@ -184,6 +184,48 @@ same "reply to unknown id" "$(txt "$out")" "unknown id deadbeef"
 out=$(call "$B" reply '{"id":"../../x","text":"x"}')
 same "reply rejects malformed id" "$(txt "$out")" "unknown id ../../x"
 
+# ---- spawn and kill ----
+cat > "$TMPD/bin/claude" <<'EOF'
+#!/bin/sh
+# Fake harness: show the task, then answer it through cntctr like a worker would.
+[ "$1" = -i ] && shift                               # agy passes its first prompt via -i
+[ "$(basename "$0")" = codex ] && unset TMUX_PANE    # Codex hides TMUX_PANE from MCP servers
+printf '%s\n' "$1"
+id=$(printf '%s\n' "$1" | sed -n 's/^\[cntctr from=[^ ]* id=\([0-9a-f]\{8\}\)\]$/\1/p')
+sleep 0.5                                            # real harnesses take seconds to start
+printf '%s\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"reply","arguments":{"id":"%s","text":"done %s"}}}\n' \
+    "$INIT" "$id" "$id" | "$BIN" >/dev/null
+exec cat
+EOF
+chmod +x "$TMPD/bin/claude"
+ln -s claude "$TMPD/bin/codex"
+ln -s claude "$TMPD/bin/agy"
+
+L=$(newpane lead)
+out=$(call "$L" spawn '{"harness":"claude","name":"w1","task":"build it","wait":true,"timeout":10}')
+check "spawn wait=true returns the worker's reply" "$(txt "$out")" "done "
+check "list shows spawned worker" "$(txt "$(call "$L" list '{}')")" "w1 claude %"
+out=$(call "$L" spawn '{"harness":"agy","name":"w2","task":"async job"}')
+check "spawn returns at once" "$(txt "$out")" "spawned w2 in %"
+id=$(txt "$out" | sed 's/.*id=//')
+expect_screen "agy worker (-i prompt) replies into leader pane" "$L" "[cntctr reply from=w2 id=$id]"
+out=$(call "$L" spawn '{"harness":"codex","name":"w3","task":"codex job"}')
+id=$(txt "$out" | sed 's/.*id=//')
+expect_screen "codex worker finds its name without TMUX_PANE" "$L" "[cntctr reply from=w3 id=$id]"
+out=$(call "$L" spawn "$(jq -nc --arg t "\$(touch $TMPD/pwned)" '{harness:"claude",name:"w4",task:$t}')")
+W4=$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')
+expect_screen "task text reaches the worker literally" "$W4" "\$(touch $TMPD/pwned)"
+if [ -e "$TMPD/pwned" ]; then bad "spawn task was run by a shell"; else ok_; fi
+out=$(call "$L" spawn '{"harness":"claude","name":"w1","task":"x"}')
+same "duplicate spawn name" "$(txt "$out")" "agent w1 already exists"
+out=$(call "$L" spawn '{"harness":"vim","name":"w9","task":"x"}')
+same "unknown harness" "$(txt "$out")" "unknown harness vim"
+
+same "kill worker" "$(txt "$(call "$L" kill '{"name":"w1"}')")" ok
+refute "killed worker gone from list" "$(txt "$(call "$L" list '{}')")" "w1 claude"
+same "kill self refused" "$(txt "$(call "$L" kill '{"name":"lead"}')")" "cannot kill yourself"
+same "kill missing agent" "$(txt "$(call "$L" kill '{"name":"nope"}')")" "agent nope not found"
+
 # ---- summary ----
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

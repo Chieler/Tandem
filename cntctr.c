@@ -489,6 +489,55 @@ static int tool_reply(json_object *a, char **res) {
     return ok(res, fmt("ok"));
 }
 
+static int tool_spawn(json_object *a, char **res) {
+    const char *harness = sarg(a, "harness"), *name = sarg(a, "name"), *task = sarg(a, "task"), *cwd = sarg(a, "cwd");
+    if (!harness || !name || !*name || !task) return fail(res, fmt("spawn needs 'harness', 'name' and 'task'"));
+    int agy = strcmp(harness, "agy") == 0;
+    if (!agy && strcmp(harness, "claude") != 0 && strcmp(harness, "codex") != 0)
+        return fail(res, fmt("unknown harness %s", harness));
+    char *pane = find_agent(name);
+    if (pane) {
+        free(pane);
+        return fail(res, fmt("agent %s already exists", name));
+    }
+    char dir[4096];
+    if (!cwd) cwd = getcwd(dir, sizeof dir) ? dir : ".";
+    int wait = barg(a, "wait");
+    char id[9];
+    new_id(id);
+    track(id, wait);
+    char *env = envelope(id, task);
+    /* Separate argv entries, so tmux execs the harness without a shell. agy takes
+     * its first prompt through -i; claude and codex take it as a plain argument. */
+    int rc = run(NULL, &pane, (const char *[]){"tmux", "new-window", "-d", "-n", name, "-c", cwd, "-P", "-F", "#{pane_id}",
+                                              harness, agy ? "-i" : env, agy ? env : NULL, NULL});
+    free(env);
+    if (rc != 0) {
+        untrack(id);
+        return fail(res, pane);
+    }
+    /* ponytail: a worker that calls cntctr before these tags land names itself
+     * <client>-<n>. Real harnesses take seconds to start; tag via new-window -e if that changes. */
+    free(TMUXE(NULL, "set", "-p", "-t", pane, "@cntctr_name", name));
+    free(TMUXE(NULL, "set", "-p", "-t", pane, "@cntctr_harness", harness));
+    int r = wait ? await_reply(id, pane, name, targ(a), res) : ok(res, fmt("spawned %s in %s id=%s", name, pane, id));
+    free(pane);
+    return r;
+}
+
+static int tool_kill(json_object *a, char **res) {
+    const char *name = sarg(a, "name");
+    char *pane = name ? find_agent(name) : NULL, *err;
+    if (!pane) return fail(res, fmt("agent %s not found", name ? name : "(none)"));
+    if (strcmp(pane, self_pane) == 0) {
+        free(pane);
+        return fail(res, fmt("cannot kill yourself"));
+    }
+    err = TMUXE(NULL, "kill-pane", "-t", pane);
+    free(pane);
+    return err ? fail(res, err) : ok(res, fmt("ok"));
+}
+
 /* ---- dispatch ---- */
 
 typedef int (*tool_fn)(json_object *args, char **res);
@@ -498,6 +547,9 @@ static const struct { const char *name; tool_fn fn; int needs_pane; } TOOL_FNS[]
     {"send", tool_send, 1},
 
     {"reply", tool_reply, 1},
+
+    {"spawn", tool_spawn, 1},
+    {"kill", tool_kill, 1},
 
     {NULL, NULL, 0},
 };
