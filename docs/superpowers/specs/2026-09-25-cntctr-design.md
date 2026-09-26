@@ -50,7 +50,7 @@ Success looks like this: a Claude leader can spawn a Codex worker, send it a tas
 ## Identity
 
 1. Find the server's own pane: use `$TMUX_PANE` if it is set. Otherwise walk the parent-process chain until a pid matches `#{pane_pid}` in the output of `tmux list-panes -a -F '#{pane_pid} #{pane_id}'`. Codex strips environment variables from MCP servers by default, which is why the fallback exists.
-2. Name: read the pane option `@cntctr_name`. If the pane is untagged, which is the case for a leader the user started by hand, the server tags it `<clientInfo.name>-<pane index>`. `clientInfo.name` comes from the MCP `initialize` request.
+2. Name: read the pane option `@cntctr_name`. If the pane is untagged, which is the case for a leader the user started by hand, the server tags it `<clientInfo.name>-<pane id number>`, e.g. `claude-code-3` for pane `%3`. Pane indexes repeat across windows; pane ids don't. `clientInfo.name` comes from the MCP `initialize` request.
 3. The tmux server socket comes from `$TMUX`, which is inherited. If `$TMUX` is absent, tmux uses its default socket.
 
 ## Tools
@@ -91,22 +91,27 @@ Delivered back to the sender as a reply:
 
 ### Permission-prompt guard
 
-Before any paste, run `tmux capture-pane -p -t <pane> -S -15` and match the output against a per-harness regex list compiled into the binary. On a match, nothing is pasted, and the call fails with `<name> awaiting permission prompt; retry later`. The guard is necessary because an injected Enter would accept a dialog's default option, usually "Yes". The patterns are taken from the real prompts during implementation. Known limit: this is a heuristic. If a harness changes its prompt wording, the guard misses it until the pattern list is updated.
+Before any paste, run `tmux capture-pane -p -t <pane>`, take the last 15 lines, and match them against one case-insensitive regex list compiled into the binary. The list covers all three harnesses; their dialog texts don't overlap, so separate lists would add nothing. On a match, nothing is pasted, and the call fails with `<name> awaiting permission prompt; retry later`. The guard is necessary because an injected Enter would accept a dialog's default option, usually "Yes". The patterns are taken from the real prompts during implementation. Known limit: this is a heuristic. If a harness changes its prompt wording, the guard misses it until the pattern list is updated.
 
 ### Blocking send (`wait=true`)
 
 1. Set `@cntctr_wait_<id>=1`, then inject.
-2. Fork `tmux wait-for cntctr-<id>`, then `poll` and `waitpid` until the deadline.
-3. If signaled: read `show-buffer -b cntctr-reply-<id>`, delete the buffer and both options, and return the text.
-4. If the timeout expires: kill the child and **clear `@cntctr_wait_<id>` first, then** check whether `cntctr-reply-<id>` exists. If it exists, return it and clean up. If not, return `timed out; reply will arrive in your pane (id=<id>)`.
+2. Wait in slices of 5 seconds. Each slice forks `tmux wait-for cntctr-<id>` and `poll`s its pipe until it exits or the slice ends. After each slice, stop if the reply buffer `cntctr-reply-<id>` exists or the target pane is gone or dead.
+   - Why the buffer check: tmux keeps a killed `wait-for` client queued on its channel, and a later `wait-for -S` can be used up on that dead client (verified on tmux 3.7c). The check caps the delay from a lost signal at one slice.
+   - Why the pane check: a worker that exits without replying ends the wait within 5 seconds instead of at the timeout.
+3. Clear `@cntctr_wait_<id>`, then try to claim the buffer (see "Claiming a reply").
+4. Claimed: remove both options and return the text. Not claimed, pane gone: return the error `agent <name> exited before replying (id=<id>)`. Not claimed otherwise: return `timed out; reply will arrive in your pane (id=<id>)`.
 
 ### reply(id, text)
 
 1. Look up `@cntctr_from_<id>`. If it is missing, return the error `unknown id`.
 2. **Write buffer `cntctr-reply-<id>` first, then** check `@cntctr_wait_<id>`.
-3. If the flag is set, run `tmux wait-for -S cntctr-<id>`. If it is clear, inject the reply envelope into the sender's pane (returning `sender gone` if that pane no longer exists), then delete the buffer and the `@cntctr_from_<id>` option.
+3. If the flag is set, run `tmux wait-for -S cntctr-<id>` and stop; the waiter claims the buffer.
+4. If the flag is clear, try `tmux delete-buffer -b cntctr-reply-<id>`. If the delete fails, a timed-out waiter already claimed the reply; return `ok`. If it succeeds, inject the reply envelope into the sender's pane (returning `sender gone` if that pane no longer exists), then remove `@cntctr_from_<id>`.
 
-Race safety: the replier always writes the buffer before it checks the flag, and the waiter always clears the flag before it checks the buffer. Under every interleaving, exactly one side delivers the reply. It is never lost and never delivered twice.
+### Claiming a reply
+
+The waiter claims by reading the buffer and then deleting it; the replier claims by deleting it. tmux runs commands one at a time, so only one `delete-buffer` can succeed, and only that side delivers. The ordering rules prevent loss: the replier writes the buffer before it checks the flag, and the waiter clears the flag before it claims. Every reply is delivered exactly once.
 
 ### Spawn
 
@@ -123,6 +128,7 @@ After the window opens, the server sets the pane options `@cntctr_name` and `@cn
 |---|---|
 | Target name not found | `agent <name> not found` |
 | Sender pane gone when a reply arrives | `sender gone` returned to the replier |
+| Worker exits while a blocking call waits | `agent <name> exited before replying (id=<id>)`, within 5 seconds |
 | Target is showing a permission prompt | `<name> awaiting permission prompt; retry later` |
 | Duplicate spawn name | `agent <name> already exists` |
 | Unknown harness | `unknown harness <h>` |
@@ -133,7 +139,8 @@ After the window opens, the server sets the pane options `@cntctr_name` and `@cn
 Known limits:
 - `@cntctr_from_<id>` options for messages that never get a reply stay in memory until the tmux server exits. Each is a few bytes.
 - If the user is typing in a pane at the same moment a message is injected, the two inputs interleave.
-- A `wait-for -S` sent when no one is waiting leaves a tmux channel marked as signaled. This is harmless, because ids are never reused.
+- A `wait-for -S` sent when no one is waiting leaves a tmux channel marked as signaled, and each slice of a blocking wait leaves one dead waiter queued on its channel. Both are harmless, because ids are never reused.
+- A blocking wait costs about three short tmux commands every 5 seconds.
 
 ## MCP surface
 
@@ -145,7 +152,7 @@ Known limits:
 | File | Purpose |
 |---|---|
 | `cntctr.c` | The whole server: JSON-RPC loop, tools, tmux helpers, and pane discovery. Roughly 600–800 lines. |
-| `Makefile` | `make` runs `cc -std=c11 -O2 -pthread $(pkg-config --cflags --libs json-c)`. `make test` rebuilds with `-fsanitize=address,undefined` and runs `test.sh`. |
+| `Makefile` | `make` compiles with `cc -std=c11 -O2 -pthread` against json-c at `$(brew --prefix json-c)`. `pkg-config` is not installed on this machine. `make test` rebuilds with `-fsanitize=address,undefined` and runs `test.sh`. |
 | `test.sh` | End-to-end tests against a private tmux server. |
 | `README.md` | Install lines for each harness and per-harness timeout settings. |
 
@@ -188,9 +195,3 @@ Manual checks with the real harnesses, after `make test` passes:
 
 Message history, broadcast, auto-approve mode, a shared HTTP daemon, and support for machines other than the local one.
 
-## Steps after plan approval
-
-1. `git init` in `/Users/chielerli/Programming/cntctr`.
-2. Copy this spec to `docs/superpowers/specs/2026-09-25-cntctr-design.md` and commit it.
-3. The user reviews the committed spec.
-4. Invoke `superpowers:writing-plans` to write the implementation plan.
