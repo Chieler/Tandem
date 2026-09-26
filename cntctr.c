@@ -21,7 +21,26 @@
 static pthread_mutex_t out_mu = PTHREAD_MUTEX_INITIALIZER;   /* one JSON line at a time on stdout */
 static pthread_mutex_t live_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t live_cv = PTHREAD_COND_INITIALIZER;
-static int live_calls;                                        /* tools/call threads still running */
+
+/* A running tools/call. The client can cancel it; so does stdin EOF. */
+struct call { json_object *req, *id; int cancelled; struct call *next; };
+static struct call *calls;                                    /* guarded by live_mu */
+static _Thread_local struct call *this_call;
+
+/* Mark the call with JSON-RPC id `id` cancelled, or every call if `id` is NULL. */
+static void cancel(json_object *id) {
+    pthread_mutex_lock(&live_mu);
+    for (struct call *c = calls; c; c = c->next)
+        if (!id || json_object_equal(c->id, id)) c->cancelled = 1;
+    pthread_mutex_unlock(&live_mu);
+}
+
+static int cancelled(void) {
+    pthread_mutex_lock(&live_mu);
+    int v = this_call && this_call->cancelled;
+    pthread_mutex_unlock(&live_mu);
+    return v;
+}
 
 static char client_name[64] = "agent";   /* clientInfo.name from initialize */
 static char self_pane[32];               /* our tmux pane id, e.g. "%3"; empty outside tmux */
@@ -385,10 +404,18 @@ static int await_reply(const char *id, const char *pane, const char *who, int ti
         /* tmux keeps a killed wait-for queued, and it can swallow a later signal,
          * so the buffer is checked after every slice as well. */
         if (wait_signal(chan, left < WAIT_SLICE ? left : WAIT_SLICE) || buffer_exists(buf)) break;
-        if ((gone = !pane_alive(pane))) break;
+        if ((gone = !pane_alive(pane)) || cancelled()) break;
     }
     free(TMUXE(NULL, "set", "-su", opt));   /* stop repliers from signalling us, then claim */
     char *text = buffer_take(buf);
+    if (text && cancelled()) {   /* nobody reads our result anymore: type the reply into our pane */
+        char *env = fmt("[cntctr reply from=%s id=%s]\n%s", who, id, text), *err = inject(self_pane, "your pane", env);
+        free(env);
+        free(text);
+        if (err) return fail(res, err);
+        untrack(id);
+        return ok(res, fmt("cancelled; reply delivered to your pane (id=%s)", id));
+    }
     if (text) {
         untrack(id);
         return ok(res, text);
@@ -543,14 +570,10 @@ static int tool_kill(json_object *a, char **res) {
 typedef int (*tool_fn)(json_object *args, char **res);
 static const struct { const char *name; tool_fn fn; int needs_pane; } TOOL_FNS[] = {
     {"list", tool_list, 0},
-
     {"send", tool_send, 1},
-
     {"reply", tool_reply, 1},
-
     {"spawn", tool_spawn, 1},
     {"kill", tool_kill, 1},
-
     {NULL, NULL, 0},
 };
 
@@ -642,8 +665,8 @@ static json_object *initialize(json_object *params) {
 }
 
 static void *call_thread(void *arg) {
-    json_object *req = arg, *id = NULL, *params = NULL, *args = NULL;
-    json_object_object_get_ex(req, "id", &id);
+    this_call = arg;
+    json_object *req = this_call->req, *id = this_call->id, *params = NULL, *args = NULL;
     if (json_object_object_get_ex(req, "params", &params)) json_object_object_get_ex(params, "arguments", &args);
 
     char *text = NULL;
@@ -657,22 +680,30 @@ static void *call_thread(void *arg) {
     json_object_object_add(result, "isError", json_object_new_boolean(is_error));
     respond(id, result);
     free(text);
-    json_object_put(req);
 
     pthread_mutex_lock(&live_mu);
-    if (--live_calls == 0) pthread_cond_signal(&live_cv);
+    struct call **p = &calls;
+    while (*p != this_call) p = &(*p)->next;
+    *p = this_call->next;
+    if (!calls) pthread_cond_signal(&live_cv);
     pthread_mutex_unlock(&live_mu);
+    json_object_put(req);
+    free(this_call);
     return NULL;
 }
 
 /* Run a tools/call on its own thread so a blocking send doesn't hold up other calls. */
 static void start_call(json_object *req) {
     pthread_t thread;
+    struct call *c = calloc(1, sizeof *c);
+    c->req = req;
+    json_object_object_get_ex(req, "id", &c->id);
     pthread_mutex_lock(&live_mu);
-    live_calls++;
+    c->next = calls;
+    calls = c;
     pthread_mutex_unlock(&live_mu);
-    if (pthread_create(&thread, NULL, call_thread, req) == 0) pthread_detach(thread);
-    else call_thread(req);   /* out of threads: run it inline */
+    if (pthread_create(&thread, NULL, call_thread, c) == 0) pthread_detach(thread);
+    else call_thread(c);   /* out of threads: run it inline */
 }
 
 static void handle(const char *line) {
@@ -691,6 +722,10 @@ static void handle(const char *line) {
     else if (strcmp(method, "initialize") == 0) respond(id, initialize(params));
     else if (strcmp(method, "ping") == 0) respond(id, json_object_new_object());
     else if (strcmp(method, "tools/list") == 0) respond(id, json_tokener_parse(TOOLS));
+    else if (strcmp(method, "notifications/cancelled") == 0) {
+        json_object *rid = NULL;
+        if (json_object_object_get_ex(params, "requestId", &rid) && rid) cancel(rid);
+    }
     else if (id) respond_error(id, -32601, "method not found");   /* notifications need no answer */
     json_object_put(req);
 }
@@ -705,10 +740,11 @@ int main(void) {
     size_t cap = 0;
     while (getline(&line, &cap, stdin) > 0) handle(line);
     free(line);
-    /* ponytail: on EOF we wait for in-flight calls, blocking ones included (up to their
-     * timeout). Cancel them instead if orphaned servers turn out to linger. */
+    /* Client gone: blocking sends stop within one wait slice and their replies
+     * go to the pane instead. */
+    cancel(NULL);
     pthread_mutex_lock(&live_mu);
-    while (live_calls > 0) pthread_cond_wait(&live_cv, &live_mu);
+    while (calls) pthread_cond_wait(&live_cv, &live_mu);
     pthread_mutex_unlock(&live_mu);
     return 0;
 }

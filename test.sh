@@ -24,9 +24,23 @@ refute() { case $2 in *"$3"*) bad "$1" "  unexpected: $3" ;; *) ok_ ;; esac; }
 # rpc <line>...: feed raw JSON-RPC lines to one cntctr process, print its output
 rpc() { printf '%s\n' "$@" | "$BIN"; }
 # call <pane> <tool> <args-json>: run one tool as the agent in <pane>, print the response line
+# session <pane> <n> <line>...: run one cntctr as <pane>'s agent and keep its stdin
+# open until it has printed <n> lines, like a harness that waits for its answers
+session() {
+    local pane=$1 n=$2 fifo
+    shift 2
+    fifo=$(mktemp -u "$TMPD/fifo.XXXXXX")
+    mkfifo "$fifo"
+    TMUX_PANE=$pane "$BIN" < "$fifo" | {
+        exec 3> "$fifo"
+        printf '%s\n' "$@" >&3
+        head -n "$n"
+        exec 3>&-
+    }
+    rm -f "$fifo"
+}
 call() {
-    printf '%s\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"%s","arguments":%s}}\n' \
-        "$INIT" "$2" "$3" | TMUX_PANE=$1 "$BIN" | tail -n 1
+    session "$1" 2 "$INIT" "$(printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"%s","arguments":%s}}' "$2" "$3")" | tail -n 1
 }
 txt() { printf '%s' "$1" | jq -r '.result.content[0].text'; }
 iserr() { printf '%s' "$1" | jq -r '.result.isError'; }
@@ -150,10 +164,10 @@ expect_screen "late reply typed into sender pane" "$S" "[cntctr reply from=b id=
 expect_screen "late reply text" "$S" "late answer"
 
 C=$(newpane c)
-{ printf '%s\n' "$INIT"
-  printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send","arguments":{"to":"b","text":"first of two","wait":true,"timeout":10}}}'
-  printf '%s\n' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"send","arguments":{"to":"c","text":"second of two","wait":true,"timeout":10}}}'
-} | TMUX_PANE=$S "$BIN" > "$TMPD/pair" &
+session "$S" 3 "$INIT" \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send","arguments":{"to":"b","text":"first of two","wait":true,"timeout":10}}}' \
+    '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"send","arguments":{"to":"c","text":"second of two","wait":true,"timeout":10}}}' \
+    > "$TMPD/pair" &
 expect_screen "first concurrent send delivered" "$B" "first of two"
 expect_screen "second concurrent send delivered" "$C" "second of two"
 call "$C" reply "{\"id\":\"$(lastid "$C")\",\"text\":\"answer two\"}" >/dev/null
@@ -161,6 +175,27 @@ call "$B" reply "{\"id\":\"$(lastid "$B")\",\"text\":\"answer one\"}" >/dev/null
 wait
 same "concurrent call 2" "$(jq -r 'select(.id==2) | .result.content[0].text' "$TMPD/pair")" "answer one"
 same "concurrent call 3" "$(jq -r 'select(.id==3) | .result.content[0].text' "$TMPD/pair")" "answer two"
+
+R=$(newpane r)
+{ printf '%s\n' "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send","arguments":{"to":"b","text":"cancel me","wait":true,"timeout":30}}}'
+  sleep 1
+  printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}'
+  sleep 1
+} | TMUX_PANE=$R "$BIN" >/dev/null &
+expect_screen "cancellable send delivered" "$B" "cancel me"
+sleep 1.5
+call "$B" reply "{\"id\":\"$(lastid "$B")\",\"text\":\"answer after cancel\"}" >/dev/null
+wait
+expect_screen "reply to cancelled send lands in sender pane" "$R" "answer after cancel"
+
+printf '%s\n' "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send","arguments":{"to":"b","text":"leader leaves","wait":true,"timeout":30}}}' |
+    TMUX_PANE=$R "$BIN" >/dev/null &
+expect_screen "send before leader exit delivered" "$B" "leader leaves"
+start=$SECONDS
+wait   # stdin is closed: cntctr must give up the wait, not block for the full timeout
+[ $((SECONDS - start)) -le 7 ] && ok_ || bad "server with closed stdin still blocked $((SECONDS - start))s"
+call "$B" reply "{\"id\":\"$(lastid "$B")\",\"text\":\"answer after exit\"}" >/dev/null
+expect_screen "reply after leader's server exits lands in its pane" "$R" "answer after exit"
 
 D=$(newpane d)
 call "$S" send '{"to":"d","text":"never answered","wait":true,"timeout":30}' > "$TMPD/dead" &
