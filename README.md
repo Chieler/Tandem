@@ -1,0 +1,57 @@
+# cntctr
+
+Lets Claude Code, Codex, and agy talk to each other directly. An agent can
+spawn another agent in a tmux window, send it messages, and get replies back
+in its own session, either right away (async) or by blocking until the answer
+arrives. There are no files and no daemon. tmux carries every message.
+
+## Requirements
+
+- tmux (tested with 3.7c)
+- json-c: `brew install json-c`
+- Run your agents inside tmux.
+
+## Build
+
+    make
+
+## Install
+
+Register the server once for each harness (use the absolute path):
+
+    claude mcp add -s user cntctr -- /path/to/cntctr
+    codex mcp add cntctr -- /path/to/cntctr
+    agy mcp add cntctr /path/to/cntctr
+
+Raise each harness's tool timeout above the longest blocking wait you plan to use:
+
+- Claude Code: `MCP_TOOL_TIMEOUT` in milliseconds, e.g. `export MCP_TOOL_TIMEOUT=3600000`.
+- Codex: in `~/.codex/config.toml`, under `[mcp_servers.cntctr]`, set `tool_timeout_sec = 3600`.
+- agy: no MCP timeout setting found; keep blocking waits short or use async sends.
+
+## Use
+
+Start a tmux session, run your leader agent in it, and ask for what you want,
+for example: "Spawn a codex worker named tests in ./api and have it write
+tests for the parser. Wait for its answer."
+
+| Tool | What it does |
+|---|---|
+| `spawn` | Starts `claude`, `codex` or `agy` in a new tmux window with a first task |
+| `send` | Types a message into another agent's terminal; `wait=true` blocks for the reply |
+| `reply` | Answers a message by its id |
+| `list` | Shows agents, their panes, and whether they are alive |
+| `kill` | Closes an agent's pane |
+
+Workers run with normal permissions. Approve their prompts in their own windows
+(`C-b w` to switch). cntctr will not type into a pane that is showing a
+permission dialog; the sender gets `<name> awaiting permission prompt; retry later`.
+
+Delivery tuning: `CNTCTR_ENTER_DELAY_MS` (default 150) is the pause between
+pasting a message and pressing Enter.
+
+## Test
+
+    make test
+
+Tests run against a private tmux server (`tmux -L cntctr-test`) and need `jq`.
