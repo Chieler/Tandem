@@ -67,6 +67,29 @@ out=$(rpc '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"nope"
 same "unknown tool is a tool error" "$(iserr "$out")" true
 same "unknown tool message" "$(txt "$out")" "unknown tool nope"
 
+# ---- identity and list ----
+A=$(newpane a)
+B=$(newpane b)
+out=$(call "$A" list '{}')
+check "list shows a" "$(txt "$out")" "a test $A alive"
+check "list shows b" "$(txt "$out")" "b test $B alive"
+U=$(t new-window -d -P -F '#{pane_id}' cat)
+out=$(call "$U" list '{}')
+check "untagged caller tags itself <client>-<pane number>" "$(txt "$out")" "test-${U#%} test $U alive"
+cat > "$TMPD/bin/probe" <<'EOF'
+#!/bin/sh
+# Start cntctr without TMUX_PANE, as Codex does; it must find its pane by process ancestry.
+printf '%s\n' "$INIT" | env -u TMUX_PANE "$BIN" >/dev/null
+exec cat
+EOF
+chmod +x "$TMPD/bin/probe"
+P=$(t new-window -d -P -F '#{pane_id}' probe)
+for _ in $(seq 50); do [ -n "$(t show -pqv -t "$P" @cntctr_name)" ] && break; sleep 0.1; done
+same "pane found by process ancestry without TMUX_PANE" "$(t show -pqv -t "$P" @cntctr_name)" "test-${P#%}"
+out=$(printf '%s\n%s\n' "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list","arguments":{}}}' |
+    TMUX=/nonexistent/sock,0,0 "$BIN" | tail -n 1)
+same "list without a tmux server is a tool error" "$(iserr "$out")" true
+
 # ---- summary ----
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

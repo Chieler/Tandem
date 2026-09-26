@@ -25,6 +25,8 @@ static int live_calls;                                        /* tools/call thre
 
 static char client_name[64] = "agent";   /* clientInfo.name from initialize */
 static char self_pane[32];               /* our tmux pane id, e.g. "%3"; empty outside tmux */
+static char self_name[128];              /* our agent name (the pane's @cntctr_name) */
+static pthread_mutex_t fork_mu = PTHREAD_MUTEX_INITIALIZER;   /* held from pipe() to fork() */
 
 static char *fmt(const char *f, ...) {
     va_list ap;
@@ -37,6 +39,7 @@ static char *fmt(const char *f, ...) {
 
 /* Tool results: *res gets malloc'd text; the return value is MCP's isError. */
 static int fail(char **res, char *text) { *res = text; return 1; }
+static int ok(char **res, char *text) { *res = text; return 0; }
 
 static const char *sarg(json_object *o, const char *key) {
     json_object *v;
@@ -44,10 +47,199 @@ static const char *sarg(json_object *o, const char *key) {
         ? json_object_get_string(v) : NULL;
 }
 
+/* ---- processes ---- */
+
+/* Close-on-exec pipe, so children forked by other threads don't inherit it and
+ * hold our read ends open. Callers hold fork_mu until they have forked. */
+static int cloexec_pipe(int p[2]) {
+    if (pipe(p) < 0) return -1;
+    fcntl(p[0], F_SETFD, FD_CLOEXEC);
+    fcntl(p[1], F_SETFD, FD_CLOEXEC);
+    return 0;
+}
+
+/* Fork and exec argv with stdin from `in` and stdout+stderr to `out` (-1 means
+ * /dev/null). No shell is involved. Caller holds fork_mu. */
+static pid_t start(const char **argv, int in, int out) {
+    pid_t pid = fork();
+    if (pid == 0) {
+        int null = open("/dev/null", O_RDWR);
+        dup2(in < 0 ? null : in, 0);
+        dup2(out < 0 ? null : out, 1);
+        dup2(out < 0 ? null : out, 2);
+        execvp(argv[0], (char *const *)argv);
+        _exit(127);
+    }
+    return pid;
+}
+
+static int reap(pid_t pid) {
+    int status;
+    while (waitpid(pid, &status, 0) < 0)
+        if (errno != EINTR) return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static void write_all(int fd, const char *s) {
+    size_t n = strlen(s);
+    while (n > 0) {
+        ssize_t w = write(fd, s, n);
+        if (w < 0 && errno == EINTR) continue;
+        if (w < 0) return;
+        s += w;
+        n -= (size_t)w;
+    }
+}
+
+static char *read_all(int fd) {
+    size_t len = 0, cap = 256;
+    char *b = malloc(cap);
+    for (;;) {
+        if (cap - len < 2) b = realloc(b, cap *= 2);
+        ssize_t n = read(fd, b + len, cap - len - 1);
+        if (n > 0) len += (size_t)n;
+        else if (n < 0 && errno == EINTR) continue;
+        else break;
+    }
+    while (len > 0 && b[len - 1] == '\n') len--;
+    b[len] = '\0';
+    return b;
+}
+
+/* Run argv, feeding `in` (may be NULL) on stdin. *out gets stdout+stderr
+ * (always malloc'd, trailing newlines dropped). Returns the exit status. */
+static int run(const char *in, char **out, const char **argv) {
+    int ip[2], op[2];
+    pthread_mutex_lock(&fork_mu);
+    if (cloexec_pipe(ip) < 0) {
+        pthread_mutex_unlock(&fork_mu);
+        *out = fmt("pipe: %s", strerror(errno));
+        return -1;
+    }
+    if (cloexec_pipe(op) < 0) {
+        pthread_mutex_unlock(&fork_mu);
+        close(ip[0]);
+        close(ip[1]);
+        *out = fmt("pipe: %s", strerror(errno));
+        return -1;
+    }
+    pid_t pid = start(argv, ip[0], op[1]);
+    pthread_mutex_unlock(&fork_mu);
+    close(ip[0]);
+    close(op[1]);
+    if (pid < 0) {
+        close(ip[1]);
+        close(op[0]);
+        *out = fmt("fork: %s", strerror(errno));
+        return -1;
+    }
+    if (in) write_all(ip[1], in);
+    close(ip[1]);
+    *out = read_all(op[0]);
+    close(op[0]);
+    int rc = reap(pid);
+    if (rc == 127 && !**out) {
+        free(*out);
+        *out = fmt("cannot run %s", argv[0]);
+    }
+    return rc;
+}
+
+/* Run a tmux command: NULL on success, else its error text (caller frees). */
+static char *tmux_do(const char *in, const char **argv) {
+    char *out;
+    if (run(in, &out, argv) == 0) {
+        free(out);
+        return NULL;
+    }
+    return out;
+}
+
+#define TMUX(in, out, ...) run((in), (out), (const char *[]){"tmux", __VA_ARGS__, NULL})
+#define TMUXE(in, ...) tmux_do((in), (const char *[]){"tmux", __VA_ARGS__, NULL})
+
+/* ---- identity ---- */
+
+/* If `pid` is the root process of a pane in `panes` ("pid pane_id" lines), make it ours. */
+static int match_pane(const char *panes, long pid) {
+    long p;
+    char id[32];
+    int n;
+    for (const char *s = panes; sscanf(s, "%ld %31s%n", &p, id, &n) == 2; s += n)
+        if (p == pid) {
+            snprintf(self_pane, sizeof self_pane, "%s", id);
+            return 1;
+        }
+    return 0;
+}
+
+/* Parent of `pid` according to `procs` ("pid ppid" lines), or 0. */
+static long parent_of(const char *procs, long pid) {
+    long p, pp;
+    int n;
+    for (const char *s = procs; sscanf(s, "%ld %ld%n", &p, &pp, &n) == 2; s += n)
+        if (p == pid) return pp;
+    return 0;
+}
+
+/* Find our pane: $TMUX_PANE, else the nearest ancestor process that is a pane's
+ * root process (Codex hides TMUX_PANE from MCP servers). Then take our name from
+ * the pane's tag, tagging an untagged pane (e.g. a leader the user started by
+ * hand) as <client>-<pane number>. */
+static void find_self(void) {
+    const char *env = getenv("TMUX_PANE");
+    if (env && *env) {
+        snprintf(self_pane, sizeof self_pane, "%s", env);
+    } else {
+        char *panes, *procs;
+        int found = TMUX(NULL, &panes, "list-panes", "-a", "-F", "#{pane_pid} #{pane_id}") == 0;
+        found = run(NULL, &procs, (const char *[]){"ps", "-A", "-o", "pid=,ppid=", NULL}) == 0 && found;
+        for (long pid = getpid(); found && pid > 1 && !match_pane(panes, pid); pid = parent_of(procs, pid)) {}
+        free(panes);
+        free(procs);
+    }
+    if (!*self_pane) return;
+
+    char *name;
+    if (TMUX(NULL, &name, "show", "-pqv", "-t", self_pane, "@cntctr_name") == 0 && *name) {
+        snprintf(self_name, sizeof self_name, "%s", name);
+    } else {
+        snprintf(self_name, sizeof self_name, "%s-%s", client_name, self_pane + 1);
+        free(TMUXE(NULL, "set", "-p", "-t", self_pane, "@cntctr_name", self_name));
+        free(TMUXE(NULL, "set", "-p", "-t", self_pane, "@cntctr_harness", client_name));
+    }
+    free(name);
+}
+
+/* ---- tools ---- */
+
+static int tool_list(json_object *args, char **res) {
+    (void)args;
+    char *out;
+    if (TMUX(NULL, &out, "list-panes", "-a", "-F",
+             "#{@cntctr_name} #{@cntctr_harness} #{pane_id} #{?pane_dead,dead,alive}") != 0)
+        return fail(res, out);
+    char *list = calloc(1, strlen(out) + 2), *save;
+    for (char *line = strtok_r(out, "\n", &save); line; line = strtok_r(NULL, "\n", &save))
+        if (*line != ' ') {   /* untagged panes have an empty name, so the line starts with a space */
+            strcat(list, line);
+            strcat(list, "\n");
+        }
+    free(out);
+    if (!*list) {
+        free(list);
+        return ok(res, fmt("no agents"));
+    }
+    list[strlen(list) - 1] = '\0';
+    return ok(res, list);
+}
+
 /* ---- dispatch ---- */
 
 typedef int (*tool_fn)(json_object *args, char **res);
 static const struct { const char *name; tool_fn fn; int needs_pane; } TOOL_FNS[] = {
+    {"list", tool_list, 0},
+
     {NULL, NULL, 0},
 };
 
@@ -126,6 +318,7 @@ static json_object *initialize(json_object *params) {
     const char *name = json_object_object_get_ex(params, "clientInfo", &info) ? sarg(info, "name") : NULL;
     const char *version = sarg(params, "protocolVersion");
     if (name && *name) snprintf(client_name, sizeof client_name, "%s", name);
+    find_self();
 
     json_object *r = json_object_new_object(), *caps = json_object_new_object(), *server = json_object_new_object();
     json_object_object_add(caps, "tools", json_object_new_object());
