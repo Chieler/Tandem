@@ -211,6 +211,94 @@ static void find_self(void) {
     free(name);
 }
 
+/* ---- agents and delivery ---- */
+
+/* Pane id of the agent called `name` (caller frees), or NULL. */
+static char *find_agent(const char *name) {
+    char *out, *pane = NULL, *save;
+    if (TMUX(NULL, &out, "list-panes", "-a", "-F", "#{pane_id}\t#{@cntctr_name}") == 0)
+        for (char *line = strtok_r(out, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+            char *tab = strchr(line, '\t');
+            if (tab && strcmp(tab + 1, name) == 0) {
+                *tab = '\0';
+                pane = strdup(line);
+                break;
+            }
+        }
+    free(out);
+    return pane;
+}
+
+/* Text of harness permission dialogs. Enter on one of these accepts its default
+ * choice, so nothing may be pasted while one is showing. Matched case-insensitively
+ * against the last 15 lines of the pane. */
+static const char *PROMPTS[] = {
+    "Do you want to (proceed|make this edit|create|allow)",
+    "Would you like to (run|make|allow)",
+    "Allow (once|always|command|this)",
+    "enter to confirm",
+};
+static regex_t prompt_re[sizeof PROMPTS / sizeof *PROMPTS];
+
+static int awaiting_permission(const char *pane) {
+    char *screen;
+    if (TMUX(NULL, &screen, "capture-pane", "-p", "-t", pane) != 0) {
+        free(screen);
+        return 0;   /* a missing pane fails later, in paste-buffer */
+    }
+    char *tail = screen + strlen(screen);   /* run() already dropped trailing blank lines */
+    for (int lines = 0; tail > screen; tail--)
+        if (tail[-1] == '\n' && ++lines == 15) break;
+    int hit = 0;
+    for (size_t i = 0; i < sizeof PROMPTS / sizeof *PROMPTS && !hit; i++)
+        hit = regexec(&prompt_re[i], tail, 0, NULL, 0) == 0;
+    free(screen);
+    return hit;
+}
+
+static int enter_delay_ms = 150;   /* CNTCTR_ENTER_DELAY_MS: pause between paste and Enter */
+
+/* Paste `text` into `pane` as one bracketed paste, then press Enter.
+ * `who` names the pane in errors. Returns NULL or an error (caller frees). */
+static char *inject(const char *pane, const char *who, const char *text) {
+    if (awaiting_permission(pane)) return fmt("%s awaiting permission prompt; retry later", who);
+    char buf[32], *err;
+    snprintf(buf, sizeof buf, "cntctr-in-%08x", arc4random());
+    if ((err = TMUXE(text, "load-buffer", "-b", buf, "-"))) return err;
+    if ((err = TMUXE(NULL, "paste-buffer", "-p", "-d", "-b", buf, "-t", pane))) {
+        free(TMUXE(NULL, "delete-buffer", "-b", buf));
+        return err;
+    }
+    struct timespec pause = {enter_delay_ms / 1000, (enter_delay_ms % 1000) * 1000000L};
+    nanosleep(&pause, NULL);
+    return TMUXE(NULL, "send-keys", "-t", pane, "Enter");
+}
+
+static void new_id(char id[9]) { snprintf(id, 9, "%08x", arc4random()); }
+
+/* Record that we sent message `id`, and whether we block on its reply. */
+static void track(const char *id, int wait) {
+    char opt[48];
+    snprintf(opt, sizeof opt, "@cntctr_from_%s", id);
+    free(TMUXE(NULL, "set", "-s", opt, self_pane));
+    if (wait) {
+        snprintf(opt, sizeof opt, "@cntctr_wait_%s", id);
+        free(TMUXE(NULL, "set", "-s", opt, "1"));
+    }
+}
+
+static void untrack(const char *id) {
+    char opt[48];
+    snprintf(opt, sizeof opt, "@cntctr_from_%s", id);
+    free(TMUXE(NULL, "set", "-su", opt));
+    snprintf(opt, sizeof opt, "@cntctr_wait_%s", id);
+    free(TMUXE(NULL, "set", "-su", opt));
+}
+
+static char *envelope(const char *id, const char *text) {
+    return fmt("[cntctr from=%s id=%s]\n%s\n[when done: cntctr reply id=%s]", self_name, id, text, id);
+}
+
 /* ---- tools ---- */
 
 static int tool_list(json_object *args, char **res) {
@@ -234,11 +322,32 @@ static int tool_list(json_object *args, char **res) {
     return ok(res, list);
 }
 
+static int tool_send(json_object *a, char **res) {
+    const char *to = sarg(a, "to"), *text = sarg(a, "text");
+    if (!to || !text) return fail(res, fmt("send needs 'to' and 'text'"));
+    char *pane = find_agent(to);
+    if (!pane) return fail(res, fmt("agent %s not found", to));
+    char id[9], *env, *err;
+    new_id(id);
+    track(id, 0);
+    env = envelope(id, text);
+    err = inject(pane, to, env);
+    free(env);
+    free(pane);
+    if (err) {
+        untrack(id);
+        return fail(res, err);
+    }
+    return ok(res, fmt("sent id=%s", id));
+}
+
 /* ---- dispatch ---- */
 
 typedef int (*tool_fn)(json_object *args, char **res);
 static const struct { const char *name; tool_fn fn; int needs_pane; } TOOL_FNS[] = {
     {"list", tool_list, 0},
+
+    {"send", tool_send, 1},
 
     {NULL, NULL, 0},
 };
@@ -386,6 +495,10 @@ static void handle(const char *line) {
 
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
+    const char *delay = getenv("CNTCTR_ENTER_DELAY_MS");
+    if (delay) enter_delay_ms = atoi(delay);
+    for (size_t i = 0; i < sizeof PROMPTS / sizeof *PROMPTS; i++)
+        regcomp(&prompt_re[i], PROMPTS[i], REG_EXTENDED | REG_ICASE | REG_NOSUB);
     char *line = NULL;
     size_t cap = 0;
     while (getline(&line, &cap, stdin) > 0) handle(line);

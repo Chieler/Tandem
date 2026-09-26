@@ -90,6 +90,30 @@ out=$(printf '%s\n%s\n' "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/call","
     TMUX=/nonexistent/sock,0,0 "$BIN" | tail -n 1)
 same "list without a tmux server is a tool error" "$(iserr "$out")" true
 
+# ---- send ----
+out=$(call "$A" send '{"to":"b","text":"hello from a"}')
+check "send returns an id" "$(txt "$out")" "sent id="
+id=$(txt "$out" | sed 's/sent id=//')
+expect_screen "envelope header" "$B" "[cntctr from=a id=$id]"
+expect_screen "message text" "$B" "hello from a"
+expect_screen "reply hint" "$B" "[when done: cntctr reply id=$id]"
+call "$A" send '{"to":"b","text":"line one\nline two ünï"}' >/dev/null
+expect_screen "multiline unicode text arrives" "$B" "line two ünï"
+call "$A" send "$(jq -nc --arg t "\$(touch $TMPD/pwned) \`touch $TMPD/pwned\`" '{to:"b",text:$t}')" >/dev/null
+expect_screen "shell syntax arrives literally" "$B" "\$(touch $TMPD/pwned)"
+if [ -e "$TMPD/pwned" ]; then bad "send text was run by a shell"; else ok_; fi
+G=$(newpane g sh -c 'echo "Do you want to proceed?"; exec cat')
+expect_screen "guard pane ready" "$G" "Do you want to proceed?"
+out=$(call "$A" send '{"to":"g","text":"sneaky"}')
+same "send refused during permission prompt" "$(txt "$out")" "g awaiting permission prompt; retry later"
+same "refusal is a tool error" "$(iserr "$out")" true
+sleep 0.3
+refute "nothing pasted into prompt pane" "$(screen "$G")" "sneaky"
+out=$(call "$A" send '{"to":"nope","text":"x"}')
+same "send to missing agent" "$(txt "$out")" "agent nope not found"
+out=$(rpc "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send","arguments":{"to":"b","text":"x"}}}' | tail -n 1)
+same "send outside tmux" "$(txt "$out")" "cntctr is not running inside a tmux pane"
+
 # ---- summary ----
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
