@@ -110,7 +110,7 @@ check "send returns an id" "$(txt "$out")" "sent id="
 id=$(txt "$out" | sed 's/sent id=//')
 expect_screen "envelope header" "$B" "[cntctr from=a id=$id]"
 expect_screen "message text" "$B" "hello from a"
-expect_screen "reply hint" "$B" "[when done: call the reply tool of the cntctr MCP server with id=$id and your answer; it is an MCP tool, not a shell command]"
+expect_screen "reply hint" "$B" "[when done: call the reply tool of the cntctr MCP server with id=$id and your answer; it is an MCP tool, not a shell command. Your agent name is b: pass from=b when you call send, spawn or kill]"
 call "$A" send '{"to":"b","text":"line one\nline two ünï"}' >/dev/null
 expect_screen "multiline unicode text arrives" "$B" "line two ünï"
 call "$A" send "$(jq -nc --arg t "\$(touch $TMPD/pwned) \`touch $TMPD/pwned\`" '{to:"b",text:$t}')" >/dev/null
@@ -126,7 +126,27 @@ refute "nothing pasted into prompt pane" "$(screen "$G")" "sneaky"
 out=$(call "$A" send '{"to":"nope","text":"x"}')
 same "send to missing agent" "$(txt "$out")" "agent nope not found"
 out=$(rpc "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send","arguments":{"to":"b","text":"x"}}}' | tail -n 1)
-same "send outside tmux" "$(txt "$out")" "cntctr is not running inside a tmux pane"
+check "send outside tmux says to pass from" "$(txt "$out")" "pass from="
+
+# ---- from: a shared server (Codex) names its caller ----
+# nopane <tool> <args-json>: run a tool from a process that is in no pane
+nopane() { rpc "$INIT" "$(printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"%s","arguments":%s}}' "$1" "$2")" | tail -n 1; }
+F=$(newpane fromer)
+out=$(nopane send '{"to":"b","text":"via name","from":"fromer"}')
+check "send with from=<agent name> succeeds" "$(txt "$out")" "sent id="
+id=$(txt "$out" | sed 's/sent id=//')
+expect_screen "envelope names the from agent" "$B" "[cntctr from=fromer id=$id]"
+expect_screen "envelope tells receiver its own name" "$B" "Your agent name is b: pass from=b"
+call "$B" reply "{\"id\":\"$id\",\"text\":\"back\"}" >/dev/null
+expect_screen "reply routes to the from agent's pane" "$F" "[cntctr reply from=b id=$id]"
+H=$(t new-window -d -n hand -P -F '#{pane_id}' cat)   # untagged, like a hand-started leader
+out=$(nopane send "{\"to\":\"b\",\"text\":\"via pane\",\"from\":\"$H\"}")
+check "send with from=<pane id> succeeds" "$(txt "$out")" "sent id="
+id=$(txt "$out" | sed 's/sent id=//')
+same "untagged from pane gets tagged" "$(t show -pqv -t "$H" @cntctr_name)" "agent-${H#%}"
+expect_screen "envelope names the tagged leader" "$B" "[cntctr from=agent-${H#%} id=$id]"
+out=$(nopane send '{"to":"b","text":"x","from":"ghost"}')
+same "from an unknown agent refused" "$(txt "$out")" "from=ghost is not a live agent or pane"
 
 # ---- reply and blocking send ----
 S=$(newpane s)   # fresh sender, so screen checks only see this section's traffic

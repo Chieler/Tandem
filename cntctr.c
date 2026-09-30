@@ -45,6 +45,9 @@ static int cancelled(void) {
 static char client_name[64] = "agent";   /* clientInfo.name from initialize */
 static char self_pane[32];               /* our tmux pane id, e.g. "%3"; empty outside tmux */
 static char self_name[128];              /* our agent name (the pane's @cntctr_name) */
+/* Who the current tool call is from: self_*, or the `from` argument when one shared
+ * server (Codex) serves many panes. Set per call in dispatch. */
+static _Thread_local char caller_pane[32], caller_name[128];
 static pthread_mutex_t fork_mu = PTHREAD_MUTEX_INITIALIZER;   /* held from pipe() to fork() */
 
 static char *fmt(const char *f, ...) {
@@ -311,7 +314,7 @@ static void new_id(char id[9]) { snprintf(id, 9, "%08x", arc4random()); }
 static void track(const char *id, int wait) {
     char opt[48];
     snprintf(opt, sizeof opt, "@cntctr_from_%s", id);
-    free(TMUXE(NULL, "set", "-s", opt, self_pane));
+    free(TMUXE(NULL, "set", "-s", opt, caller_pane));
     if (wait) {
         snprintf(opt, sizeof opt, "@cntctr_wait_%s", id);
         free(TMUXE(NULL, "set", "-s", opt, "1"));
@@ -336,8 +339,8 @@ static void untrack(const char *id) {
     free(TMUXE(NULL, "set", "-su", opt));
 }
 
-static char *envelope(const char *id, const char *text) {
-    return fmt("[cntctr from=%s id=%s]\n%s\n[when done: call the reply tool of the cntctr MCP server with id=%s and your answer; it is an MCP tool, not a shell command]", self_name, id, text, id);
+static char *envelope(const char *id, const char *text, const char *you) {
+    return fmt("[cntctr from=%s id=%s]\n%s\n[when done: call the reply tool of the cntctr MCP server with id=%s and your answer; it is an MCP tool, not a shell command. Your agent name is %s: pass from=%s when you call send, spawn or kill]", caller_name, id, text, id, you, you);
 }
 
 /* Nonzero if `pane` exists and its process is still running. */
@@ -419,7 +422,7 @@ static int await_reply(const char *id, const char *pane, const char *who, int ti
     free(TMUXE(NULL, "set", "-su", opt));   /* stop repliers from signalling us, then claim */
     char *text = buffer_take(buf);
     if (text && cancelled()) {   /* nobody reads our result anymore: type the reply into our pane */
-        char *env = fmt("[cntctr reply from=%s id=%s]\n%s", who, id, text), *err = inject(self_pane, "your pane", env);
+        char *env = fmt("[cntctr reply from=%s id=%s]\n%s", who, id, text), *err = inject(caller_pane, "your pane", env);
         free(env);
         free(text);
         if (err) return fail(res, err);
@@ -470,7 +473,7 @@ static int tool_send(json_object *a, char **res) {
     new_id(id);
     track(id, wait);
     track_to(id, pane);
-    env = envelope(id, text);
+    env = envelope(id, text, to);
     err = inject(pane, to, env);
     free(env);
     if (err) {
@@ -550,7 +553,7 @@ static int tool_spawn(json_object *a, char **res) {
     char id[9];
     new_id(id);
     track(id, wait);
-    char *env = envelope(id, task);
+    char *env = envelope(id, task, name);
     /* Separate argv entries, so tmux execs the harness without a shell. agy takes
      * its first prompt through -i; claude and codex take it as a plain argument. */
     int rc = run(NULL, &pane, (const char *[]){"tmux", "new-window", "-d", "-n", name, "-c", cwd, "-P", "-F", "#{pane_id}",
@@ -574,7 +577,7 @@ static int tool_kill(json_object *a, char **res) {
     const char *name = sarg(a, "name");
     char *pane = name ? find_agent(name) : NULL, *err;
     if (!pane) return fail(res, fmt("agent %s not found", name ? name : "(none)"));
-    if (strcmp(pane, self_pane) == 0) {
+    if (strcmp(pane, caller_pane) == 0) {
         free(pane);
         return fail(res, fmt("cannot kill yourself"));
     }
@@ -595,10 +598,39 @@ static const struct { const char *name; tool_fn fn; int needs_pane; } TOOL_FNS[]
     {NULL, NULL, 0},
 };
 
+/* Set caller_* from the `from` argument: an agent name, or a pane id ($TMUX_PANE) for a
+ * leader started by hand, which is tagged on first use. Returns an error or NULL. */
+static char *resolve_from(const char *from) {
+    char *pane = *from == '%' ? strdup(from) : find_agent(from);
+    if (!pane || !pane_alive(pane)) {
+        free(pane);
+        return fmt("from=%s is not a live agent or pane", from);
+    }
+    char *name;
+    snprintf(caller_pane, sizeof caller_pane, "%s", pane);
+    if (TMUX(NULL, &name, "show", "-pqv", "-t", pane, "@cntctr_name") == 0 && *name) {
+        snprintf(caller_name, sizeof caller_name, "%s", name);
+    } else {
+        snprintf(caller_name, sizeof caller_name, "agent-%s", pane + 1);
+        free(TMUXE(NULL, "set", "-p", "-t", pane, "@cntctr_name", caller_name));
+    }
+    free(name);
+    free(pane);
+    return NULL;
+}
+
 static int dispatch(const char *name, json_object *args, char **res) {
     for (int i = 0; TOOL_FNS[i].name; i++) {
         if (strcmp(TOOL_FNS[i].name, name ? name : "") != 0) continue;
-        if (TOOL_FNS[i].needs_pane && !*self_pane) return fail(res, fmt("cntctr is not running inside a tmux pane"));
+        snprintf(caller_pane, sizeof caller_pane, "%s", self_pane);
+        snprintf(caller_name, sizeof caller_name, "%s", self_name);
+        const char *from = sarg(args, "from");
+        if (TOOL_FNS[i].needs_pane && from && *from) {
+            char *err = resolve_from(from);
+            if (err) return fail(res, err);
+        }
+        if (TOOL_FNS[i].needs_pane && !*caller_pane)
+            return fail(res, fmt("cntctr cannot tell which pane you are in; pass from=<your agent name, or your $TMUX_PANE if you were started by hand>"));
         return TOOL_FNS[i].fn(args, res);
     }
     return fail(res, fmt("unknown tool %s", name ? name : "(none)"));
@@ -613,6 +645,7 @@ static const char TOOLS[] =
     "\"name\":{\"type\":\"string\",\"description\":\"Unique agent name; other agents use it as 'to'\"},"
     "\"task\":{\"type\":\"string\"},"
     "\"cwd\":{\"type\":\"string\",\"description\":\"Working directory; defaults to yours\"},"
+    "\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"},"
     "\"wait\":{\"type\":\"boolean\"},"
     "\"timeout\":{\"type\":\"integer\",\"description\":\"Seconds to block when wait=true (default 600)\"}},"
     "\"required\":[\"harness\",\"name\",\"task\"]}},"
@@ -620,6 +653,7 @@ static const char TOOLS[] =
     "With wait=true, blocks until the receiver calls reply; if the timeout passes first, the reply arrives in your terminal later.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
     "\"to\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},\"wait\":{\"type\":\"boolean\"},"
+    "\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"},"
     "\"timeout\":{\"type\":\"integer\",\"description\":\"Seconds to block when wait=true (default 600)\"}},"
     "\"required\":[\"to\",\"text\"]}},"
     "{\"name\":\"reply\",\"description\":\"Answer a message you received. Use the id from its [cntctr from=... id=...] header. "
@@ -629,7 +663,7 @@ static const char TOOLS[] =
     "{\"name\":\"list\",\"description\":\"List agents: name, harness, tmux pane, alive or dead.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
     "{\"name\":\"kill\",\"description\":\"Close an agent's tmux pane.\","
-    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"]}}"
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"}},\"required\":[\"name\"]}}"
     "]}";
 
 /* ---- MCP protocol ---- */
