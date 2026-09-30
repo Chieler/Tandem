@@ -38,7 +38,7 @@ Success looks like this: a Claude leader can spawn a Codex worker, send it a tas
         │ tmux cmds (fork/execvp, argv only, text via stdin pipe)    │
         └──────────────────► tmux server ◄───────────────────────────┘
                  pane options: @cntctr_name, @cntctr_harness
-                 server options: @cntctr_from_<id>, @cntctr_wait_<id>
+                 server options: @cntctr_from_<id>, @cntctr_to_<id>, @cntctr_wait_<id>
                  buffers: cntctr-in-<id>, cntctr-reply-<id>
                  wait-for channels: cntctr-<id>
 ```
@@ -80,7 +80,7 @@ Delivered back to the sender as a reply:
 <text>
 ```
 
-`id` is 8 hex characters taken from `arc4random`. On `send`, the server sets the server option `@cntctr_from_<id>` to the sender's pane id. Replies are routed by pane id, not by name.
+`id` is 8 hex characters taken from `arc4random`. On `send`, the server sets the server option `@cntctr_from_<id>` to the sender's pane id. Replies are routed by pane id, not by name. It also sets `@cntctr_to_<id>` to the receiver's pane. `reply` takes the replier's name from that pane, so it works from a server that is not inside any pane (Codex runs one shared MCP server under its app-server daemon).
 
 ### Inject into a pane
 

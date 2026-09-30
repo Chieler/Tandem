@@ -219,6 +219,14 @@ same "reply to unknown id" "$(txt "$out")" "unknown id deadbeef"
 out=$(call "$B" reply '{"id":"../../x","text":"x"}')
 same "reply rejects malformed id" "$(txt "$out")" "unknown id ../../x"
 
+# Codex runs one shared MCP server outside any pane: reply must work without knowing its own pane
+out=$(call "$S" send '{"to":"b","text":"answer me from nowhere"}')
+id=$(txt "$out" | sed 's/sent id=//')
+out=$(session "" 2 "$INIT" "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"reply\",\"arguments\":{\"id\":\"$id\",\"text\":\"paneless answer\"}}}" | tail -n 1)
+same "reply from a server outside any pane" "$(txt "$out")" ok
+expect_screen "paneless reply is signed with the receiver's name" "$S" "[cntctr reply from=b id=$id]"
+expect_screen "paneless reply text" "$S" "paneless answer"
+
 # ---- spawn and kill ----
 cat > "$TMPD/bin/claude" <<'EOF'
 #!/bin/sh

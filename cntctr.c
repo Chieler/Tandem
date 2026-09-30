@@ -318,9 +318,19 @@ static void track(const char *id, int wait) {
     }
 }
 
+/* Record which pane message `id` went to, so reply can name the replier
+ * without knowing its own pane (Codex runs one shared server outside any pane). */
+static void track_to(const char *id, const char *pane) {
+    char opt[48];
+    snprintf(opt, sizeof opt, "@cntctr_to_%s", id);
+    free(TMUXE(NULL, "set", "-s", opt, pane));
+}
+
 static void untrack(const char *id) {
     char opt[48];
     snprintf(opt, sizeof opt, "@cntctr_from_%s", id);
+    free(TMUXE(NULL, "set", "-su", opt));
+    snprintf(opt, sizeof opt, "@cntctr_to_%s", id);
     free(TMUXE(NULL, "set", "-su", opt));
     snprintf(opt, sizeof opt, "@cntctr_wait_%s", id);
     free(TMUXE(NULL, "set", "-su", opt));
@@ -459,6 +469,7 @@ static int tool_send(json_object *a, char **res) {
     char id[9], *env, *err;
     new_id(id);
     track(id, wait);
+    track_to(id, pane);
     env = envelope(id, text);
     err = inject(pane, to, env);
     free(env);
@@ -507,7 +518,13 @@ static int tool_reply(json_object *a, char **res) {
         untrack(id);
         return fail(res, fmt("sender gone"));
     }
-    env = fmt("[cntctr reply from=%s id=%s]\n%s", self_name, id, text);
+    char *me = NULL;
+    snprintf(opt, sizeof opt, "@cntctr_to_%s", id);
+    char *to = sopt_get(opt);
+    if (to && TMUX(NULL, &me, "show", "-pqv", "-t", to, "@cntctr_name") != 0) *me = '\0';
+    env = fmt("[cntctr reply from=%s id=%s]\n%s", me && *me ? me : *self_name ? self_name : client_name, id, text);
+    free(me);
+    free(to);
     err = inject(sender, "sender", env);
     free(env);
     free(sender);
@@ -545,6 +562,7 @@ static int tool_spawn(json_object *a, char **res) {
     }
     /* ponytail: a worker that calls cntctr before these tags land names itself
      * <client>-<n>. Real harnesses take seconds to start; tag via new-window -e if that changes. */
+    track_to(id, pane);
     free(TMUXE(NULL, "set", "-p", "-t", pane, "@cntctr_name", name));
     free(TMUXE(NULL, "set", "-p", "-t", pane, "@cntctr_harness", harness));
     int r = wait ? await_reply(id, pane, name, targ(a), res) : ok(res, fmt("spawned %s in %s id=%s", name, pane, id));
@@ -571,7 +589,7 @@ typedef int (*tool_fn)(json_object *args, char **res);
 static const struct { const char *name; tool_fn fn; int needs_pane; } TOOL_FNS[] = {
     {"list", tool_list, 0},
     {"send", tool_send, 1},
-    {"reply", tool_reply, 1},
+    {"reply", tool_reply, 0},
     {"spawn", tool_spawn, 1},
     {"kill", tool_kill, 1},
     {NULL, NULL, 0},
