@@ -327,7 +327,7 @@ static void untrack(const char *id) {
 }
 
 static char *envelope(const char *id, const char *text) {
-    return fmt("[cntctr from=%s id=%s]\n%s\n[when done: cntctr reply id=%s]", self_name, id, text, id);
+    return fmt("[cntctr from=%s id=%s]\n%s\n[when done: call the reply tool of the cntctr MCP server with id=%s and your answer; it is an MCP tool, not a shell command]", self_name, id, text, id);
 }
 
 /* Nonzero if `pane` exists and its process is still running. */

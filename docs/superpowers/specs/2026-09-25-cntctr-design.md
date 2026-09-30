@@ -71,7 +71,7 @@ Delivered to the receiver:
 ```
 [cntctr from=<sender name> id=<id>]
 <text>
-[when done: cntctr reply id=<id>]
+[when done: call the reply tool of the cntctr MCP server with id=<id> and your answer; it is an MCP tool, not a shell command]
 ```
 
 Delivered back to the sender as a reply:
