@@ -292,20 +292,31 @@ static int awaiting_permission(const char *pane) {
 
 static int enter_delay_ms = 150;   /* CNTCTR_ENTER_DELAY_MS: pause between paste and Enter */
 
+/* Write `text` to `pane`'s program through a temporary buffer, bracketed or raw. */
+static char *paste(const char *pane, const char *text, int bracketed) {
+    char buf[32], *err;
+    snprintf(buf, sizeof buf, "cntctr-in-%08x", arc4random());
+    if ((err = TMUXE(text, "load-buffer", "-b", buf, "-"))) return err;
+    if ((err = bracketed ? TMUXE(NULL, "paste-buffer", "-p", "-d", "-b", buf, "-t", pane)
+                         : TMUXE(NULL, "paste-buffer", "-d", "-b", buf, "-t", pane)))
+        free(TMUXE(NULL, "delete-buffer", "-b", buf));
+    return err;
+}
+
 /* Paste `text` into `pane` as one bracketed paste, then press Enter.
  * `who` names the pane in errors. Returns NULL or an error (caller frees). */
 static char *inject(const char *pane, const char *who, const char *text) {
     if (awaiting_permission(pane)) return fmt("%s awaiting permission prompt; retry later", who);
-    char buf[32], *err;
-    snprintf(buf, sizeof buf, "cntctr-in-%08x", arc4random());
-    if ((err = TMUXE(text, "load-buffer", "-b", buf, "-"))) return err;
-    if ((err = TMUXE(NULL, "paste-buffer", "-p", "-d", "-b", buf, "-t", pane))) {
-        free(TMUXE(NULL, "delete-buffer", "-b", buf));
-        return err;
-    }
+    size_t n = strlen(text);
+    /* Claude reads backslash + Enter as "new line", not "submit". */
+    char *body = n && text[n - 1] == '\\' ? fmt("%s\n", text) : NULL, *err;
+    err = paste(pane, body ? body : text, 1);
+    free(body);
+    if (err) return err;
     struct timespec pause = {enter_delay_ms / 1000, (enter_delay_ms % 1000) * 1000000L};
     nanosleep(&pause, NULL);
-    return TMUXE(NULL, "send-keys", "-t", pane, "Enter");
+    /* Enter as a raw CR paste: send-keys would go to copy-mode if the user is scrolled back. */
+    return paste(pane, "\r", 0);
 }
 
 static void new_id(char id[9]) { snprintf(id, 9, "%08x", arc4random()); }

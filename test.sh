@@ -116,6 +116,17 @@ expect_screen "multiline unicode text arrives" "$B" "line two ünï"
 call "$A" send "$(jq -nc --arg t "\$(touch $TMPD/pwned) \`touch $TMPD/pwned\`" '{to:"b",text:$t}')" >/dev/null
 expect_screen "shell syntax arrives literally" "$B" "\$(touch $TMPD/pwned)"
 if [ -e "$TMPD/pwned" ]; then bad "send text was run by a shell"; else ok_; fi
+C=$(newpane cm)
+t copy-mode -t "$C"   # the user scrolled back in the receiver's pane
+call "$A" send '{"to":"cm","text":"sent while scrolled"}' >/dev/null
+t send-keys -t "$C" -X cancel
+for _ in $(seq 50); do [ "$(screen "$C" | grep -c 'when done')" -ge 2 ] && break; sleep 0.1; done
+same "Enter reaches a pane in copy-mode" "$(screen "$C" | grep -c 'when done')" 2
+# read without -r, like Claude's input box, treats a trailing backslash as "continue on the next line"
+K=$(newpane bs sh -c 'while read l; do echo "GOT:$l"; done')
+id=$(txt "$(call "$K" send '{"to":"b","text":"ask"}')" | sed 's/sent id=//')
+call "$B" reply "{\"id\":\"$id\",\"text\":\"ends in \\\\\"}" >/dev/null
+expect_screen "reply ending in a backslash is still submitted" "$K" "GOT:ends in"
 G=$(newpane g sh -c 'echo "Do you want to proceed?"; exec cat')
 expect_screen "guard pane ready" "$G" "Do you want to proceed?"
 out=$(call "$A" send '{"to":"g","text":"sneaky"}')
