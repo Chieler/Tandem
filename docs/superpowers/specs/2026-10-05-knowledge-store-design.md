@@ -39,7 +39,7 @@ This is sub-project 1 of 2. Sub-project 2, a cross-machine signal layer covering
 
 ```sql
 CREATE TABLE entries(
-  id TEXT PRIMARY KEY,          -- <machine>-<ms since epoch, hex>-<4 random hex>
+  id TEXT PRIMARY KEY,          -- <machine hex>-<ms since epoch, hex>-<4 random hex>
   layer TEXT NOT NULL,          -- insight | skill | doc | history
   scope TEXT NOT NULL,          -- project key or 'global'
   title TEXT NOT NULL,
@@ -59,7 +59,7 @@ CREATE TABLE projects(root TEXT PRIMARY KEY, key TEXT NOT NULL);
 CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT);   -- schema, machine, last_distill:<scope>
 ```
 
-`machine` is a random 8-hex-character id, generated on first open and stored in `meta`, followed by `-` and the short hostname. `author` is `$USER`.
+`machine` is a random 8-hex-character id followed by `-` and the short hostname, generated on first open and stored in `meta`. Entry ids start with the 8-hex part. `author` is `$USER`.
 
 ## Project resolution
 
@@ -82,7 +82,7 @@ The new tools are `note`, `recall`, `read`, `forget`, `project` and `distill`, a
 | Tool | Args | Behavior |
 |---|---|---|
 | `note` | `layer` (insight, skill or doc), `title`, `summary`, `body`?, `tags`?, `refs`?, `scope` (`project` by default, or `global`), `supersedes`? (array of ids) | Inserts an entry and mirrors it to claude-mem. Each id in `supersedes` gets `superseded_by` set to the new id, and its claude-mem copy is deleted. Returns the new id. |
-| `recall` | `query`?, `layer`?, `scope`?, `limit` (default 20) | Without `query`, it returns the **index**: live entries for the project, then global ones, insights and skills first, newest first, one line each as `id [layer] title — summary`. With `query`, it runs FTS5 bm25 over live entries (history included), merged with claude-mem observation hits. A hit that maps to a cntctr entry through `mem_id` is shown as that entry. Any other hit is shown as `claude-mem #<n> <title>`, which brings Claude's and Codex's own observations into recall. |
+| `recall` | `query`?, `layer`?, `scope`?, `since`? (UTC `YYYY-MM-DD HH:MM:SS`, index only), `limit` (default 20, at most 200) | Without `query`, it returns the **index**: live entries for the project, then global ones, insights and skills first, newest first (history only when `layer=history`), one line each as `id [layer] title — summary`. With `query`, it runs FTS5 bm25 over live entries (history included), merged with claude-mem observation hits. A hit that maps to a cntctr entry through `mem_id` is shown as that entry. Any other hit is shown as `claude-mem #<n> <title>`, which brings Claude's and Codex's own observations into recall. |
 | `read` | `id` | The full entry: every field, including `body` and `refs`. A superseded entry is still readable and shows `superseded_by`. |
 | `forget` | `id` | Sets `superseded_by = 'forgotten'` and deletes the claude-mem copy. History can't be forgotten. |
 | `project` | `key`? | With no args, shows the resolved key and the root. With `key`, sets the override for this root, and an empty key removes it. Existing entries keep their old scope, since retagging is the librarian's job. |
@@ -99,7 +99,7 @@ Logging writes history in the **sender's** project scope, without mirroring it, 
 ### What agents see automatically
 
 - **`initialize` instructions.** The `instructions` field of the result carries two short paragraphs explaining when to `recall`, `note` and attach `insights`. It also carries the project index, capped at 40 lines or 4 KB. A server with no pane, such as Codex's, carries only the global index and tells the agent to call `recall` with `from`.
-- **Envelope.** Every `send` and `spawn` envelope gets a block before the reply hint. It lists up to 5 live entries from an FTS5 search on the task text, as `id: summary`, followed by `[knowledge: call recall for more; when you reply, pass insights=[...] with durable facts others should know]`. The block is left out when there are no matches.
+- **Envelope.** Every `send` and `spawn` envelope gets a block before the reply hint. It starts with `[cntctr knowledge: call recall for more]` and lists up to 5 live non-history entries from an FTS5 search on the task text, in the same line format as `recall`. The block is left out when there are no matches. The reply hint always asks for `insights=[...]`, whether or not the block appears.
 
 ### Librarian task (`distill`)
 
@@ -135,6 +135,7 @@ The task is fixed text, filled in with the scope and the last distill time:
 | `note` is missing `layer`, `title` or `summary`, or has a bad layer | `note needs layer (insight, skill or doc), title and summary` |
 | Unknown id in `read`, `forget` or `supersedes` | `entry <id> not found` (`note` fails before inserting anything) |
 | `forget` on history | `history entries cannot be forgotten` |
+| `supersedes` naming a history entry | `history entries cannot be superseded` |
 | `SQLITE_BUSY` after `busy_timeout` (5 s) | Returned as a tool error |
 | claude-mem down or slow | Ignored. Recall uses FTS5 only. |
 
