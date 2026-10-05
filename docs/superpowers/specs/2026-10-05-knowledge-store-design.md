@@ -1,7 +1,7 @@
 # cntctr knowledge store — Design Spec
 
 Date: 2026-10-05
-Status: Design agreed in conversation; pending written-spec review.
+Status: Approved 2026-10-05, including the claude-mem mirror changes.
 
 ## Context
 
@@ -82,7 +82,7 @@ The new tools are `note`, `recall`, `read`, `forget`, `project` and `distill`, a
 | Tool | Args | Behavior |
 |---|---|---|
 | `note` | `layer` (insight, skill or doc), `title`, `summary`, `body`?, `tags`?, `refs`?, `scope` (`project` by default, or `global`), `supersedes`? (array of ids) | Inserts an entry and mirrors it to claude-mem. Each id in `supersedes` gets `superseded_by` set to the new id, and its claude-mem copy is deleted. Returns the new id. |
-| `recall` | `query`?, `layer`?, `scope`?, `limit` (default 20) | Without `query`, it returns the **index**: live entries for the project, then global ones, insights and skills first, newest first, one line each as `id [layer] title — summary`. With `query`, it runs FTS5 bm25 over live entries (history included), merged with claude-mem search hits. A hit that maps to a cntctr entry through `mem_id` is shown as that entry. Any other hit is shown as `claude-mem #<n> <title>`, which brings Claude's own observations into recall. |
+| `recall` | `query`?, `layer`?, `scope`?, `limit` (default 20) | Without `query`, it returns the **index**: live entries for the project, then global ones, insights and skills first, newest first, one line each as `id [layer] title — summary`. With `query`, it runs FTS5 bm25 over live entries (history included), merged with claude-mem observation hits. A hit that maps to a cntctr entry through `mem_id` is shown as that entry. Any other hit is shown as `claude-mem #<n> <title>`, which brings Claude's and Codex's own observations into recall. |
 | `read` | `id` | The full entry: every field, including `body` and `refs`. A superseded entry is still readable and shows `superseded_by`. |
 | `forget` | `id` | Sets `superseded_by = 'forgotten'` and deletes the claude-mem copy. History can't be forgotten. |
 | `project` | `key`? | With no args, shows the resolved key and the root. With `key`, sets the override for this root, and an empty key removes it. Existing entries keep their old scope, since retagging is the librarian's job. |
@@ -117,10 +117,14 @@ The task is fixed text, filled in with the scope and the last distill time:
 ## claude-mem mirror
 
 - The base URL comes from `CNTCTR_MEM_URL`, defaulting to `http://127.0.0.1:37701`. An empty value turns mirroring off.
-- **Save** runs `curl -s -m 2 -X POST -H 'Content-Type: application/json' --data-binary @- <url>/api/memory/save`, with the body `{"title","text": summary + "\n\n" + body,"project": scope,"metadata":{"cntctr_id","layer"}}`. The returned `id` is stored in `mem_id`.
+- **Project name.** claude-mem names projects after the directory (`cntctr`, `work_aptdat`), not the remote. Mirrored entries use the basename of the project root, so they sit next to Claude's and Codex's own observations of that repo. Global entries use the project `cntctr-global`. The full scope key goes in `metadata.scope`.
+- **Save** runs `curl -s -m 2 -X POST -H 'Content-Type: application/json' --data-binary @- <url>/api/memory/save`, with the body `{"title","text": summary + "\n\n" + body,"project": <basename>,"metadata":{"cntctr_id","layer","scope"}}`. The returned `id` is stored in `mem_id`.
 - **Delete** runs `curl -s -m 2 -X DELETE <url>/api/observation/<mem_id>`.
-- **Search** runs `curl -s -m 2 '<url>/api/search?query=<q>&project=<scope>&limit=<n>'`. The response text is a markdown table, and the observation ids are the `#<n>` tokens in it.
+- **Search** runs `curl -s -m 2 '<url>/api/search/observations?query=<q>&project=<basename>&limit=<n>'`, with the query URL-encoded by cntctr. It searches observations only, because `/api/search` mixes in session and prompt ids that would be mistaken for observations. The response's `content[0].text` is a markdown table, and the observation ids are the `#<n>` tokens that start its rows.
+- **Fragility.** This is claude-mem's internal API (13.15), and it returns markdown, not JSON. If the format changes, parsing finds no ids and recall quietly falls back to FTS5 alone. That's acceptable because SQLite is the source of truth.
 - Any failure, whether a timeout, a non-JSON reply or a missing id, is ignored. The entry stays unmirrored (`mem_id` NULL).
+- **Known overlap:** claude-mem's startup context may also list mirrored insights, so a Claude agent can see them twice. Accepted for v1.
+- **Privacy:** history is never mirrored. If claude-mem's cmem.ai cloud sync is turned on, mirrored shared entries go with it. It's off (`configured:false`) on this machine.
 - **Known limit:** there's no retry queue, so entries written while claude-mem is down never get mirrored. The librarian pass can re-mirror rows with a NULL `mem_id` later, if that matters.
 
 ## Error handling
@@ -148,8 +152,8 @@ The task is fixed text, filled in with the scope and the last distill time:
 8. `initialize` returns `instructions` containing the project index.
 9. Project key: in a temporary git repo whose origin is `git@github.com:X/y.git`, `project` reports `github.com/X/y`, and after `project key=foo` it reports `foo`.
 10. Concurrency: 20 parallel `note` calls from separate processes all succeed.
-11. Mirror: a Python `http.server` stub on a random port records requests and answers `/api/memory/save` with `{"id":7}` and `/api/search` with `#7`.
-    - `note` posts the entry and stores `mem_id` 7, `recall query` returns the entry through `#7`, and `forget` sends `DELETE /api/observation/7`.
+11. Mirror: a Python `http.server` stub on a random port records requests and answers `/api/memory/save` with `{"id":7}` and `/api/search/observations` with a table row `| #7 |`.
+    - `note` posts the entry under the repo's basename as project and stores `mem_id` 7, `recall query` returns the entry through `#7`, and `forget` sends `DELETE /api/observation/7`.
     - With the stub stopped, `note` still succeeds.
 
 ## Files
