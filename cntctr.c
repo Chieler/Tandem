@@ -748,6 +748,40 @@ static int tool_project(json_object *a, char **res) {
     return ok(res, fmt("project %s (root %s)", p.key, p.root));
 }
 
+static int tool_recall(json_object *a, char **res) {
+    const char *query = sarg(a, "query"), *layer = sarg(a, "layer"), *scope = sarg(a, "scope"), *since = sarg(a, "since");
+    json_object *v;
+    int limit = json_object_object_get_ex(a, "limit", &v) ? json_object_get_int(v) : 20;
+    limit = limit < 1 ? 1 : limit > 200 ? 200 : limit;
+    if (layer && !*layer) layer = NULL;
+    struct project p;
+    sqlite3 *db = kb_for_caller(&p, res);
+    if (!db) return 1;
+    const char *s1 = p.key, *s2 = "global";
+    if (scope && strcmp(scope, "global") == 0) s1 = "global", s2 = NULL;
+    else if (scope && strcmp(scope, "project") == 0) s2 = NULL;
+    char *out = query && *query ? kb_search(db, s1, s2, query, layer, 1, limit) : kb_index(db, s1, s2, layer, since, limit);
+    sqlite3_close(db);
+    if (*out) return ok(res, out);
+    free(out);
+    return ok(res, fmt("no entries"));
+}
+
+static int tool_forget(json_object *a, char **res) {
+    const char *id = sarg(a, "id");
+    if (!id) return fail(res, fmt("forget needs 'id'"));
+    sqlite3 *db = kb(res);
+    if (!db) return 1;
+    char layer[16];
+    long long mem = 0;
+    int found = kb_lookup(db, id, layer, &mem) == 0, history = found && strcmp(layer, "history") == 0;
+    if (found && !history) kb_supersede(db, id, "forgotten");
+    sqlite3_close(db);
+    if (!found) return fail(res, fmt("entry %s not found", id));
+    if (history) return fail(res, fmt("history entries cannot be forgotten"));
+    return ok(res, fmt("forgot %s", id));
+}
+
 /* ---- dispatch ---- */
 
 typedef int (*tool_fn)(json_object *args, char **res);
@@ -760,6 +794,8 @@ static const struct { const char *name; tool_fn fn; int needs_pane; } TOOL_FNS[]
     {"note", tool_note, 0},
     {"read", tool_read, 0},
     {"project", tool_project, 0},
+    {"recall", tool_recall, 0},
+    {"forget", tool_forget, 0},
     {NULL, NULL, 0},
 };
 
@@ -848,6 +884,15 @@ static const char TOOLS[] =
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"]}},"
     "{\"name\":\"project\",\"description\":\"Show the project key your knowledge is filed under, or set key to override it for this repo (empty key removes the override).\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}," KFROM "}}}"
+    ",{\"name\":\"recall\",\"description\":\"Read the shared knowledge store before you explore. Without query: the index, "
+    "one line per entry, this project first, then global. With query: search, including work history. Use read for an entry's full text.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},"
+    "\"layer\":{\"type\":\"string\",\"enum\":[\"insight\",\"skill\",\"doc\",\"history\"]},"
+    "\"scope\":{\"type\":\"string\",\"enum\":[\"project\",\"global\"]},"
+    "\"since\":{\"type\":\"string\",\"description\":\"UTC 'YYYY-MM-DD HH:MM:SS'; index only\"},"
+    "\"limit\":{\"type\":\"integer\",\"description\":\"Default 20, at most 200\"}," KFROM "}}},"
+    "{\"name\":\"forget\",\"description\":\"Retire a stale or wrong knowledge entry (history cannot be forgotten).\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"]}}"
     "]}";
 
 /* ---- MCP protocol ---- */

@@ -334,6 +334,30 @@ KP=$(t new-window -d -n kp -c "$TMPD/plain" -P -F '#{pane_id}' cat)
 t set -p -t "$KP" @cntctr_name kp
 check "outside git the key is the directory" "$(txt "$(call "$KP" project '{}')")" "/plain (root "
 
+call "$KA" note '{"layer":"skill","title":"Run the tests","summary":"make test runs test.sh under ASan","scope":"global"}' >/dev/null
+call "$KR" note '{"layer":"insight","title":"Other repo fact","summary":"only in the other repo"}' >/dev/null
+idx=$(txt "$(call "$KA" recall '{}')")
+check "index lists the project insight" "$idx" "$nid [insight] Enter in copy-mode — send-keys Enter goes to copy-mode; paste a CR instead"
+check "index lists the global skill" "$idx" "[skill] Run the tests — make test runs test.sh under ASan"
+same "project entries come before global ones" "$(printf '%s\n' "$idx" | head -n 1 | cut -d' ' -f1)" "$nid"
+refute "index leaves out other projects" "$idx" "only in the other repo"
+check "other projects see global entries" "$(txt "$(call "$KR" recall '{}')")" "Run the tests"
+refute "scope=global leaves out the project" "$(txt "$(call "$KA" recall '{"scope":"global"}')")" "$nid"
+check "search finds a body word" "$(txt "$(call "$KA" recall '{"query":"Seen"}')")" "$nid"
+check "search finds a tag" "$(txt "$(call "$KA" recall '{"query":"scrollback"}')")" "$nid"
+same "search with no hits" "$(txt "$(call "$KA" recall '{"query":"zebra"}')")" "no entries"
+same "search text is never FTS syntax" "$(txt "$(call "$KA" recall '{"query":"\"AND ( NEAR"}')")" "no entries"
+out=$(call "$KA" note "{\"layer\":\"insight\",\"title\":\"Enter fix\",\"summary\":\"inject pastes a raw CR so copy-mode cannot eat Enter\",\"supersedes\":[\"$nid\"]}")
+nid2=$(txt "$out" | sed 's/noted //')
+refute "superseded entry leaves the index" "$(txt "$(call "$KA" recall '{}')")" "$nid "
+refute "superseded entry leaves search" "$(txt "$(call "$KA" recall '{"query":"scrollback"}')")" "$nid"
+check "superseded entry is still readable" "$(txt "$(call "$KA" read "{\"id\":\"$nid\"}")")" "superseded_by: $nid2"
+same "supersedes an unknown id" "$(txt "$(call "$KA" note '{"layer":"insight","title":"x","summary":"y","supersedes":["nope"]}')")" "entry nope not found"
+fid=$(txt "$(call "$KA" note '{"layer":"doc","title":"Stale","summary":"soon gone"}')" | sed 's/noted //')
+same "forget" "$(txt "$(call "$KA" forget "{\"id\":\"$fid\"}")")" "forgot $fid"
+refute "forgotten entry leaves the index" "$(txt "$(call "$KA" recall '{}')")" "soon gone"
+same "forget an unknown id" "$(txt "$(call "$KA" forget '{"id":"nope"}')")" "entry nope not found"
+
 # ---- summary ----
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
