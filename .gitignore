@@ -2,3 +2,4 @@ cntctr
 cntctr-test
 *.dSYM/
 .claude/
+.worktrees/
