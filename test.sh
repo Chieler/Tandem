@@ -372,7 +372,8 @@ check "insight refs its message" "$(txt "$(call "$KA" read "{\"id\":\"$iid\"}")"
 hent=$(printf '%s\n' "$hist" | grep "task $hid" | cut -d' ' -f1)
 check "history is private" "$(txt "$(call "$KA" read "{\"id\":\"$hent\"}")")" "visibility: private"
 same "history cannot be forgotten" "$(txt "$(call "$KA" forget "{\"id\":\"$hent\"}")")" "history entries cannot be forgotten"
-same "history cannot be superseded" "$(txt "$(call "$KA" note "{\"layer\":\"insight\",\"title\":\"x\",\"summary\":\"y\",\"supersedes\":[\"$hent\"]}")")" "history entries cannot be superseded"
+out=$(call "$KA" note "{\"layer\":\"insight\",\"title\":\"x\",\"summary\":\"y\",\"supersedes\":[\"$hent\"]}")
+same "history cannot be superseded" "$(txt "$out")" "history entries cannot be superseded"
 long="x$(printf 'é%.0s' $(seq 60))"   # 121 bytes: byte 80 is inside an é, so the 80-byte title cut must back off
 hid=$(txt "$(call "$KA" send '{"to":"kb","text":"unicode"}')" | sed 's/sent id=//')
 call "$KB" reply "{\"id\":\"$hid\",\"text\":\"ok\",\"insights\":[\"$long\"]}" >/dev/null
