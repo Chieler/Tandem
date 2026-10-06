@@ -110,7 +110,7 @@ check "send returns an id" "$(txt "$out")" "sent id="
 id=$(txt "$out" | sed 's/sent id=//')
 expect_screen "envelope header" "$B" "[cntctr from=a id=$id]"
 expect_screen "message text" "$B" "hello from a"
-expect_screen "reply hint" "$B" "[when done: call the reply tool of the cntctr MCP server with id=$id and your answer; it is an MCP tool, not a shell command. Your agent name is b: pass from=b when you call send, spawn or kill]"
+expect_screen "reply hint" "$B" "[when done: call the reply tool of the cntctr MCP server with id=$id and your answer, plus insights=[...] with durable facts other agents should know; it is an MCP tool, not a shell command. Your agent name is b: pass from=b when you call send, spawn or kill]"
 call "$A" send '{"to":"b","text":"line one\nline two ünï"}' >/dev/null
 expect_screen "multiline unicode text arrives" "$B" "line two ünï"
 call "$A" send "$(jq -nc --arg t "\$(touch $TMPD/pwned) \`touch $TMPD/pwned\`" '{to:"b",text:$t}')" >/dev/null
@@ -383,6 +383,19 @@ refute "titles are cut on a character boundary" "$out" "�"
 out=$(CNTCTR_DB=/nonexistent/x.db call "$KA" send '{"to":"kb","text":"still delivered"}')
 check "send works without a knowledge store" "$(txt "$out")" "sent id="
 same "note reports a missing store" "$(txt "$(CNTCTR_DB=/nonexistent/x.db call "$KA" note '{"layer":"insight","title":"x","summary":"y"}')" | cut -c1-30)" "knowledge store unavailable: u"
+call "$KA" send '{"to":"kb","text":"why does Enter get lost in copy-mode?"}' >/dev/null
+expect_screen "envelope points at recall" "$KB" "[cntctr knowledge: call recall for more]"
+expect_screen "envelope lists matching knowledge" "$KB" "$nid2 [insight] Enter fix — inject pastes a raw CR so copy-mode cannot eat Enter"
+words=$(printf 'word%d ' $(seq 3000))
+out=$(call "$KA" send "{\"to\":\"kb\",\"text\":\"$words\"}")
+check "a 3000-word task is still sent" "$(txt "$out")" "sent id="
+ins=$(session "$KA" 1 "$INIT" | jq -r .result.instructions)
+check "initialize explains the knowledge tools" "$ins" "call recall"
+check "initialize carries the project index" "$ins" "Enter fix — inject pastes a raw CR so copy-mode cannot eat Enter"
+ins=$(session "" 1 "$INIT" | jq -r .result.instructions)
+check "paneless instructions ask for from" "$ins" "pass from="
+check "paneless index shows global entries" "$ins" "Run the tests"
+refute "paneless index leaves out project entries" "$ins" "Enter fix"
 
 # ---- summary ----
 printf '%d passed, %d failed\n' "$pass" "$fail"
