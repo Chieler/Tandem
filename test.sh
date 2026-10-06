@@ -5,7 +5,7 @@ BIN=$(cd "$(dirname "${BIN:-./cntctr}")" && pwd)/$(basename "${BIN:-./cntctr}")
 TMPD=$(mktemp -d)
 INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"test"}}}'
 mkdir "$TMPD/bin"
-export BIN INIT CNTCTR_ENTER_DELAY_MS=50 LC_ALL=en_US.UTF-8 PATH="$TMPD/bin:$PATH"
+export BIN INIT CNTCTR_ENTER_DELAY_MS=50 LC_ALL=en_US.UTF-8 PATH="$TMPD/bin:$PATH" CNTCTR_DB="$TMPD/kb.db" CNTCTR_MEM_URL=
 unset TMUX_PANE
 
 t() { tmux -L cntctr-test -f /dev/null "$@"; }
@@ -299,6 +299,40 @@ same "kill worker" "$(txt "$(call "$L" kill '{"name":"w1"}')")" ok
 refute "killed worker gone from list" "$(txt "$(call "$L" list '{}')")" "w1 claude"
 same "kill self refused" "$(txt "$(call "$L" kill '{"name":"lead"}')")" "cannot kill yourself"
 same "kill missing agent" "$(txt "$(call "$L" kill '{"name":"nope"}')")" "agent nope not found"
+
+# ---- knowledge ----
+KA=$(newpane ka)
+out=$(call "$KA" note '{"layer":"insight","title":"Enter in copy-mode","summary":"send-keys Enter goes to copy-mode; paste a CR instead","body":"Seen with Claude 2.1.287.","tags":"scrollback","refs":"cntctr.c:inject"}')
+check "note returns an id" "$(txt "$out")" "noted "
+nid=$(txt "$out" | sed 's/noted //')
+same "entry id is <machine>-<ms>-<rand>" "$(printf '%s' "$nid" | grep -cE '^[0-9a-f]{8}-[0-9a-f]+-[0-9a-f]{4}$')" 1
+out=$(txt "$(call "$KA" read "{\"id\":\"$nid\"}")")
+check "read shows layer" "$out" "layer: insight"
+check "read shows summary" "$out" "summary: send-keys Enter goes to copy-mode; paste a CR instead"
+check "read shows tags" "$out" "tags: scrollback"
+check "read shows refs" "$out" "refs: cntctr.c:inject"
+check "read shows the agent" "$out" "(agent ka)"
+check "read shows visibility" "$out" "visibility: shared"
+check "read shows body" "$out" "Seen with Claude 2.1.287."
+same "read unknown id" "$(txt "$(call "$KA" read '{"id":"nope"}')")" "entry nope not found"
+same "note without summary" "$(txt "$(call "$KA" note '{"layer":"insight","title":"x"}')")" "note needs layer (insight, skill or doc), title and summary"
+same "note cannot write history" "$(txt "$(call "$KA" note '{"layer":"history","title":"x","summary":"y"}')")" "note needs layer (insight, skill or doc), title and summary"
+
+mkdir "$TMPD/repo" "$TMPD/plain"
+git -C "$TMPD/repo" init -q
+git -C "$TMPD/repo" remote add origin git@GitHub.com:X/y.git
+KR=$(t new-window -d -n kr -c "$TMPD/repo" -P -F '#{pane_id}' cat)
+t set -p -t "$KR" @cntctr_name kr
+check "project key from the origin remote" "$(txt "$(call "$KR" project '{}')")" "project github.com/X/y (root "
+git -C "$TMPD/repo" remote set-url origin https://github.com/X/y.git/
+check "https remote normalizes the same" "$(txt "$(call "$KR" project '{}')")" "project github.com/X/y (root "
+same "project override" "$(txt "$(call "$KR" project '{"key":"foo"}')" | cut -d' ' -f1-2)" "project foo"
+same "override persists" "$(txt "$(call "$KR" project '{}')" | cut -d' ' -f1-2)" "project foo"
+call "$KR" project '{"key":""}' >/dev/null
+check "empty key removes the override" "$(txt "$(call "$KR" project '{}')")" "project github.com/X/y"
+KP=$(t new-window -d -n kp -c "$TMPD/plain" -P -F '#{pane_id}' cat)
+t set -p -t "$KP" @cntctr_name kp
+check "outside git the key is the directory" "$(txt "$(call "$KP" project '{}')")" "/plain (root "
 
 # ---- summary ----
 printf '%d passed, %d failed\n' "$pass" "$fail"

@@ -4,6 +4,7 @@
 #define _DARWIN_C_SOURCE
 #define _GNU_SOURCE
 #include <errno.h>
+#include <ctype.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
@@ -13,10 +14,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include <json-c/json.h>
+#include "kb.h"
 
 static pthread_mutex_t out_mu = PTHREAD_MUTEX_INITIALIZER;   /* one JSON line at a time on stdout */
 static pthread_mutex_t live_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -243,6 +246,81 @@ static void find_self(void) {
         free(TMUXE(NULL, "set", "-p", "-t", self_pane, "@cntctr_harness", client_name));
     }
     free(name);
+}
+
+/* ---- knowledge ---- */
+
+static sqlite3 *kb(char **err) {
+    const char *path = getenv("CNTCTR_DB"), *home = getenv("HOME");
+    char def[4096];
+    if (!path || !*path) {
+        home = home ? home : ".";
+        snprintf(def, sizeof def, "%s/.local", home);
+        mkdir(def, 0755);
+        snprintf(def, sizeof def, "%s/.local/share", home);
+        mkdir(def, 0755);
+        snprintf(def, sizeof def, "%s/.local/share/cntctr", home);
+        mkdir(def, 0700);
+        snprintf(def, sizeof def, "%s/.local/share/cntctr/kb.db", home);
+        path = def;
+    }
+    char *why = NULL;
+    sqlite3 *db = kb_open(path, &why);
+    if (!db) *err = fmt("knowledge store unavailable: %s", why);
+    free(why);
+    return db;
+}
+
+struct project { char root[4096], key[1024], base[256]; };
+
+static void normalize_remote(const char *url, char *out, size_t n) {
+    const char *s = strstr(url, "://");
+    int scp = !s;
+    s = s ? s + 3 : url;
+    const char *at = strchr(s, '@'), *slash = strchr(s, '/');
+    if (at && (!slash || at < slash)) s = at + 1;
+    snprintf(out, n, "%s", s);
+    char *colon = strchr(out, ':'), *sl = strchr(out, '/');
+    if (scp && colon && (!sl || colon < sl)) *colon = '/';
+    size_t len = strlen(out);
+    while (len && out[len - 1] == '/') out[--len] = '\0';
+    if (len > 4 && strcmp(out + len - 4, ".git") == 0) out[len -= 4] = '\0';
+    while (len && out[len - 1] == '/') out[--len] = '\0';
+    for (char *c = out; *c && *c != '/'; c++) *c = (char)tolower((unsigned char)*c);
+}
+
+static void resolve_project(sqlite3 *db, const char *pane, struct project *p) {
+    char *out = NULL, cwd[4096];
+    if (pane && *pane && TMUX(NULL, &out, "display", "-p", "-t", pane, "#{pane_current_path}") == 0 && *out)
+        snprintf(cwd, sizeof cwd, "%s", out);
+    else if (!getcwd(cwd, sizeof cwd))
+        snprintf(cwd, sizeof cwd, ".");
+    free(out);
+    if (run(NULL, &out, (const char *[]){"git", "-C", cwd, "rev-parse", "--show-toplevel", NULL}) == 0 && *out)
+        snprintf(p->root, sizeof p->root, "%s", out);
+    else
+        snprintf(p->root, sizeof p->root, "%s", cwd);
+    free(out);
+    const char *slash = strrchr(p->root, '/');
+    snprintf(p->base, sizeof p->base, "%s", slash && slash[1] ? slash + 1 : p->root);
+    char *key = kb_project_get(db, p->root);
+    if (key) {
+        snprintf(p->key, sizeof p->key, "%s", key);
+        free(key);
+        return;
+    }
+    if (run(NULL, &out, (const char *[]){"git", "-C", p->root, "remote", "get-url", "origin", NULL}) == 0 && *out)
+        normalize_remote(out, p->key, sizeof p->key);
+    else
+        snprintf(p->key, sizeof p->key, "%s", p->root);
+    free(out);
+}
+
+static char *first_line(const char *text, size_t max) {
+    size_t n = strcspn(text, "\n");
+    if (n > max)
+        for (n = max; n > 0 && (text[n] & 0xC0) == 0x80; n--) {}
+    return fmt("%.*s", (int)n, text);
 }
 
 /* ---- agents and delivery ---- */
@@ -597,6 +675,79 @@ static int tool_kill(json_object *a, char **res) {
     return err ? fail(res, err) : ok(res, fmt("ok"));
 }
 
+/* ---- knowledge tools ---- */
+
+static sqlite3 *kb_for_caller(struct project *p, char **res) {
+    sqlite3 *db = kb(res);
+    if (db) resolve_project(db, caller_pane, p);
+    return db;
+}
+
+static int is_layer(const char *l) {
+    return l && (strcmp(l, "insight") == 0 || strcmp(l, "skill") == 0 || strcmp(l, "doc") == 0);
+}
+
+static int tool_note(json_object *a, char **res) {
+    const char *layer = sarg(a, "layer"), *title = sarg(a, "title"), *summary = sarg(a, "summary");
+    const char *body = sarg(a, "body"), *scope = sarg(a, "scope");
+    if (!is_layer(layer) || !title || !*title || !summary || !*summary)
+        return fail(res, fmt("note needs layer (insight, skill or doc), title and summary"));
+    json_object *sup = NULL;
+    json_object_object_get_ex(a, "supersedes", &sup);
+    size_t nsup = json_object_is_type(sup, json_type_array) ? json_object_array_length(sup) : 0;
+    struct project p;
+    sqlite3 *db = kb_for_caller(&p, res);
+    if (!db) return 1;
+    for (size_t i = 0; i < nsup; i++) {
+        const char *old = json_object_get_string(json_object_array_get_idx(sup, i));
+        char l[16];
+        long long mem;
+        int bad = !old || kb_lookup(db, old, l, &mem) != 0;
+        if (bad || strcmp(l, "history") == 0) {
+            sqlite3_close(db);
+            return fail(res, bad ? fmt("entry %s not found", old ? old : "(none)") : fmt("history entries cannot be superseded"));
+        }
+    }
+    int global = scope && strcmp(scope, "global") == 0;
+    char *line = first_line(summary, 300), id[64];
+    struct kb_entry e = {.layer = layer, .scope = global ? "global" : p.key, .title = title, .summary = line,
+                         .body = body, .tags = sarg(a, "tags"), .refs = sarg(a, "refs"),
+                         .author = getenv("USER"), .agent = caller_name, .visibility = "shared"};
+    if (kb_put(db, &e, id) != 0) {
+        char *err = fmt("note failed: %s", sqlite3_errmsg(db));
+        free(line);
+        sqlite3_close(db);
+        return fail(res, err);
+    }
+    for (size_t i = 0; i < nsup; i++) kb_supersede(db, json_object_get_string(json_object_array_get_idx(sup, i)), id);
+    free(line);
+    sqlite3_close(db);
+    return ok(res, fmt("noted %s", id));
+}
+
+static int tool_read(json_object *a, char **res) {
+    const char *id = sarg(a, "id");
+    if (!id) return fail(res, fmt("read needs 'id'"));
+    sqlite3 *db = kb(res);
+    if (!db) return 1;
+    char *text = kb_show(db, id);
+    sqlite3_close(db);
+    return text ? ok(res, text) : fail(res, fmt("entry %s not found", id));
+}
+
+static int tool_project(json_object *a, char **res) {
+    const char *key = sarg(a, "key");
+    struct project p;
+    sqlite3 *db = kb_for_caller(&p, res);
+    if (!db) return 1;
+    if (key) {
+        kb_project_set(db, p.root, key);
+        resolve_project(db, caller_pane, &p);
+    }
+    sqlite3_close(db);
+    return ok(res, fmt("project %s (root %s)", p.key, p.root));
+}
+
 /* ---- dispatch ---- */
 
 typedef int (*tool_fn)(json_object *args, char **res);
@@ -606,6 +757,9 @@ static const struct { const char *name; tool_fn fn; int needs_pane; } TOOL_FNS[]
     {"reply", tool_reply, 0},
     {"spawn", tool_spawn, 1},
     {"kill", tool_kill, 1},
+    {"note", tool_note, 0},
+    {"read", tool_read, 0},
+    {"project", tool_project, 0},
     {NULL, NULL, 0},
 };
 
@@ -636,7 +790,7 @@ static int dispatch(const char *name, json_object *args, char **res) {
         snprintf(caller_pane, sizeof caller_pane, "%s", self_pane);
         snprintf(caller_name, sizeof caller_name, "%s", self_name);
         const char *from = sarg(args, "from");
-        if (TOOL_FNS[i].needs_pane && from && *from) {
+        if (from && *from) {
             char *err = resolve_from(from);
             if (err) return fail(res, err);
         }
@@ -646,6 +800,8 @@ static int dispatch(const char *name, json_object *args, char **res) {
     }
     return fail(res, fmt("unknown tool %s", name ? name : "(none)"));
 }
+
+#define KFROM "\"from\":{\"type\":\"string\",\"description\":\"Your agent name. Needed from Codex, whose cntctr runs outside your pane, to find your project\"}"
 
 static const char TOOLS[] =
     "{\"tools\":["
@@ -675,6 +831,23 @@ static const char TOOLS[] =
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
     "{\"name\":\"kill\",\"description\":\"Close an agent's tmux pane.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"}},\"required\":[\"name\"]}}"
+    ",{\"name\":\"note\",\"description\":\"Store durable knowledge for all agents: insight (a 1-5 line fact or decision), "
+    "skill (a reusable how-to) or doc (long text). Point at code as file:symbol instead of copying it. "
+    "To replace or merge entries, pass their ids in supersedes.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+    "\"layer\":{\"type\":\"string\",\"enum\":[\"insight\",\"skill\",\"doc\"]},"
+    "\"title\":{\"type\":\"string\"},"
+    "\"summary\":{\"type\":\"string\",\"description\":\"One line; the index shows only this\"},"
+    "\"body\":{\"type\":\"string\"},"
+    "\"tags\":{\"type\":\"string\",\"description\":\"Extra search words, e.g. synonyms\"},"
+    "\"refs\":{\"type\":\"string\",\"description\":\"Source entry or message ids, code pointers\"},"
+    "\"scope\":{\"type\":\"string\",\"enum\":[\"project\",\"global\"],\"description\":\"global for knowledge not tied to this repo\"},"
+    "\"supersedes\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}," KFROM "},"
+    "\"required\":[\"layer\",\"title\",\"summary\"]}},"
+    "{\"name\":\"read\",\"description\":\"Read one knowledge entry in full.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"]}},"
+    "{\"name\":\"project\",\"description\":\"Show the project key your knowledge is filed under, or set key to override it for this repo (empty key removes the override).\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}," KFROM "}}}"
     "]}";
 
 /* ---- MCP protocol ---- */
