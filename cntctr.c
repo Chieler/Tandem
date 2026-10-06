@@ -323,6 +323,31 @@ static char *first_line(const char *text, size_t max) {
     return fmt("%.*s", (int)n, text);
 }
 
+/* The agent name of `pane` (caller frees), or NULL. */
+static char *pane_name(const char *pane) {
+    char *name;
+    if (!pane || !*pane) return NULL;
+    if (TMUX(NULL, &name, "show", "-pqv", "-t", pane, "@cntctr_name") == 0 && *name) return name;
+    free(name);
+    return NULL;
+}
+
+/* Log a task or reply as private history in the project of the agent in `pane`. Never fails. */
+static void log_history(const char *pane, const char *title, const char *text) {
+    char *err = NULL, id[64];
+    sqlite3 *db = kb(&err);
+    free(err);
+    if (!db) return;
+    struct project p;
+    resolve_project(db, pane, &p);
+    char *summary = first_line(text, 200);
+    struct kb_entry e = {.layer = "history", .scope = p.key, .title = title, .summary = summary, .body = text,
+                         .author = getenv("USER"), .agent = caller_name, .visibility = "private"};
+    kb_put(db, &e, id);
+    free(summary);
+    sqlite3_close(db);
+}
+
 /* ---- agents and delivery ---- */
 
 /* Pane id of the agent called `name` (caller frees), or NULL. */
@@ -570,30 +595,67 @@ static int tool_send(json_object *a, char **res) {
         free(pane);
         return fail(res, err);
     }
+    char *title = fmt("task %s %s→%s", id, caller_name, to);
+    log_history(caller_pane, title, text);
+    free(title);
     int r = wait ? await_reply(id, pane, to, targ(a), res) : ok(res, fmt("sent id=%s", id));
     free(pane);
     return r;
 }
 
+/* Store a reply as history in the sender's project, and its insights in the replier's.
+ * ponytail: a reply retried after a failed delivery is stored again; the librarian merges duplicates. */
+static void remember_reply(const char *id, const char *to, const char *sender, const char *text, json_object *a) {
+    char *me = pane_name(to), *them = pane_name(sender), *title = fmt("reply %s %s→%s", id, me ? me : "?", them ? them : "?");
+    log_history(sender, title, text);
+    json_object *ins = NULL;
+    char *err = NULL;
+    sqlite3 *db = json_object_object_get_ex(a, "insights", &ins) && json_object_is_type(ins, json_type_array) ? kb(&err) : NULL;
+    free(err);
+    if (db) {
+        struct project p;
+        resolve_project(db, to ? to : caller_pane, &p);
+        for (size_t i = 0; i < json_object_array_length(ins); i++) {
+            const char *s = json_object_get_string(json_object_array_get_idx(ins, i));
+            if (!s || !*s) continue;
+            char *t = first_line(s, 80), *sum = first_line(s, 300), eid[64];
+            struct kb_entry e = {.layer = "insight", .scope = p.key, .title = t, .summary = sum, .body = s, .refs = id,
+                                 .author = getenv("USER"), .agent = me ? me : caller_name, .visibility = "shared"};
+            kb_put(db, &e, eid);
+            free(t);
+            free(sum);
+        }
+        sqlite3_close(db);
+    }
+    free(me);
+    free(them);
+    free(title);
+}
+
 static int tool_reply(json_object *a, char **res) {
     const char *id = sarg(a, "id"), *text = sarg(a, "text");
     if (!id || !text) return fail(res, fmt("reply needs 'id' and 'text'"));
-    char opt[48], buf[40], chan[32], *sender = NULL, *waiting, *env, *err;
+    char opt[48], buf[40], chan[32], *sender = NULL, *to, *waiting, *env, *err;
     snprintf(opt, sizeof opt, "@cntctr_from_%s", id);
     if (strlen(id) != 8 || strspn(id, "0123456789abcdef") != 8 || !(sender = sopt_get(opt)))
         return fail(res, fmt("unknown id %s", id));
+    snprintf(opt, sizeof opt, "@cntctr_to_%s", id);
+    to = sopt_get(opt);
+    remember_reply(id, to, sender, text, a);
 
     /* Write the buffer before checking the wait flag; await_reply clears the flag
      * before claiming. That ordering means no reply is lost. */
     snprintf(buf, sizeof buf, "cntctr-reply-%s", id);
     if ((err = TMUXE(text, "load-buffer", "-b", buf, "-"))) {
         free(sender);
+        free(to);
         return fail(res, err);
     }
     snprintf(opt, sizeof opt, "@cntctr_wait_%s", id);
     if ((waiting = sopt_get(opt))) {   /* sender is blocked in await_reply: wake it */
         free(waiting);
         free(sender);
+        free(to);
         snprintf(chan, sizeof chan, "cntctr-%s", id);
         free(TMUXE(NULL, "wait-for", "-S", chan));
         return ok(res, fmt("ok"));
@@ -603,17 +665,16 @@ static int tool_reply(json_object *a, char **res) {
     if ((err = TMUXE(NULL, "delete-buffer", "-b", buf))) {
         free(err);
         free(sender);
+        free(to);
         return ok(res, fmt("ok"));
     }
     if (!pane_alive(sender)) {
         free(sender);
+        free(to);
         untrack(id);
         return fail(res, fmt("sender gone"));
     }
-    char *me = NULL;
-    snprintf(opt, sizeof opt, "@cntctr_to_%s", id);
-    char *to = sopt_get(opt);
-    if (to && TMUX(NULL, &me, "show", "-pqv", "-t", to, "@cntctr_name") != 0) *me = '\0';
+    char *me = pane_name(to);
     env = fmt("[cntctr reply from=%s id=%s]\n%s", me && *me ? me : *self_name ? self_name : client_name, id, text);
     free(me);
     free(to);
@@ -657,6 +718,9 @@ static int tool_spawn(json_object *a, char **res) {
     track_to(id, pane);
     free(TMUXE(NULL, "set", "-p", "-t", pane, "@cntctr_name", name));
     free(TMUXE(NULL, "set", "-p", "-t", pane, "@cntctr_harness", harness));
+    char *title = fmt("task %s %s→%s", id, caller_name, name);
+    log_history(caller_pane, title, task);
+    free(title);
     int r = wait ? await_reply(id, pane, name, targ(a), res) : ok(res, fmt("spawned %s in %s id=%s", name, pane, id));
     free(pane);
     return r;
@@ -861,7 +925,8 @@ static const char TOOLS[] =
     "\"required\":[\"to\",\"text\"]}},"
     "{\"name\":\"reply\",\"description\":\"Answer a message you received. Use the id from its [cntctr from=... id=...] header. "
     "Always reply when you finish a task another agent gave you.\","
-    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"}},"
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},"
+    "\"insights\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Durable facts other agents should know; each is stored in the shared knowledge store\"}},"
     "\"required\":[\"id\",\"text\"]}},"
     "{\"name\":\"list\",\"description\":\"List agents: name, harness, tmux pane, alive or dead.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"

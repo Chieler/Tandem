@@ -358,6 +358,31 @@ same "forget" "$(txt "$(call "$KA" forget "{\"id\":\"$fid\"}")")" "forgot $fid"
 refute "forgotten entry leaves the index" "$(txt "$(call "$KA" recall '{}')")" "soon gone"
 same "forget an unknown id" "$(txt "$(call "$KA" forget '{"id":"nope"}')")" "entry nope not found"
 
+KB=$(newpane kb)
+hid=$(txt "$(call "$KA" send '{"to":"kb","text":"measure the paste delay"}')" | sed 's/sent id=//')
+call "$KB" reply "{\"id\":\"$hid\",\"text\":\"150 ms is enough\",\"insights\":[\"Claude submits pasted text with no delay before Enter\"]}" >/dev/null
+hist=$(txt "$(call "$KA" recall '{"layer":"history"}')")
+check "send is logged as history" "$hist" "[history] task $hid ka→kb — measure the paste delay"
+check "reply is logged as history" "$hist" "[history] reply $hid kb→ka — 150 ms is enough"
+refute "history stays out of the index" "$(txt "$(call "$KA" recall '{}')")" "[history]"
+ins=$(txt "$(call "$KA" recall '{"query":"delay before Enter"}')")
+check "reply insight is stored" "$ins" "[insight] Claude submits pasted text with no delay before Enter"
+iid=$(printf '%s\n' "$ins" | grep '\[insight\] Claude submits' | cut -d' ' -f1)
+check "insight refs its message" "$(txt "$(call "$KA" read "{\"id\":\"$iid\"}")")" "refs: $hid"
+hent=$(printf '%s\n' "$hist" | grep "task $hid" | cut -d' ' -f1)
+check "history is private" "$(txt "$(call "$KA" read "{\"id\":\"$hent\"}")")" "visibility: private"
+same "history cannot be forgotten" "$(txt "$(call "$KA" forget "{\"id\":\"$hent\"}")")" "history entries cannot be forgotten"
+same "history cannot be superseded" "$(txt "$(call "$KA" note "{\"layer\":\"insight\",\"title\":\"x\",\"summary\":\"y\",\"supersedes\":[\"$hent\"]}")")" "history entries cannot be superseded"
+long="x$(printf 'é%.0s' $(seq 60))"   # 121 bytes: byte 80 is inside an é, so the 80-byte title cut must back off
+hid=$(txt "$(call "$KA" send '{"to":"kb","text":"unicode"}')" | sed 's/sent id=//')
+call "$KB" reply "{\"id\":\"$hid\",\"text\":\"ok\",\"insights\":[\"$long\"]}" >/dev/null
+out=$(txt "$(call "$KA" recall '{}')")
+check "long unicode insight is listed" "$out" "[insight] xéé"
+refute "titles are cut on a character boundary" "$out" "�"
+out=$(CNTCTR_DB=/nonexistent/x.db call "$KA" send '{"to":"kb","text":"still delivered"}')
+check "send works without a knowledge store" "$(txt "$out")" "sent id="
+same "note reports a missing store" "$(txt "$(CNTCTR_DB=/nonexistent/x.db call "$KA" note '{"layer":"insight","title":"x","summary":"y"}')" | cut -c1-30)" "knowledge store unavailable: u"
+
 # ---- summary ----
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
