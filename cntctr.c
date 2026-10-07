@@ -364,6 +364,103 @@ static char *knowledge_hints(const char *text) {
     return block;
 }
 
+/* claude-mem mirror: best effort; a failure never fails the caller. */
+static const char *mem_url(void) {
+    const char *u = getenv("CNTCTR_MEM_URL");
+    return u ? u : "http://127.0.0.1:37701";
+}
+
+/* Save an entry as a claude-mem observation under `project` (a directory basename,
+ * as claude-mem names projects). Returns the observation id, or 0. */
+static long long mem_save(const char *project, const char *id, const char *layer, const char *scope,
+                          const char *title, const char *summary, const char *body) {
+    if (!*mem_url()) return 0;
+    json_object *req = json_object_new_object(), *meta = json_object_new_object(), *resp, *v;
+    char *text = fmt("%s\n\n%s", summary, body ? body : ""), *url = fmt("%s/api/memory/save", mem_url()), *out;
+    json_object_object_add(meta, "cntctr_id", json_object_new_string(id));
+    json_object_object_add(meta, "layer", json_object_new_string(layer));
+    json_object_object_add(meta, "scope", json_object_new_string(scope));
+    json_object_object_add(req, "title", json_object_new_string(title));
+    json_object_object_add(req, "text", json_object_new_string(text));
+    json_object_object_add(req, "project", json_object_new_string(project));
+    json_object_object_add(req, "metadata", meta);
+    long long mem = 0;
+    if (run(json_object_to_json_string_ext(req, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE), &out,
+            (const char *[]){"curl", "-s", "-m", "2", "-X", "POST", "-H", "Content-Type: application/json",
+                             "--data-binary", "@-", url, NULL}) == 0 && (resp = json_tokener_parse(out))) {
+        if (json_object_object_get_ex(resp, "id", &v)) mem = json_object_get_int64(v);
+        json_object_put(resp);
+    }
+    free(out);
+    free(url);
+    free(text);
+    json_object_put(req);
+    return mem;
+}
+
+static void mem_delete(long long mem) {
+    if (!mem || !*mem_url()) return;
+    char *url = fmt("%s/api/observation/%lld", mem_url(), mem), *out;
+    run(NULL, &out, (const char *[]){"curl", "-s", "-m", "2", "-X", "DELETE", url, NULL});
+    free(out);
+    free(url);
+}
+
+/* claude-mem observation search: its markdown table text, or NULL. Observations only:
+ * /api/search mixes in session and prompt ids. */
+static char *mem_search(const char *query, const char *project, int limit) {
+    if (!*mem_url()) return NULL;
+    char *q = fmt("query=%s", query), *pr = fmt("project=%s", project), *lim = fmt("limit=%d", limit);
+    char *url = fmt("%s/api/search/observations", mem_url()), *out, *text = NULL;
+    json_object *resp, *content, *item, *t;
+    if (run(NULL, &out, (const char *[]){"curl", "-s", "-m", "2", "-G", "--data-urlencode", q, "--data-urlencode", pr,
+                                          "--data-urlencode", lim, url, NULL}) == 0 && (resp = json_tokener_parse(out))) {
+        if (json_object_object_get_ex(resp, "content", &content) && json_object_is_type(content, json_type_array)
+            && (item = json_object_array_get_idx(content, 0)) && json_object_object_get_ex(item, "text", &t))
+            text = strdup(json_object_get_string(t));
+        json_object_put(resp);
+    }
+    free(out);
+    free(url);
+    free(lim);
+    free(pr);
+    free(q);
+    return text;
+}
+
+/* Append claude-mem hits (rows "| #<id> | time | type | title | ..." of `table`) to `out`:
+ * as the cntctr entry mirrored there, else as "claude-mem #<id> <title>". Frees `out`. */
+static char *merge_mem(sqlite3 *db, char *out, const char *table) {
+    if (!table) return out;
+    char *copy = strdup(table), *save;
+    for (char *row = strtok_r(copy, "\n", &save); row; row = strtok_r(NULL, "\n", &save)) {
+        long long mem;
+        if (sscanf(row, "| #%lld |", &mem) != 1) continue;
+        char *line = kb_by_mem(db, mem), *add = NULL, idsp[72];
+        if (line) {
+            snprintf(idsp, sizeof idsp, "%.*s ", (int)strcspn(line, " "), line);
+            if (!strstr(out, idsp)) add = line, line = NULL;
+        } else {
+            char *t = row, *end;
+            for (int i = 0; i < 3 && t; i++) t = strchr(t + 1, '|');
+            if (t && (end = strchr(t + 1, '|'))) {
+                for (t++; *t == ' '; t++) {}
+                while (end > t && end[-1] == ' ') end--;
+                add = fmt("claude-mem #%lld %.*s", mem, (int)(end - t), t);
+            }
+        }
+        if (add) {
+            char *n = fmt(*out ? "%s\n%s" : "%s%s", out, add);
+            free(out);
+            out = n;
+            free(add);
+        }
+        free(line);
+    }
+    free(copy);
+    return out;
+}
+
 /* ---- agents and delivery ---- */
 
 /* Pane id of the agent called `name` (caller frees), or NULL. */
@@ -643,7 +740,10 @@ static void remember_reply(const char *id, const char *to, const char *sender, c
             char *t = first_line(s, 80), *sum = first_line(s, 300), eid[64];
             struct kb_entry e = {.layer = "insight", .scope = p.key, .title = t, .summary = sum, .body = s, .refs = id,
                                  .author = getenv("USER"), .agent = me ? me : caller_name, .visibility = "shared"};
-            kb_put(db, &e, eid);
+            if (kb_put(db, &e, eid) == 0) {
+                long long mem = mem_save(p.base, eid, "insight", p.key, t, sum, s);
+                if (mem) kb_set_mem(db, eid, mem);
+            }
             free(t);
             free(sum);
         }
@@ -805,7 +905,16 @@ static int tool_note(json_object *a, char **res) {
         sqlite3_close(db);
         return fail(res, err);
     }
-    for (size_t i = 0; i < nsup; i++) kb_supersede(db, json_object_get_string(json_object_array_get_idx(sup, i)), id);
+    for (size_t i = 0; i < nsup; i++) {
+        const char *old = json_object_get_string(json_object_array_get_idx(sup, i));
+        char l[16];
+        long long mem = 0;
+        kb_lookup(db, old, l, &mem);
+        mem_delete(mem);
+        kb_supersede(db, old, id);
+    }
+    long long mem = mem_save(global ? "cntctr-global" : p.base, id, layer, e.scope, title, line, body);
+    if (mem) kb_set_mem(db, id, mem);
     free(line);
     sqlite3_close(db);
     return ok(res, fmt("noted %s", id));
@@ -846,7 +955,14 @@ static int tool_recall(json_object *a, char **res) {
     const char *s1 = p.key, *s2 = "global";
     if (scope && strcmp(scope, "global") == 0) s1 = "global", s2 = NULL;
     else if (scope && strcmp(scope, "project") == 0) s2 = NULL;
-    char *out = query && *query ? kb_search(db, s1, s2, query, layer, 1, limit) : kb_index(db, s1, s2, layer, since, limit);
+    char *out;
+    if (query && *query) {
+        char *table = mem_search(query, strcmp(s1, "global") == 0 ? "cntctr-global" : p.base, limit);
+        out = merge_mem(db, kb_search(db, s1, s2, query, layer, 1, limit), table);
+        free(table);
+    } else {
+        out = kb_index(db, s1, s2, layer, since, limit);
+    }
     sqlite3_close(db);
     if (*out) return ok(res, out);
     free(out);
@@ -861,7 +977,10 @@ static int tool_forget(json_object *a, char **res) {
     char layer[16];
     long long mem = 0;
     int found = kb_lookup(db, id, layer, &mem) == 0, history = found && strcmp(layer, "history") == 0;
-    if (found && !history) kb_supersede(db, id, "forgotten");
+    if (found && !history) {
+        mem_delete(mem);
+        kb_supersede(db, id, "forgotten");
+    }
     sqlite3_close(db);
     if (!found) return fail(res, fmt("entry %s not found", id));
     if (history) return fail(res, fmt("history entries cannot be forgotten"));

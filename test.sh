@@ -397,6 +397,51 @@ check "paneless instructions ask for from" "$ins" "pass from="
 check "paneless index shows global entries" "$ins" "Run the tests"
 refute "paneless index leaves out project entries" "$ins" "Enter fix"
 
+cat > "$TMPD/mem.py" <<'EOF'
+# Fake claude-mem worker: logs every request, answers like claude-mem 13.15.
+import http.server, json, sys
+log = open(sys.argv[1], "a")
+class H(http.server.BaseHTTPRequestHandler):
+    def answer(self, body):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(json.dumps(body).encode())
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", 0))).decode()
+        log.write("POST %s %s\n" % (self.path, body)); log.flush()
+        self.answer({"success": True, "id": 7})
+    def do_GET(self):
+        log.write("GET %s\n" % self.path); log.flush()
+        self.answer({"content": [{"type": "text", "text": "| ID | Time | T | Title | Read |\n|----|------|---|-------|------|\n"
+                                  "| #7 | 1:00 PM | o | Mirror me | ~10 |\n| #9 | 1:00 PM | o | Claude saw this | ~10 |"}]})
+    def do_DELETE(self):
+        log.write("DELETE %s\n" % self.path); log.flush()
+        self.answer({"success": True})
+    def log_message(self, *a): pass
+s = http.server.HTTPServer(("127.0.0.1", 0), H)
+print(s.server_port, flush=True)
+s.serve_forever()
+EOF
+python3 "$TMPD/mem.py" "$TMPD/mem.log" > "$TMPD/mem.port" &
+MEMPID=$!
+for _ in $(seq 50); do [ -s "$TMPD/mem.port" ] && break; sleep 0.1; done
+MEM=http://127.0.0.1:$(cat "$TMPD/mem.port")
+base=$(basename "$(git -C "$(t display -p -t "$KA" '#{pane_current_path}')" rev-parse --show-toplevel 2>/dev/null || t display -p -t "$KA" '#{pane_current_path}')")
+mid=$(txt "$(CNTCTR_MEM_URL=$MEM call "$KA" note '{"layer":"doc","title":"Mirror me","summary":"mirrored doc","body":"long text"}')" | sed 's/noted //')
+check "note posts to claude-mem" "$(cat "$TMPD/mem.log")" "POST /api/memory/save"
+check "mirror files under the repo basename" "$(cat "$TMPD/mem.log")" "\"project\":\"$base\""
+check "mirror carries the cntctr id" "$(cat "$TMPD/mem.log")" "\"cntctr_id\":\"$mid\""
+out=$(txt "$(CNTCTR_MEM_URL=$MEM call "$KA" recall '{"query":"zzz"}')")
+check "search asks for observations only" "$(cat "$TMPD/mem.log")" "GET /api/search/observations?query=zzz&project=$base"
+check "claude-mem hit maps to the cntctr entry" "$out" "$mid [doc] Mirror me — mirrored doc"
+check "other claude-mem hits are shown" "$out" "claude-mem #9 Claude saw this"
+CNTCTR_MEM_URL=$MEM call "$KA" forget "{\"id\":\"$mid\"}" >/dev/null
+check "forget deletes the claude-mem copy" "$(cat "$TMPD/mem.log")" "DELETE /api/observation/7"
+kill "$MEMPID"
+wait "$MEMPID" 2>/dev/null
+check "note works with claude-mem down" "$(txt "$(CNTCTR_MEM_URL=$MEM call "$KA" note '{"layer":"insight","title":"t","summary":"s"}')")" "noted "
+
 # ---- summary ----
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
