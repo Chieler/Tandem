@@ -1,15 +1,40 @@
-# cntctr
+# Tandem
 
-Lets Claude Code, Codex, and agy talk to each other directly. An agent can
-spawn another agent in a tmux window, send it messages, and get replies back
-in its own session, either right away (async) or by blocking until the answer
-arrives. There are no files and no daemon. tmux carries every message.
+Tandem lets Claude Code, Codex and agy (Antigravity CLI) work together as one team.
+A leader agent can spawn workers in any of the three harnesses, give them tasks, and
+get the answers back in its own session. All agents share one knowledge store and one
+live project board.
+
+The server is `cntctr`, a small C11 MCP stdio server. Every agent runs its own copy.
+There is no daemon. tmux carries every message, and SQLite holds the shared knowledge.
+
+## How it works
+
+```
+ leader pane (claude)        worker window (codex)        worker window (agy)
+ ┌──────────────┐            ┌──────────────┐             ┌──────────────┐
+ │ claude       │            │ codex        │             │ agy          │
+ │  └ cntctr    │            │  └ cntctr    │             │  └ cntctr    │
+ └──────┬───────┘            └──────┬───────┘             └──────┬───────┘
+        └─────────────► tmux server ◄────────────────────────────┘
+                 pane options, paste buffers, wait-for channels
+                              │
+                     SQLite + FTS5 knowledge store
+```
+
+- Each worker gets its own tmux window, so you can watch it and approve its prompts.
+- Messages are pasted into the target pane as an envelope with an id. The receiver
+  answers with `reply`, and the answer goes back to the sender's pane, or it returns
+  directly from a blocking `send`.
+- tmux is called with an argv array and never through a shell. Message text reaches
+  tmux only through a pipe.
 
 ## Requirements
 
-- tmux (tested with 3.7c)
-- json-c: `brew install json-c`
-- Run your agents inside tmux.
+- macOS or Linux, with tmux (tested with 3.7c). Run your agents inside tmux.
+- json-c (`brew install json-c`) and SQLite with FTS5.
+- At least one of `claude`, `codex` and `agy` on `PATH`.
+- `jq` to run the tests. `sqlite3` to run `watch.sh`.
 
 ## Build
 
@@ -108,3 +133,13 @@ each feature with real agents, ask your leader to:
     make test
 
 Tests run against a private tmux server (`tmux -L cntctr-test`) and need `jq`.
+
+## Layout
+
+| File | Purpose |
+|---|---|
+| `cntctr.c` | MCP server: JSON-RPC loop, tools, tmux helpers, model router |
+| `kb.c`, `kb.h` | Knowledge store: entries, FTS5 search, history, board |
+| `watch.sh` | Live dashboard |
+| `test.sh` | End-to-end tests with fake harnesses |
+| `docs/superpowers/` | Design specs and implementation plans |

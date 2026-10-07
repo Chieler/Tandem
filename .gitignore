@@ -3,3 +3,5 @@ cntctr-test
 *.dSYM/
 .claude/
 .worktrees/
+.serena/
+.vscode/
