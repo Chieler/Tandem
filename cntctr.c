@@ -1004,10 +1004,8 @@ static int tool_distill(json_object *a, char **res) {
     time_t now = time(NULL);
     strftime(stamp, sizeof stamp, "%Y-%m-%d %H:%M:%S", gmtime(&now));
     char *task = fmt(LIBRARIAN, p.key, since ? since : "1970-01-01 00:00:00");
-    kb_meta_set(db, mk, stamp);
     sqlite3_close(db);
     free(since);
-    free(mk);
     for (int n = 1;; n++) {
         snprintf(name, sizeof name, "librarian-%d", n);
         if (!(pane = find_agent(name))) break;
@@ -1023,6 +1021,14 @@ static int tool_distill(json_object *a, char **res) {
     int r = tool_spawn(args, res);
     json_object_put(args);
     free(task);
+    /* Move the cursor only once a librarian exists, so a failed spawn doesn't skip history. */
+    char *err = NULL;
+    if (!r && (db = kb(&err))) {
+        kb_meta_set(db, mk, stamp);
+        sqlite3_close(db);
+    }
+    free(err);
+    free(mk);
     return r;
 }
 

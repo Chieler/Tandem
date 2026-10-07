@@ -441,6 +441,8 @@ check "forget deletes the claude-mem copy" "$(cat "$TMPD/mem.log")" "DELETE /api
 kill "$MEMPID"
 wait "$MEMPID" 2>/dev/null
 check "note works with claude-mem down" "$(txt "$(CNTCTR_MEM_URL=$MEM call "$KA" note '{"layer":"insight","title":"t","summary":"s"}')")" "noted "
+out=$(call "$KA" distill '{"harness":"vim"}')
+check "failed distill reports the spawn error" "$(txt "$out")" "unknown harness vim"
 out=$(call "$KA" distill '{}')
 check "distill spawns a librarian" "$(txt "$out")" "spawned librarian-1 in %"
 LB=$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')
