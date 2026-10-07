@@ -70,7 +70,7 @@ check "initialize names the server" "$out" '"serverInfo":{"name":"cntctr"'
 out=$(rpc '{"jsonrpc":"2.0","id":7,"method":"ping"}')
 same "ping" "$out" '{"jsonrpc":"2.0","id":7,"result":{}}'
 out=$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')
-for tool in spawn send reply list kill note recall read forget project distill; do check "tools/list has $tool" "$out" "\"name\":\"$tool\""; done
+for tool in spawn send reply list kill note recall read forget project distill post board; do check "tools/list has $tool" "$out" "\"name\":\"$tool\""; done
 out=$(rpc '{"jsonrpc":"2.0","id":3,"method":"nope"}')
 check "unknown method" "$out" '"code":-32601'
 out=$(rpc 'not json')
@@ -457,6 +457,30 @@ for i in $(seq 20); do
 done
 wait
 same "20 parallel notes all succeed" "$(cat "$TMPD"/par.* | jq -r '.result.content[0].text' | grep -c '^noted ')" 20
+
+# ---- board ----
+PB=$(newpane pb)
+out=$(call "$KA" post '{"text":"heads up: main is broken"}')
+check "post reaches agents in the project" "$(txt "$out")" "posted to "
+check "post names who it reached" "$(txt "$out")" "pb"
+check "post reports agents it could not reach" "$(txt "$out")" "skipped g (g awaiting permission prompt"
+expect_screen "post arrives in another agent's pane" "$PB" "[cntctr board from=ka] heads up: main is broken"
+refute "post never reaches another project" "$(screen "$KR")" "heads up"
+sleep 0.3
+refute "post is not echoed to the poster" "$(screen "$KA")" "heads up"
+call "$PB" post '{"text":"fixed in abc123"}' >/dev/null
+out=$(txt "$(call "$KA" board '{}')")
+check "board shows posts" "$out" "ka: heads up: main is broken"
+same "board is oldest first" "$(printf '%s\n' "$out" | tail -n 1 | cut -d' ' -f3-)" "pb: fixed in abc123"
+same "board limit" "$(txt "$(call "$KA" board '{"limit":1}')" | cut -d' ' -f3-)" "pb: fixed in abc123"
+same "board of another project" "$(txt "$(call "$KR" board '{}')")" "no posts"
+same "post needs text" "$(txt "$(call "$KA" post '{}')")" "post needs 'text'"
+out=$(bash "$(dirname "$BIN")/watch.sh" --once)
+check "dashboard lists agents" "$out" "librarian-1"
+check "dashboard shows the board" "$out" "pb: fixed in abc123"
+check "dashboard shows knowledge" "$out" "par 20 — parallel note 20"
+check "dashboard shows history" "$out" "reply $(lastid "$LB2") librarian-2→ka"
+check "dashboard shows the distill cursor" "$out" "last distill"
 
 # ---- summary ----
 printf '%d passed, %d failed\n' "$pass" "$fail"

@@ -29,6 +29,7 @@ static const char SCHEMA[] =
     " INSERT INTO entries_fts(rowid, title, summary, body, tags) VALUES (new.rowid, new.title, new.summary, new.body, new.tags); END;"
     "CREATE TABLE IF NOT EXISTS projects(root TEXT PRIMARY KEY, key TEXT NOT NULL);"
     "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);"
+    "CREATE TABLE IF NOT EXISTS posts(scope TEXT NOT NULL, sender TEXT NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL);"
     "INSERT OR IGNORE INTO meta VALUES ('schema', '1');";
 
 static const char *col(sqlite3_stmt *st, int i) {
@@ -140,7 +141,8 @@ static char *lines(sqlite3_stmt *st) {
     char *out = malloc(cap);
     *out = '\0';
     while (sqlite3_step(st) == SQLITE_ROW) {
-        char *l = sqlite3_mprintf("%s [%s] %s — %s\n", col(st, 0), col(st, 1), col(st, 2), col(st, 3));
+        char *l = sqlite3_column_count(st) == 1 ? sqlite3_mprintf("%s\n", col(st, 0))
+                  : sqlite3_mprintf("%s [%s] %s — %s\n", col(st, 0), col(st, 1), col(st, 2), col(st, 3));
         size_t n = strlen(l);
         if (len + n + 1 > cap) out = realloc(out, cap = (len + n + 1) * 2);
         memcpy(out + len, l, n + 1);
@@ -236,4 +238,23 @@ char *kb_project_get(sqlite3 *db, const char *root) { return text1(db, "SELECT k
 void kb_project_set(sqlite3 *db, const char *root, const char *key) {
     if (*key) exec2(db, "INSERT OR REPLACE INTO projects VALUES (?1, ?2)", root, key);
     else exec2(db, "DELETE FROM projects WHERE root = ?1", root, NULL);
+}
+
+int kb_post(sqlite3 *db, const char *scope, const char *sender, const char *text) {
+    sqlite3_stmt *st = prep(db, "INSERT INTO posts VALUES (?1, ?2, ?3, CAST(strftime('%s', 'now') AS INTEGER))");
+    sqlite3_bind_text(st, 1, scope, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, sender, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, text, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st) == SQLITE_DONE ? 0 : -1;
+    sqlite3_finalize(st);
+    return rc;
+}
+
+char *kb_board(sqlite3 *db, const char *scope, int limit) {
+    sqlite3_stmt *st = prep(db,
+        "SELECT line FROM (SELECT rowid, datetime(at, 'unixepoch') || ' ' || sender || ': ' || text AS line FROM posts"
+        " WHERE scope = ?1 ORDER BY rowid DESC LIMIT ?2) ORDER BY rowid");
+    sqlite3_bind_text(st, 1, scope, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 2, limit);
+    return lines(st);
 }

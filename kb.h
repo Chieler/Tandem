@@ -24,4 +24,6 @@ char *kb_meta_get(sqlite3 *db, const char *k);
 void kb_meta_set(sqlite3 *db, const char *k, const char *v);
 char *kb_project_get(sqlite3 *db, const char *root);
 void kb_project_set(sqlite3 *db, const char *root, const char *key);   /* an empty key removes the override */
+int kb_post(sqlite3 *db, const char *scope, const char *sender, const char *text);   /* 0, or -1 */
+char *kb_board(sqlite3 *db, const char *scope, int limit);   /* "<UTC time> <sender>: <text>" lines, oldest first */
 #endif

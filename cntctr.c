@@ -1032,6 +1032,61 @@ static int tool_distill(json_object *a, char **res) {
     return r;
 }
 
+/* Type `text` into every other live agent in the caller's project, and keep it on the project's board. */
+static int tool_post(json_object *a, char **res) {
+    const char *text = sarg(a, "text");
+    if (!text || !*text) return fail(res, fmt("post needs 'text'"));
+    struct project p, q;
+    sqlite3 *db = kb_for_caller(&p, res);
+    if (!db) return 1;
+    char *panes;
+    if (kb_post(db, p.key, caller_name, text) != 0) {
+        char *err = fmt("post failed: %s", sqlite3_errmsg(db));
+        sqlite3_close(db);
+        return fail(res, err);
+    }
+    if (TMUX(NULL, &panes, "list-panes", "-a", "-F", "#{pane_id}\t#{pane_dead}\t#{@cntctr_name}") != 0) {
+        sqlite3_close(db);
+        return fail(res, panes);
+    }
+    char *env = fmt("[cntctr board from=%s] %s", caller_name, text), *sent = strdup(""), *skipped = strdup(""), *save, *t;
+    for (char *line = strtok_r(panes, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        char *dead = strchr(line, '\t'), *name = dead ? strchr(dead + 1, '\t') : NULL;
+        if (!name || !name[1]) continue;
+        *dead++ = '\0';
+        *name++ = '\0';
+        if (strcmp(dead, "0") != 0 || strcmp(line, caller_pane) == 0) continue;
+        resolve_project(db, line, &q);
+        if (strcmp(q.key, p.key) != 0) continue;
+        char *err = inject(line, name, env), **list = err ? &skipped : &sent;
+        t = err ? fmt("%s %s (%s)", *list, name, err) : fmt("%s %s", *list, name);
+        free(*list);
+        *list = t;
+        free(err);
+    }
+    sqlite3_close(db);
+    free(panes);
+    free(env);
+    char *r = fmt("posted to%s%s%s", *sent ? sent : " nobody else", *skipped ? "; skipped" : "", skipped);
+    free(sent);
+    free(skipped);
+    return ok(res, r);
+}
+
+static int tool_board(json_object *a, char **res) {
+    json_object *v;
+    int limit = json_object_object_get_ex(a, "limit", &v) ? json_object_get_int(v) : 20;
+    limit = limit < 1 ? 1 : limit > 200 ? 200 : limit;
+    struct project p;
+    sqlite3 *db = kb_for_caller(&p, res);
+    if (!db) return 1;
+    char *out = kb_board(db, p.key, limit);
+    sqlite3_close(db);
+    if (*out) return ok(res, out);
+    free(out);
+    return ok(res, fmt("no posts"));
+}
+
 /* ---- dispatch ---- */
 
 typedef int (*tool_fn)(json_object *args, char **res);
@@ -1047,6 +1102,8 @@ static const struct { const char *name; tool_fn fn; int needs_pane; } TOOL_FNS[]
     {"recall", tool_recall, 0},
     {"forget", tool_forget, 0},
     {"distill", tool_distill, 1},
+    {"post", tool_post, 1},
+    {"board", tool_board, 0},
     {NULL, NULL, 0},
 };
 
@@ -1151,6 +1208,12 @@ static const char TOOLS[] =
     "\"harness\":{\"type\":\"string\",\"enum\":[\"claude\",\"codex\",\"agy\"],\"description\":\"Default claude\"},"
     "\"wait\":{\"type\":\"boolean\"},\"timeout\":{\"type\":\"integer\"},"
     "\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"}}}}"
+    ",{\"name\":\"post\",\"description\":\"Tell every other agent working in this project something now (a broken build, a changed plan, a claimed file). "
+    "It is typed into their terminals and kept on the project's board. No reply is expected.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"},"
+    "\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"}},\"required\":[\"text\"]}},"
+    "{\"name\":\"board\",\"description\":\"Read the latest posts on this project's board, oldest first.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"limit\":{\"type\":\"integer\",\"description\":\"Default 20, at most 200\"}," KFROM "}}}"
     "]}";
 
 /* ---- MCP protocol ---- */
@@ -1191,7 +1254,8 @@ static const char GUIDE[] =
     "Before exploring a codebase or problem, call recall: no query lists the index, a query searches; read shows an entry in full. "
     "When you learn something durable (a fact, decision, gotcha, procedure, or the summary of a long analysis), store it with note: "
     "layer insight (1-5 lines), skill (a how-to) or doc (long text); point at code as file:symbol instead of copying it. "
-    "When you reply to a task, add insights=[...].";
+    "When you reply to a task, add insights=[...]. "
+    "To tell every agent in this project something now, use post; board shows recent posts.";
 
 /* Usage guide plus the knowledge index: our project's and global entries, or only
  * global ones for a server outside any pane (Codex), capped at 40 lines and 4 KB. */

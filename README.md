@@ -63,6 +63,8 @@ SQLite at `~/.local/share/cntctr/kb.db`, or at `$CNTCTR_DB` if that is set.
 | `forget` | Retire a stale entry. History entries can't be forgotten. |
 | `project` | Show the project key, which is the normalized `origin` remote, or override it for this repo. |
 | `distill` | Spawn a librarian worker that turns recent history into insights and skills and merges duplicates. |
+| `post` | Type a note into every other live agent working in the same project, and keep it on the project's board. |
+| `board` | Show the project's latest posts, oldest first. |
 
 Every `send`, `spawn` and `reply` is logged as private history. Replies can add
 `insights=[...]`. Every message includes up to 5 matching entries, and every agent gets
@@ -71,6 +73,22 @@ its project's index at startup through MCP `instructions`.
 Insights, skills and docs are also copied to claude-mem (`$CNTCTR_MEM_URL`, default
 `http://127.0.0.1:37701`; set it empty to turn copying off), so `recall` gets semantic
 matches. If claude-mem is down, recall uses keyword search alone.
+
+## Watch it work
+
+    ./watch.sh          # in a spare tmux pane; refreshes every 2 s ($CNTCTR_WATCH_SECS)
+
+It shows the live agents, the board, the newest knowledge entries (`*` = copied to
+claude-mem, `x` = retired), private history, and when the librarian last ran. To check
+each feature with real agents, ask your leader to:
+
+1. `note` an insight. It appears under knowledge, marked `*` if claude-mem is running.
+2. Spawn a worker with a task that mentions the insight's words. The task and reply appear
+   under history, and the worker's window shows a `[cntctr knowledge: ...]` block.
+3. Have the worker reply with `insights=[...]`. They appear under knowledge.
+4. `post` something. It shows up in every other agent's window in the project and on the board.
+5. `distill`. A `librarian-N` agent appears, `last distill` updates, and new or merged
+   entries appear as it works; merged ones turn `x`.
 
 ## Test
 
