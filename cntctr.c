@@ -987,6 +987,45 @@ static int tool_forget(json_object *a, char **res) {
     return ok(res, fmt("forgot %s", id));
 }
 
+static const char LIBRARIAN[] =
+    "You are the cntctr librarian for project %s. Use the tools of the cntctr MCP server.\n"
+    "1. Call recall with layer=history, since=\"%s\" and limit=200 to read new work history, and recall with no query to read the index.\n"
+    "2. For each durable fact or procedure in that history, write an insight or skill with note, with refs set to the source ids.\n"
+    "3. Merge duplicate or contradicting entries: write one entry with note supersedes=[their ids]. "
+    "Entries that are not specific to this project go in scope=global.\n"
+    "4. Call forget on entries whose code pointers (file:symbol) no longer exist; check them with Serena if you have it.\n"
+    "5. Reply with a short summary of what you changed.";
+
+static int tool_distill(json_object *a, char **res) {
+    struct project p;
+    sqlite3 *db = kb_for_caller(&p, res);
+    if (!db) return 1;
+    char *mk = fmt("last_distill:%s", p.key), *since = kb_meta_get(db, mk), stamp[32], name[32], *pane;
+    time_t now = time(NULL);
+    strftime(stamp, sizeof stamp, "%Y-%m-%d %H:%M:%S", gmtime(&now));
+    char *task = fmt(LIBRARIAN, p.key, since ? since : "1970-01-01 00:00:00");
+    kb_meta_set(db, mk, stamp);
+    sqlite3_close(db);
+    free(since);
+    free(mk);
+    for (int n = 1;; n++) {
+        snprintf(name, sizeof name, "librarian-%d", n);
+        if (!(pane = find_agent(name))) break;
+        free(pane);
+    }
+    const char *harness = sarg(a, "harness");
+    json_object *args = json_object_new_object(), *v;
+    json_object_object_add(args, "harness", json_object_new_string(harness ? harness : "claude"));
+    json_object_object_add(args, "name", json_object_new_string(name));
+    json_object_object_add(args, "task", json_object_new_string(task));
+    json_object_object_add(args, "wait", json_object_new_boolean(barg(a, "wait")));
+    if (json_object_object_get_ex(a, "timeout", &v)) json_object_object_add(args, "timeout", json_object_get(v));
+    int r = tool_spawn(args, res);
+    json_object_put(args);
+    free(task);
+    return r;
+}
+
 /* ---- dispatch ---- */
 
 typedef int (*tool_fn)(json_object *args, char **res);
@@ -1001,6 +1040,7 @@ static const struct { const char *name; tool_fn fn; int needs_pane; } TOOL_FNS[]
     {"project", tool_project, 0},
     {"recall", tool_recall, 0},
     {"forget", tool_forget, 0},
+    {"distill", tool_distill, 1},
     {NULL, NULL, 0},
 };
 
@@ -1099,6 +1139,12 @@ static const char TOOLS[] =
     "\"limit\":{\"type\":\"integer\",\"description\":\"Default 20, at most 200\"}," KFROM "}}},"
     "{\"name\":\"forget\",\"description\":\"Retire a stale or wrong knowledge entry (history cannot be forgotten).\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"]}}"
+    ",{\"name\":\"distill\",\"description\":\"Spawn a librarian agent that turns recent work history into insights and skills "
+    "and merges duplicates in the knowledge store. Returns like spawn.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+    "\"harness\":{\"type\":\"string\",\"enum\":[\"claude\",\"codex\",\"agy\"],\"description\":\"Default claude\"},"
+    "\"wait\":{\"type\":\"boolean\"},\"timeout\":{\"type\":\"integer\"},"
+    "\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"}}}}"
     "]}";
 
 /* ---- MCP protocol ---- */

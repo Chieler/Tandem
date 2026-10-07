@@ -70,7 +70,7 @@ check "initialize names the server" "$out" '"serverInfo":{"name":"cntctr"'
 out=$(rpc '{"jsonrpc":"2.0","id":7,"method":"ping"}')
 same "ping" "$out" '{"jsonrpc":"2.0","id":7,"result":{}}'
 out=$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')
-for tool in spawn send reply list kill; do check "tools/list has $tool" "$out" "\"name\":\"$tool\""; done
+for tool in spawn send reply list kill note recall read forget project distill; do check "tools/list has $tool" "$out" "\"name\":\"$tool\""; done
 out=$(rpc '{"jsonrpc":"2.0","id":3,"method":"nope"}')
 check "unknown method" "$out" '"code":-32601'
 out=$(rpc 'not json')
@@ -441,6 +441,20 @@ check "forget deletes the claude-mem copy" "$(cat "$TMPD/mem.log")" "DELETE /api
 kill "$MEMPID"
 wait "$MEMPID" 2>/dev/null
 check "note works with claude-mem down" "$(txt "$(CNTCTR_MEM_URL=$MEM call "$KA" note '{"layer":"insight","title":"t","summary":"s"}')")" "noted "
+out=$(call "$KA" distill '{}')
+check "distill spawns a librarian" "$(txt "$out")" "spawned librarian-1 in %"
+LB=$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')
+expect_screen "librarian gets its task" "$LB" "You are the cntctr librarian for project"
+expect_screen "first librarian reads all history" "$LB" 'since="1970-01-01 00:00:00"'
+out=$(call "$KA" distill '{}')
+check "next librarian gets a new name" "$(txt "$out")" "spawned librarian-2 in %"
+LB2=$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')
+expect_screen "next librarian starts at the last distill" "$LB2" 'since="20'
+for i in $(seq 20); do
+    call "$KA" note "{\"layer\":\"insight\",\"title\":\"par $i\",\"summary\":\"parallel note $i\"}" > "$TMPD/par.$i" &
+done
+wait
+same "20 parallel notes all succeed" "$(cat "$TMPD"/par.* | jq -r '.result.content[0].text' | grep -c '^noted ')" 20
 
 # ---- summary ----
 printf '%d passed, %d failed\n' "$pass" "$fail"

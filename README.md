@@ -50,6 +50,28 @@ permission dialog; the sender gets `<name> awaiting permission prompt; retry lat
 Delivery tuning: `CNTCTR_ENTER_DELAY_MS` (default 150) is the pause between
 pasting a message and pressing Enter.
 
+## Knowledge
+
+cntctr keeps a knowledge store that every agent shares across sessions. It lives in
+SQLite at `~/.local/share/cntctr/kb.db`, or at `$CNTCTR_DB` if that is set.
+
+| Tool | What it does |
+|---|---|
+| `note` | Store an `insight` (1–5 lines), a `skill` (a how-to) or a `doc` (long text), for this project or `scope=global`. `supersedes=[ids]` replaces older entries. |
+| `recall` | With no query, list the index: this project's entries first, then global ones. With a query, search, including work history and claude-mem observations. |
+| `read` | Show one entry in full. |
+| `forget` | Retire a stale entry. History entries can't be forgotten. |
+| `project` | Show the project key, which is the normalized `origin` remote, or override it for this repo. |
+| `distill` | Spawn a librarian worker that turns recent history into insights and skills and merges duplicates. |
+
+Every `send`, `spawn` and `reply` is logged as private history. Replies can add
+`insights=[...]`. Every message includes up to 5 matching entries, and every agent gets
+its project's index at startup through MCP `instructions`.
+
+Insights, skills and docs are also copied to claude-mem (`$CNTCTR_MEM_URL`, default
+`http://127.0.0.1:37701`; set it empty to turn copying off), so `recall` gets semantic
+matches. If claude-mem is down, recall uses keyword search alone.
+
 ## Test
 
     make test
