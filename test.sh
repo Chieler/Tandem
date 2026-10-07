@@ -262,10 +262,10 @@ expect_screen "paneless reply text" "$S" "paneless answer"
 cat > "$TMPD/bin/claude" <<'EOF'
 #!/bin/sh
 # Fake harness: show the task, then answer it through cntctr like a worker would.
-[ "$1" = -i ] && shift                               # agy passes its first prompt via -i
+for a; do flags="${flags-} ${task-}"; task=$a; done    # the task is the last argument
 [ "$(basename "$0")" = codex ] && unset TMUX_PANE    # Codex hides TMUX_PANE from MCP servers
-printf '%s\n' "$1"
-id=$(printf '%s\n' "$1" | sed -n 's/^\[cntctr from=[^ ]* id=\([0-9a-f]\{8\}\)\]$/\1/p')
+printf 'flags:%s\n%s\n' "$flags" "$task"
+id=$(printf '%s\n' "$task" | sed -n 's/^\[cntctr from=[^ ]* id=\([0-9a-f]\{8\}\)\]$/\1/p')
 sleep 0.5                                            # real harnesses take seconds to start
 printf '%s\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"reply","arguments":{"id":"%s","text":"done %s"}}}\n' \
     "$INIT" "$id" "$id" | "$BIN" >/dev/null
@@ -290,6 +290,14 @@ out=$(call "$L" spawn "$(jq -nc --arg t "\$(touch $TMPD/pwned)" '{harness:"claud
 W4=$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')
 expect_screen "task text reaches the worker literally" "$W4" "\$(touch $TMPD/pwned)"
 if [ -e "$TMPD/pwned" ]; then bad "spawn task was run by a shell"; else ok_; fi
+out=$(call "$L" spawn '{"harness":"claude","name":"m1","task":"x","model":"claude-sonnet-5","effort":"low"}')
+expect_screen "claude gets model and effort" "$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')" "flags:  --model claude-sonnet-5 --effort low"
+out=$(call "$L" spawn '{"harness":"codex","name":"m2","task":"x","model":"gpt-6-luna","effort":"high"}')
+expect_screen "codex gets model and effort" "$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')" "flags:  -m gpt-6-luna -c model_reasoning_effort=\"high\""
+out=$(call "$L" spawn '{"harness":"agy","name":"m3","task":"x","model":"gemini-3.8-flash-high","effort":"high"}')
+expect_screen "agy gets model and effort" "$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')" "flags:  --model gemini-3.8-flash-high --effort high -i"
+same "model cannot be a flag" "$(txt "$(call "$L" spawn '{"harness":"claude","name":"m4","task":"x","model":"--danger"}')")" "bad model --danger"
+same "effort must be a level" "$(txt "$(call "$L" spawn '{"harness":"claude","name":"m4","task":"x","effort":"turbo"}')")" "bad effort turbo"
 out=$(call "$L" spawn '{"harness":"claude","name":"w1","task":"x"}')
 same "duplicate spawn name" "$(txt "$out")" "agent w1 already exists"
 out=$(call "$L" spawn '{"harness":"vim","name":"w9","task":"x"}')
@@ -448,10 +456,11 @@ check "distill spawns a librarian" "$(txt "$out")" "spawned librarian-1 in %"
 LB=$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')
 expect_screen "librarian gets its task" "$LB" "You are the cntctr librarian for project"
 expect_screen "first librarian reads all history" "$LB" 'since="1970-01-01 00:00:00"'
-out=$(call "$KA" distill '{}')
+out=$(call "$KA" distill '{"model":"claude-sonnet-5","effort":"medium"}')
 check "next librarian gets a new name" "$(txt "$out")" "spawned librarian-2 in %"
 LB2=$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')
 expect_screen "next librarian starts at the last distill" "$LB2" 'since="20'
+expect_screen "distill passes model and effort" "$LB2" "flags:  --model claude-sonnet-5 --effort medium"
 for i in $(seq 20); do
     call "$KA" note "{\"layer\":\"insight\",\"title\":\"par $i\",\"summary\":\"parallel note $i\"}" > "$TMPD/par.$i" &
 done

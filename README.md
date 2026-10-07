@@ -37,7 +37,7 @@ tests for the parser. Wait for its answer."
 
 | Tool | What it does |
 |---|---|
-| `spawn` | Starts `claude`, `codex` or `agy` in a new tmux window with a first task |
+| `spawn` | Starts `claude`, `codex` or `agy` in a new tmux window with a first task; optional `model` and `effort` |
 | `send` | Types a message into another agent's terminal; `wait=true` blocks for the reply |
 | `reply` | Answers a message by its id |
 | `list` | Shows agents, their panes, and whether they are alive |

@@ -819,6 +819,12 @@ static int tool_spawn(json_object *a, char **res) {
         free(pane);
         return fail(res, fmt("agent %s already exists", name));
     }
+    const char *model = sarg(a, "model"), *effort = sarg(a, "effort");
+    if (model && (!*model || *model == '-')) return fail(res, fmt("bad model %s", model));
+    static const char *EFFORTS[] = {"low", "medium", "high", "xhigh", "max", NULL};
+    int known = !effort;
+    for (int i = 0; !known && EFFORTS[i]; i++) known = strcmp(effort, EFFORTS[i]) == 0;
+    if (!known) return fail(res, fmt("bad effort %s", effort));
     char dir[4096];
     if (!cwd) cwd = getcwd(dir, sizeof dir) ? dir : ".";
     int wait = barg(a, "wait");
@@ -827,9 +833,18 @@ static int tool_spawn(json_object *a, char **res) {
     track(id, wait);
     char *env = envelope(id, task, name);
     /* Separate argv entries, so tmux execs the harness without a shell. agy takes
-     * its first prompt through -i; claude and codex take it as a plain argument. */
-    int rc = run(NULL, &pane, (const char *[]){"tmux", "new-window", "-d", "-n", name, "-c", cwd, "-P", "-F", "#{pane_id}",
-                                              harness, agy ? "-i" : env, agy ? env : NULL, NULL});
+     * its first prompt through -i; claude and codex take it as a plain argument.
+     * Codex has no --effort flag; it takes the effort as a config override. */
+    int codex = strcmp(harness, "codex") == 0, n = 0;
+    char *ceffort = effort && codex ? fmt("model_reasoning_effort=\"%s\"", effort) : NULL;
+    const char *argv[20] = {"tmux", "new-window", "-d", "-n", name, "-c", cwd, "-P", "-F", "#{pane_id}", harness};
+    n = 11;
+    if (model) argv[n++] = codex ? "-m" : "--model", argv[n++] = model;
+    if (effort) argv[n++] = codex ? "-c" : "--effort", argv[n++] = codex ? ceffort : effort;
+    if (agy) argv[n++] = "-i";
+    argv[n++] = env;
+    int rc = run(NULL, &pane, argv);
+    free(ceffort);
     free(env);
     if (rc != 0) {
         untrack(id);
@@ -1017,7 +1032,8 @@ static int tool_distill(json_object *a, char **res) {
     json_object_object_add(args, "name", json_object_new_string(name));
     json_object_object_add(args, "task", json_object_new_string(task));
     json_object_object_add(args, "wait", json_object_new_boolean(barg(a, "wait")));
-    if (json_object_object_get_ex(a, "timeout", &v)) json_object_object_add(args, "timeout", json_object_get(v));
+    for (const char **k = (const char *[]){"timeout", "model", "effort", NULL}; *k; k++)
+        if (json_object_object_get_ex(a, *k, &v)) json_object_object_add(args, *k, json_object_get(v));
     int r = tool_spawn(args, res);
     json_object_put(args);
     free(task);
@@ -1154,6 +1170,8 @@ static const char TOOLS[] =
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
     "\"harness\":{\"type\":\"string\",\"enum\":[\"claude\",\"codex\",\"agy\"]},"
     "\"name\":{\"type\":\"string\",\"description\":\"Unique agent name; other agents use it as 'to'\"},"
+    "\"model\":{\"type\":\"string\",\"description\":\"Model id for the harness, e.g. claude-sonnet-5, gpt-6-luna, gemini-3.8-flash-medium; defaults to the harness's own\"},"
+    "\"effort\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\",\"xhigh\",\"max\"],\"description\":\"Reasoning effort; pick the lowest that fits the task\"},"
     "\"task\":{\"type\":\"string\"},"
     "\"cwd\":{\"type\":\"string\",\"description\":\"Working directory; defaults to yours\"},"
     "\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"},"
@@ -1206,6 +1224,7 @@ static const char TOOLS[] =
     "and merges duplicates in the knowledge store. Returns like spawn.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
     "\"harness\":{\"type\":\"string\",\"enum\":[\"claude\",\"codex\",\"agy\"],\"description\":\"Default claude\"},"
+    "\"model\":{\"type\":\"string\"},\"effort\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\",\"xhigh\",\"max\"]},"
     "\"wait\":{\"type\":\"boolean\"},\"timeout\":{\"type\":\"integer\"},"
     "\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"}}}}"
     ",{\"name\":\"post\",\"description\":\"Tell every other agent working in this project something now (a broken build, a changed plan, a claimed file). "
