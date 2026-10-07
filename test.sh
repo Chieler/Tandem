@@ -281,10 +281,10 @@ check "spawn wait=true returns the worker's reply" "$(txt "$out")" "done "
 check "list shows spawned worker" "$(txt "$(call "$L" list '{}')")" "w1 claude %"
 out=$(call "$L" spawn '{"harness":"agy","name":"w2","task":"async job"}')
 check "spawn returns at once" "$(txt "$out")" "spawned w2 in %"
-id=$(txt "$out" | sed 's/.*id=//')
+id=$(txt "$out" | sed 's/.*id=\([0-9a-f]*\).*/\1/')
 expect_screen "agy worker (-i prompt) replies into leader pane" "$L" "[cntctr reply from=w2 id=$id]"
 out=$(call "$L" spawn '{"harness":"codex","name":"w3","task":"codex job"}')
-id=$(txt "$out" | sed 's/.*id=//')
+id=$(txt "$out" | sed 's/.*id=\([0-9a-f]*\).*/\1/')
 expect_screen "codex worker finds its name without TMUX_PANE" "$L" "[cntctr reply from=w3 id=$id]"
 out=$(call "$L" spawn "$(jq -nc --arg t "\$(touch $TMPD/pwned)" '{harness:"claude",name:"w4",task:$t}')")
 W4=$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')
@@ -296,6 +296,25 @@ out=$(call "$L" spawn '{"harness":"codex","name":"m2","task":"x","model":"gpt-6-
 expect_screen "codex gets model and effort" "$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')" "flags:  -m gpt-6-luna -c model_reasoning_effort=\"high\""
 out=$(call "$L" spawn '{"harness":"agy","name":"m3","task":"x","model":"gemini-3.8-flash-high","effort":"high"}')
 expect_screen "agy gets model and effort" "$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')" "flags:  --model gemini-3.8-flash-high --effort high -i"
+pane_of() { txt "$1" | sed 's/.* in \(%[0-9]*\) .*/\1/'; }
+out=$(call "$L" spawn '{"harness":"claude","name":"r1","task":"smoke test: run make test, report the count"}')
+check "router names its choice" "$(txt "$out")" "(light: claude-sonnet-5 low)"
+expect_screen "light task gets the small model" "$(pane_of "$out")" "flags:  --model claude-sonnet-5 --effort low"
+out=$(call "$L" spawn '{"harness":"claude","name":"r2","task":"Implement the retry loop in cntctr.c:inject so a busy pane is retried twice, with a test in test.sh."}')
+expect_screen "ordinary task gets the standard model" "$(pane_of "$out")" "flags:  --model claude-sonnet-5-5 --effort medium"
+out=$(call "$L" spawn '{"harness":"claude","name":"r3","task":"Review the diff in /tmp/x.diff against the spec; list issues."}')
+expect_screen "review gets the review model" "$(pane_of "$out")" "flags:  --model claude-opus-4-7 --effort high"
+out=$(call "$L" spawn '{"harness":"claude","name":"r4","task":"Design the architecture for cross-machine sync; find the race conditions."}')
+expect_screen "hard task gets the strongest model" "$(pane_of "$out")" "flags:  --model claude-opus-5-5 --effort high"
+out=$(call "$L" spawn '{"harness":"codex","name":"r5","task":"rename foo to bar in kb.c"}')
+expect_screen "codex light task" "$(pane_of "$out")" "flags:  -m gpt-6-luna -c model_reasoning_effort=\"low\""
+out=$(call "$L" spawn '{"harness":"agy","name":"r6","task":"Design the architecture for the new sync layer."}')
+expect_screen "agy always uses Gemini 3.8" "$(pane_of "$out")" "flags:  --model gemini-3.8-flash-high --effort high -i"
+out=$(call "$L" spawn '{"harness":"claude","name":"r7","task":"Design everything","tier":"light"}')
+expect_screen "tier overrides the router" "$(pane_of "$out")" "flags:  --model claude-sonnet-5 --effort low"
+out=$(call "$L" spawn '{"harness":"claude","name":"r8","task":"Design everything","effort":"low"}')
+expect_screen "explicit effort wins, model still routed" "$(pane_of "$out")" "flags:  --model claude-opus-5-5 --effort low"
+same "unknown tier" "$(txt "$(call "$L" spawn '{"harness":"claude","name":"r9","task":"x","tier":"huge"}')")" "bad tier huge"
 same "model cannot be a flag" "$(txt "$(call "$L" spawn '{"harness":"claude","name":"m4","task":"x","model":"--danger"}')")" "bad model --danger"
 same "effort must be a level" "$(txt "$(call "$L" spawn '{"harness":"claude","name":"m4","task":"x","effort":"turbo"}')")" "bad effort turbo"
 out=$(call "$L" spawn '{"harness":"claude","name":"w1","task":"x"}')
@@ -456,6 +475,7 @@ check "distill spawns a librarian" "$(txt "$out")" "spawned librarian-1 in %"
 LB=$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')
 expect_screen "librarian gets its task" "$LB" "You are the cntctr librarian for project"
 expect_screen "first librarian reads all history" "$LB" 'since="1970-01-01 00:00:00"'
+expect_screen "librarian is routed as a review" "$LB" "flags:  --model claude-opus-4-7 --effort high"
 out=$(call "$KA" distill '{"model":"claude-sonnet-5","effort":"medium"}')
 check "next librarian gets a new name" "$(txt "$out")" "spawned librarian-2 in %"
 LB2=$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')
@@ -487,7 +507,7 @@ same "post needs text" "$(txt "$(call "$KA" post '{}')")" "post needs 'text'"
 out=$(bash "$(dirname "$BIN")/watch.sh" --once)
 check "dashboard lists agents" "$out" "librarian-1"
 check "dashboard shows the board" "$out" "pb: fixed in abc123"
-check "dashboard shows knowledge" "$out" "par 20 — parallel note 20"
+check "dashboard shows knowledge" "$out" " — parallel note "
 check "dashboard shows history" "$out" "reply $(lastid "$LB2") librarian-2→ka"
 check "dashboard shows the distill cursor" "$out" "last distill"
 

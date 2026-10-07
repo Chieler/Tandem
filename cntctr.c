@@ -673,6 +673,31 @@ static int await_reply(const char *id, const char *pane, const char *who, int ti
     return ok(res, fmt("timed out; reply will arrive in your pane (id=%s)", id));
 }
 
+/* ---- model router ---- */
+
+/* Picks a model and effort for a task the caller didn't size. Keyword rules on the task
+ * text, first match wins; anything unmatched is "standard".
+ * ponytail: keyword heuristic, swap in a small classifier if it misroutes often. */
+static const char *TIERS[] = {"light", "standard", "review", "hard"};
+static const struct { int tier; const char *words[12]; } RULES[] = {
+    {3, {"architect", "design", "race condition", "concurren", "deadlock", "root cause", "security", "migrat", "distributed", "rewrite", NULL}},
+    {2, {"review", "audit", "verify", "merge", "critique", "judge", NULL}},
+    {0, {"smoke test", "rename", "typo", "format", "lookup", "look up", "list ", "summari", "transcri", "count", NULL}},
+};
+/* model, effort for each tier, per harness: claude, codex, agy */
+static const char *ROUTES[3][4][2] = {
+    {{"claude-sonnet-5", "low"}, {"claude-sonnet-5-5", "medium"}, {"claude-opus-4-7", "high"}, {"claude-opus-5-5", "high"}},
+    {{"gpt-6-luna", "low"}, {"gpt-6-luna", "medium"}, {"gpt-6-sol", "medium"}, {"gpt-6-sol", "high"}},
+    {{"gemini-3.8-flash-low", "low"}, {"gemini-3.8-flash-medium", "medium"}, {"gemini-3.8-flash-high", "high"}, {"gemini-3.8-flash-high", "high"}},
+};
+
+static int route(const char *task) {
+    for (size_t r = 0; r < sizeof RULES / sizeof *RULES; r++)
+        for (int w = 0; RULES[r].words[w]; w++)
+            if (strcasestr(task, RULES[r].words[w])) return RULES[r].tier;
+    return strlen(task) > 6000 ? 2 : 1;
+}
+
 /* ---- tools ---- */
 
 static int tool_list(json_object *args, char **res) {
@@ -825,6 +850,14 @@ static int tool_spawn(json_object *a, char **res) {
     int known = !effort;
     for (int i = 0; !known && EFFORTS[i]; i++) known = strcmp(effort, EFFORTS[i]) == 0;
     if (!known) return fail(res, fmt("bad effort %s", effort));
+    const char *tier = sarg(a, "tier");
+    int t = tier ? -1 : route(task);
+    for (int i = 0; tier && i < 4; i++)
+        if (strcmp(tier, TIERS[i]) == 0) t = i;
+    if (t < 0) return fail(res, fmt("bad tier %s", tier));
+    int h = agy ? 2 : strcmp(harness, "codex") == 0;
+    if (!model) model = ROUTES[h][t][0];
+    if (!effort) effort = ROUTES[h][t][1];
     char dir[4096];
     if (!cwd) cwd = getcwd(dir, sizeof dir) ? dir : ".";
     int wait = barg(a, "wait");
@@ -858,7 +891,7 @@ static int tool_spawn(json_object *a, char **res) {
     char *title = fmt("task %s %s→%s", id, caller_name, name);
     log_history(caller_pane, title, task);
     free(title);
-    int r = wait ? await_reply(id, pane, name, targ(a), res) : ok(res, fmt("spawned %s in %s id=%s", name, pane, id));
+    int r = wait ? await_reply(id, pane, name, targ(a), res) : ok(res, fmt("spawned %s in %s id=%s (%s: %s %s)", name, pane, id, TIERS[t], model, effort));
     free(pane);
     return r;
 }
@@ -1032,7 +1065,7 @@ static int tool_distill(json_object *a, char **res) {
     json_object_object_add(args, "name", json_object_new_string(name));
     json_object_object_add(args, "task", json_object_new_string(task));
     json_object_object_add(args, "wait", json_object_new_boolean(barg(a, "wait")));
-    for (const char **k = (const char *[]){"timeout", "model", "effort", NULL}; *k; k++)
+    for (const char **k = (const char *[]){"timeout", "model", "effort", "tier", NULL}; *k; k++)
         if (json_object_object_get_ex(a, *k, &v)) json_object_object_add(args, *k, json_object_get(v));
     int r = tool_spawn(args, res);
     json_object_put(args);
@@ -1170,8 +1203,9 @@ static const char TOOLS[] =
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
     "\"harness\":{\"type\":\"string\",\"enum\":[\"claude\",\"codex\",\"agy\"]},"
     "\"name\":{\"type\":\"string\",\"description\":\"Unique agent name; other agents use it as 'to'\"},"
-    "\"model\":{\"type\":\"string\",\"description\":\"Model id for the harness, e.g. claude-sonnet-5, gpt-6-luna, gemini-3.8-flash-medium; defaults to the harness's own\"},"
-    "\"effort\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\",\"xhigh\",\"max\"],\"description\":\"Reasoning effort; pick the lowest that fits the task\"},"
+    "\"model\":{\"type\":\"string\",\"description\":\"Model id for the harness, overrides the routed model\"},"
+    "\"tier\":{\"type\":\"string\",\"enum\":[\"light\",\"standard\",\"review\",\"hard\"],\"description\":\"Usually leave unset: cntctr picks model and effort from the task text\"},"
+    "\"effort\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\",\"xhigh\",\"max\"],\"description\":\"Overrides the routed effort\"},"
     "\"task\":{\"type\":\"string\"},"
     "\"cwd\":{\"type\":\"string\",\"description\":\"Working directory; defaults to yours\"},"
     "\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"},"
