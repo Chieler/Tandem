@@ -686,9 +686,9 @@ static const struct { int tier; const char *words[12]; } RULES[] = {
 };
 /* model, effort for each tier, per harness: claude, codex, agy */
 static const char *ROUTES[3][4][2] = {
-    {{"claude-sonnet-5", "low"}, {"claude-sonnet-5-5", "medium"}, {"claude-opus-4-7", "high"}, {"claude-opus-5-5", "high"}},
+    {{"claude-sonnet-5", "low"}, {"claude-opus-4-7", "medium"}, {"claude-opus-4-7", "high"}, {"claude-opus-5-5", "high"}},
     {{"gpt-6-luna", "low"}, {"gpt-6-luna", "medium"}, {"gpt-6-sol", "medium"}, {"gpt-6-sol", "high"}},
-    {{"gemini-3.8-flash-low", "low"}, {"gemini-3.8-flash-medium", "medium"}, {"gemini-3.8-flash-high", "high"}, {"gemini-3.8-flash-high", "high"}},
+    {{"gemini-3.8-flash-medium", "medium"}, {"gemini-3.8-flash-medium", "medium"}, {"gemini-3.8-flash-high", "high"}, {"gemini-3.8-flash-high", "high"}},
 };
 
 static int route(const char *task) {
