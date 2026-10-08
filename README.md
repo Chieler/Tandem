@@ -34,6 +34,9 @@ There is no daemon. tmux carries every message, and SQLite holds the shared know
 - macOS or Linux, with tmux (tested with 3.7c). Run your agents inside tmux.
 - json-c (`brew install json-c`) and SQLite with FTS5.
 - At least one of `claude`, `codex` and `agy` on `PATH`.
+- [headroom](https://headroom-docs.vercel.app) on `PATH`. Claude and Codex workers
+  start as `headroom wrap claude|codex -- <args>`, so their API calls go through the
+  headroom proxy. agy is started directly.
 - `jq` to run the tests. `sqlite3` to run `watch.sh`.
 
 ## Build

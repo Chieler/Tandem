@@ -870,8 +870,11 @@ static int tool_spawn(json_object *a, char **res) {
      * Codex has no --effort flag; it takes the effort as a config override. */
     int codex = strcmp(harness, "codex") == 0, n = 0;
     char *ceffort = effort && codex ? fmt("model_reasoning_effort=\"%s\"", effort) : NULL;
-    const char *argv[20] = {"tmux", "new-window", "-d", "-n", name, "-c", cwd, "-P", "-F", "#{pane_id}", harness};
-    n = 11;
+    const char *argv[24] = {"tmux", "new-window", "-d", "-n", name, "-c", cwd, "-P", "-F", "#{pane_id}"};
+    n = 10;
+    if (!agy) argv[n++] = "headroom", argv[n++] = "wrap";   /* route claude and codex API calls through headroom */
+    argv[n++] = harness;
+    if (!agy) argv[n++] = "--";
     if (model) argv[n++] = codex ? "-m" : "--model", argv[n++] = model;
     if (effort) argv[n++] = codex ? "-c" : "--effort", argv[n++] = codex ? ceffort : effort;
     if (agy) argv[n++] = "-i";

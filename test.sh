@@ -274,6 +274,14 @@ EOF
 chmod +x "$TMPD/bin/claude"
 ln -s claude "$TMPD/bin/codex"
 ln -s claude "$TMPD/bin/agy"
+cat > "$TMPD/bin/headroom" <<'EOF'
+#!/bin/sh
+# Fake headroom: headroom wrap <tool> -- <args>
+echo "wrapped:$2"
+tool=$2; shift 2; [ "$1" = -- ] && shift
+exec "$tool" "$@"
+EOF
+chmod +x "$TMPD/bin/headroom"
 
 L=$(newpane lead)
 out=$(call "$L" spawn '{"harness":"claude","name":"w1","task":"build it","wait":true,"timeout":10}')
@@ -296,6 +304,9 @@ out=$(call "$L" spawn '{"harness":"codex","name":"m2","task":"x","model":"gpt-6-
 expect_screen "codex gets model and effort" "$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')" "flags:  -m gpt-6-luna -c model_reasoning_effort=\"high\""
 out=$(call "$L" spawn '{"harness":"agy","name":"m3","task":"x","model":"gemini-3.8-flash-high","effort":"high"}')
 expect_screen "agy gets model and effort" "$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')" "flags:  --model gemini-3.8-flash-high --effort high -i"
+expect_screen "claude runs under headroom wrap" "$(txt "$(call "$L" list '{}')" | sed -n 's/^m1 claude \(%[0-9]*\).*/\1/p')" "wrapped:claude"
+expect_screen "codex runs under headroom wrap" "$(txt "$(call "$L" list '{}')" | sed -n 's/^m2 codex \(%[0-9]*\).*/\1/p')" "wrapped:codex"
+if t capture-pane -p -t "$(txt "$(call "$L" list '{}')" | sed -n 's/^m3 agy \(%[0-9]*\).*/\1/p')" | grep -q wrapped; then bad "agy is not wrapped"; else ok_; fi
 pane_of() { txt "$1" | sed 's/.* in \(%[0-9]*\) .*/\1/'; }
 out=$(call "$L" spawn '{"harness":"claude","name":"r1","task":"smoke test: run make test, report the count"}')
 check "router names its choice" "$(txt "$out")" "(light: claude-sonnet-5 low)"
