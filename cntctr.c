@@ -686,7 +686,7 @@ static const struct { int tier; const char *words[12]; } RULES[] = {
 };
 /* model, effort for each tier, per harness: claude, codex, agy */
 static const char *ROUTES[3][4][2] = {
-    {{"claude-sonnet-5", "low"}, {"claude-opus-4-7", "medium"}, {"claude-opus-4-7", "high"}, {"claude-opus-5-5", "high"}},
+    {{"claude-haiku-5-5", "medium"}, {"claude-sonnet-5-5", "medium"}, {"claude-opus-4-7", "high"}, {"claude-opus-5-5", "high"}},
     {{"gpt-6-luna", "low"}, {"gpt-6-luna", "medium"}, {"gpt-6-sol", "medium"}, {"gpt-6-sol", "high"}},
     {{"gemini-3.8-flash-medium", "medium"}, {"gemini-3.8-flash-medium", "medium"}, {"gemini-3.8-flash-high", "high"}, {"gemini-3.8-flash-high", "high"}},
 };
@@ -1042,7 +1042,7 @@ static const char LIBRARIAN[] =
     "You are the cntctr librarian for project %s. Use the tools of the cntctr MCP server.\n"
     "1. Call recall with layer=history, since=\"%s\" and limit=200 to read new work history, and recall with no query to read the index.\n"
     "2. For each durable fact or procedure in that history, write an insight or skill with note, with refs set to the source ids.\n"
-    "3. Merge duplicate or contradicting entries: write one entry with note supersedes=[their ids]. "
+    "3. Consolidate duplicate or contradicting entries: write one entry with note supersedes=[their ids]. "
     "Entries that are not specific to this project go in scope=global.\n"
     "4. Call forget on entries whose code pointers (file:symbol) no longer exist; check them with Serena if you have it.\n"
     "5. Reply with a short summary of what you changed.";

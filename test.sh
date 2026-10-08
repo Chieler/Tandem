@@ -309,10 +309,10 @@ expect_screen "codex runs under headroom wrap" "$(txt "$(call "$L" list '{}')" |
 if t capture-pane -p -t "$(txt "$(call "$L" list '{}')" | sed -n 's/^m3 agy \(%[0-9]*\).*/\1/p')" | grep -q wrapped; then bad "agy is not wrapped"; else ok_; fi
 pane_of() { txt "$1" | sed 's/.* in \(%[0-9]*\) .*/\1/'; }
 out=$(call "$L" spawn '{"harness":"claude","name":"r1","task":"smoke test: run make test, report the count"}')
-check "router names its choice" "$(txt "$out")" "(light: claude-sonnet-5 low)"
-expect_screen "light task gets the small model" "$(pane_of "$out")" "flags:  --model claude-sonnet-5 --effort low"
+check "router names its choice" "$(txt "$out")" "(light: claude-haiku-5-5 medium)"
+expect_screen "light task gets the small model" "$(pane_of "$out")" "flags:  --model claude-haiku-5-5 --effort medium"
 out=$(call "$L" spawn '{"harness":"claude","name":"r2","task":"Implement the retry loop in cntctr.c:inject so a busy pane is retried twice, with a test in test.sh."}')
-expect_screen "ordinary task gets the standard model" "$(pane_of "$out")" "flags:  --model claude-opus-4-7 --effort medium"
+expect_screen "ordinary task gets the standard model" "$(pane_of "$out")" "flags:  --model claude-sonnet-5-5 --effort medium"
 out=$(call "$L" spawn '{"harness":"claude","name":"r3","task":"Review the diff in /tmp/x.diff against the spec; list issues."}')
 expect_screen "review gets the review model" "$(pane_of "$out")" "flags:  --model claude-opus-4-7 --effort high"
 out=$(call "$L" spawn '{"harness":"claude","name":"r4","task":"Design the architecture for cross-machine sync; find the race conditions."}')
@@ -324,7 +324,7 @@ expect_screen "agy light task stays on medium" "$(pane_of "$out")" "flags:  --mo
 out=$(call "$L" spawn '{"harness":"agy","name":"r6","task":"Design the architecture for the new sync layer."}')
 expect_screen "agy always uses Gemini 3.8" "$(pane_of "$out")" "flags:  --model gemini-3.8-flash-high --effort high -i"
 out=$(call "$L" spawn '{"harness":"claude","name":"r7","task":"Design everything","tier":"light"}')
-expect_screen "tier overrides the router" "$(pane_of "$out")" "flags:  --model claude-sonnet-5 --effort low"
+expect_screen "tier overrides the router" "$(pane_of "$out")" "flags:  --model claude-haiku-5-5 --effort medium"
 out=$(call "$L" spawn '{"harness":"claude","name":"r8","task":"Design everything","effort":"low"}')
 expect_screen "explicit effort wins, model still routed" "$(pane_of "$out")" "flags:  --model claude-opus-5-5 --effort low"
 same "unknown tier" "$(txt "$(call "$L" spawn '{"harness":"claude","name":"r9","task":"x","tier":"huge"}')")" "bad tier huge"
@@ -488,7 +488,7 @@ check "distill spawns a librarian" "$(txt "$out")" "spawned librarian-1 in %"
 LB=$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')
 expect_screen "librarian gets its task" "$LB" "You are the cntctr librarian for project"
 expect_screen "first librarian reads all history" "$LB" 'since="1970-01-01 00:00:00"'
-expect_screen "librarian is routed as a review" "$LB" "flags:  --model claude-opus-4-7 --effort high"
+expect_screen "librarian is routed as standard" "$LB" "flags:  --model claude-sonnet-5-5 --effort medium"
 out=$(call "$KA" distill '{"model":"claude-sonnet-5","effort":"medium"}')
 check "next librarian gets a new name" "$(txt "$out")" "spawned librarian-2 in %"
 LB2=$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')
