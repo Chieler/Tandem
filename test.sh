@@ -70,7 +70,7 @@ check "initialize names the server" "$out" '"serverInfo":{"name":"cntctr"'
 out=$(rpc '{"jsonrpc":"2.0","id":7,"method":"ping"}')
 same "ping" "$out" '{"jsonrpc":"2.0","id":7,"result":{}}'
 out=$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')
-for tool in spawn send reply list kill note recall read forget project distill post board; do check "tools/list has $tool" "$out" "\"name\":\"$tool\""; done
+for tool in spawn send gather reply list kill note recall read forget project distill post board; do check "tools/list has $tool" "$out" "\"name\":\"$tool\""; done
 out=$(rpc '{"jsonrpc":"2.0","id":3,"method":"nope"}')
 check "unknown method" "$out" '"code":-32601'
 out=$(rpc 'not json')
@@ -116,6 +116,16 @@ expect_screen "multiline unicode text arrives" "$B" "line two ünï"
 call "$A" send "$(jq -nc --arg t "\$(touch $TMPD/pwned) \`touch $TMPD/pwned\`" '{to:"b",text:$t}')" >/dev/null
 expect_screen "shell syntax arrives literally" "$B" "\$(touch $TMPD/pwned)"
 if [ -e "$TMPD/pwned" ]; then bad "send text was run by a shell"; else ok_; fi
+# Two senders to one pane must submit two separate inputs.
+RACE=$(newpane race 'stty -echo; cat')
+CNTCTR_ENTER_DELAY_MS=1500 call "$A" send '{"to":"race","text":"race first"}' > "$TMPD/race-a" & race_a=$!
+expect_screen "first concurrent message pasted" "$RACE" "race first"
+CNTCTR_ENTER_DELAY_MS=1500 call "$B" send '{"to":"race","text":"race second"}' > "$TMPD/race-b" & race_b=$!
+wait "$race_a" "$race_b"
+check "first concurrent send succeeded" "$(txt "$(cat "$TMPD/race-a")")" "sent id="
+check "second concurrent send succeeded" "$(txt "$(cat "$TMPD/race-b")")" "sent id="
+same "concurrent messages submitted separately" "$(screen "$RACE" | grep -c '^\[cntctr from=')" 2
+
 C=$(newpane cm)
 t copy-mode -t "$C"   # the user scrolled back in the receiver's pane
 call "$A" send '{"to":"cm","text":"sent while scrolled"}' >/dev/null
@@ -207,6 +217,42 @@ wait
 same "concurrent call 2" "$(jq -r 'select(.id==2) | .result.content[0].text' "$TMPD/pair")" "answer one"
 same "concurrent call 3" "$(jq -r 'select(.id==3) | .result.content[0].text' "$TMPD/pair")" "answer two"
 
+# ---- gather: one decision boundary for delegated work ----
+GA=$(newpane ga)
+GB=$(newpane gb)
+call "$S" gather '{"tasks":[{"kind":"send","to":"ga","text":"first report"},{"kind":"send","to":"gb","text":"second report"}],"timeout":10}' > "$TMPD/gather" & gather_pid=$!
+expect_screen "gather dispatched first task" "$GA" "first report"
+expect_screen "gather dispatched second task" "$GB" "second report"
+call "$GB" reply "{\"id\":\"$(lastid "$GB")\",\"text\":\"second answer\"}" >/dev/null
+if [ ! -s "$TMPD/gather" ]; then ok_; else bad "gather returned before both answers"; fi
+call "$GA" reply "{\"id\":\"$(lastid "$GA")\",\"text\":\"first answer\"}" >/dev/null
+wait "$gather_pid"
+gather=$(txt "$(cat "$TMPD/gather")")
+same "gather complete" "$(printf '%s' "$gather" | jq -r '.complete')" true
+same "gather preserves task order" "$(printf '%s' "$gather" | jq -r '[.results[].text] | join(",")')" "first answer,second answer"
+same "gather reports both ids" "$(printf '%s' "$gather" | jq -r '[.results[].id | test("^[0-9a-f]{8}$")] | all')" true
+
+call "$S" gather '{"tasks":[{"kind":"send","to":"ga","text":"short reply"},{"kind":"send","to":"gb","text":"slow reply"}],"timeout":8}' > "$TMPD/gather-timeout" & gather_pid=$!
+expect_screen "timeout gather dispatched quick task" "$GA" "short reply"
+expect_screen "timeout gather dispatched slow task" "$GB" "slow reply"
+call "$GA" reply "{\"id\":\"$(lastid "$GA")\",\"text\":\"quick answer\"}" >/dev/null
+wait "$gather_pid"
+gather=$(txt "$(cat "$TMPD/gather-timeout")")
+same "gather timeout is incomplete" "$(printf '%s' "$gather" | jq -r '.complete')" false
+same "gather keeps answered task" "$(printf '%s' "$gather" | jq -r '.results[0].text')" "quick answer"
+same "gather marks missing task" "$(printf '%s' "$gather" | jq -r '.results[1].status')" timed_out
+call "$GB" reply "{\"id\":\"$(lastid "$GB")\",\"text\":\"late gather answer\"}" >/dev/null
+expect_screen "late gather reply reaches leader" "$S" "late gather answer"
+
+call "$S" gather '{"tasks":[{"kind":"send","to":"missing-gather-agent","text":"unavailable"},{"kind":"send","to":"ga","text":"still run"}],"timeout":10}' > "$TMPD/gather-failed" & gather_pid=$!
+expect_screen "gather continues after failed dispatch" "$GA" "still run"
+call "$GA" reply "{\"id\":\"$(lastid "$GA")\",\"text\":\"good answer\"}" >/dev/null
+wait "$gather_pid"
+gather=$(txt "$(cat "$TMPD/gather-failed")")
+same "gather failure is incomplete" "$(printf '%s' "$gather" | jq -r '.complete')" false
+same "gather records dispatch failure" "$(printf '%s' "$gather" | jq -r '.results[0].status')" failed
+same "gather keeps later answer" "$(printf '%s' "$gather" | jq -r '.results[1].text')" "good answer"
+
 R=$(newpane r)
 { printf '%s\n' "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send","arguments":{"to":"b","text":"cancel me","wait":true,"timeout":30}}}'
   sleep 1
@@ -284,6 +330,10 @@ EOF
 chmod +x "$TMPD/bin/headroom"
 
 L=$(newpane lead)
+gather=$(txt "$(call "$L" gather '{"tasks":[{"kind":"spawn","harness":"claude","name":"wg","task":"gather spawn"}],"timeout":10}')")
+same "gather spawn completes" "$(printf '%s' "$gather" | jq -r '.complete')" true
+same "gather spawn identifies worker" "$(printf '%s' "$gather" | jq -r '.results[0].agent')" wg
+check "gather spawn returns worker answer" "$(printf '%s' "$gather" | jq -r '.results[0].text')" "done "
 out=$(call "$L" spawn '{"harness":"claude","name":"w1","task":"build it","wait":true,"timeout":10}')
 check "spawn wait=true returns the worker's reply" "$(txt "$out")" "done "
 check "list shows spawned worker" "$(txt "$(call "$L" list '{}')")" "w1 claude %"

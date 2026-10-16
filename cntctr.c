@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <ctype.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <poll.h>
 #include <pthread.h>
 #include <regex.h>
@@ -14,6 +15,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -519,20 +521,57 @@ static char *paste(const char *pane, const char *text, int bracketed) {
     return err;
 }
 
+/* Serialize terminal input across cntctr processes targeting the same pane. */
+static int lock_pane(const char *pane, char **err) {
+    char *scope;
+    if (TMUX(NULL, &scope, "display", "-p", "#{socket_path}") != 0) {
+        *err = scope;
+        return -1;
+    }
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (const unsigned char *p = (const unsigned char *)scope; *p; p++)
+        hash = (hash ^ *p) * UINT64_C(1099511628211);
+    free(scope);
+    hash = (hash ^ 0xff) * UINT64_C(1099511628211);
+    for (const unsigned char *p = (const unsigned char *)pane; *p; p++)
+        hash = (hash ^ *p) * UINT64_C(1099511628211);
+    char path[96];
+    snprintf(path, sizeof path, "/tmp/cntctr-inject-%lu-%016llx.lock",
+             (unsigned long)getuid(), (unsigned long long)hash);
+    int fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0) { *err = fmt("pane lock: %s", strerror(errno)); return -1; }
+    while (flock(fd, LOCK_EX) < 0) {
+        if (errno == EINTR) continue;
+        *err = fmt("pane lock: %s", strerror(errno));
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
 /* Paste `text` into `pane` as one bracketed paste, then press Enter.
  * `who` names the pane in errors. Returns NULL or an error (caller frees). */
 static char *inject(const char *pane, const char *who, const char *text) {
-    if (awaiting_permission(pane)) return fmt("%s awaiting permission prompt; retry later", who);
+    char *err = NULL;
+    int lock = lock_pane(pane, &err);
+    if (lock < 0) return err;
+    if (awaiting_permission(pane)) {
+        err = fmt("%s awaiting permission prompt; retry later", who);
+        goto done;
+    }
     size_t n = strlen(text);
     /* Claude reads backslash + Enter as "new line", not "submit". */
-    char *body = n && text[n - 1] == '\\' ? fmt("%s\n", text) : NULL, *err;
+    char *body = n && text[n - 1] == '\\' ? fmt("%s\n", text) : NULL;
     err = paste(pane, body ? body : text, 1);
     free(body);
-    if (err) return err;
+    if (err) goto done;
     struct timespec pause = {enter_delay_ms / 1000, (enter_delay_ms % 1000) * 1000000L};
     nanosleep(&pause, NULL);
     /* Enter as a raw CR paste: send-keys would go to copy-mode if the user is scrolled back. */
-    return paste(pane, "\r", 0);
+    err = paste(pane, "\r", 0);
+done:
+    close(lock);
+    return err;
 }
 
 static void new_id(char id[9]) { snprintf(id, 9, "%08x", arc4random()); }
@@ -638,13 +677,15 @@ static char *buffer_take(const char *buf) {
 #define WAIT_SLICE 5   /* seconds between checks for a lost signal or a dead worker */
 
 /* Block for the reply to message `id`, sent to agent `who` in `pane`. */
-static int await_reply(const char *id, const char *pane, const char *who, int timeout, char **res) {
+static int await_reply(const char *id, const char *pane, const char *who, int timeout, int *timed_out, char **res) {
+    if (timed_out) *timed_out = 0;
     char chan[32], buf[40], opt[48];
     snprintf(chan, sizeof chan, "cntctr-%s", id);
     snprintf(buf, sizeof buf, "cntctr-reply-%s", id);
     snprintf(opt, sizeof opt, "@cntctr_wait_%s", id);
     int gone = 0;
     for (time_t end = time(NULL) + timeout;;) {
+        if (cancelled()) break;
         int left = (int)(end - time(NULL));
         if (left <= 0) break;
         /* tmux keeps a killed wait-for queued, and it can swallow a later signal,
@@ -670,6 +711,7 @@ static int await_reply(const char *id, const char *pane, const char *who, int ti
         untrack(id);
         return fail(res, fmt("agent %s exited before replying (id=%s)", who, id));
     }
+    if (timed_out) *timed_out = 1;
     return ok(res, fmt("timed out; reply will arrive in your pane (id=%s)", id));
 }
 
@@ -721,13 +763,12 @@ static int tool_list(json_object *args, char **res) {
     return ok(res, list);
 }
 
-static int tool_send(json_object *a, char **res) {
+static int start_send(json_object *a, int wait, char id[9], char **pane_out, char **res) {
     const char *to = sarg(a, "to"), *text = sarg(a, "text");
     if (!to || !text) return fail(res, fmt("send needs 'to' and 'text'"));
     char *pane = find_agent(to);
     if (!pane) return fail(res, fmt("agent %s not found", to));
-    int wait = barg(a, "wait");
-    char id[9], *env, *err;
+    char *env, *err;
     new_id(id);
     track(id, wait);
     track_to(id, pane);
@@ -742,7 +783,16 @@ static int tool_send(json_object *a, char **res) {
     char *title = fmt("task %s %s→%s", id, caller_name, to);
     log_history(caller_pane, title, text);
     free(title);
-    int r = wait ? await_reply(id, pane, to, targ(a), res) : ok(res, fmt("sent id=%s", id));
+    *pane_out = pane;
+    return 0;
+}
+
+static int tool_send(json_object *a, char **res) {
+    int wait = barg(a, "wait");
+    char id[9], *pane;
+    if (start_send(a, wait, id, &pane, res)) return 1;
+    int r = wait ? await_reply(id, pane, sarg(a, "to"), targ(a), NULL, res)
+                 : ok(res, fmt("sent id=%s", id));
     free(pane);
     return r;
 }
@@ -833,7 +883,8 @@ static int tool_reply(json_object *a, char **res) {
     return ok(res, fmt("ok"));
 }
 
-static int tool_spawn(json_object *a, char **res) {
+static int start_spawn(json_object *a, int wait, char id[9], char **pane_out,
+                       char **summary, char **res) {
     const char *harness = sarg(a, "harness"), *name = sarg(a, "name"), *task = sarg(a, "task"), *cwd = sarg(a, "cwd");
     if (!harness || !name || !*name || !task) return fail(res, fmt("spawn needs 'harness', 'name' and 'task'"));
     int agy = strcmp(harness, "agy") == 0;
@@ -860,8 +911,6 @@ static int tool_spawn(json_object *a, char **res) {
     if (!effort) effort = ROUTES[h][t][1];
     char dir[4096];
     if (!cwd) cwd = getcwd(dir, sizeof dir) ? dir : ".";
-    int wait = barg(a, "wait");
-    char id[9];
     new_id(id);
     track(id, wait);
     char *env = envelope(id, task, name);
@@ -894,9 +943,94 @@ static int tool_spawn(json_object *a, char **res) {
     char *title = fmt("task %s %s→%s", id, caller_name, name);
     log_history(caller_pane, title, task);
     free(title);
-    int r = wait ? await_reply(id, pane, name, targ(a), res) : ok(res, fmt("spawned %s in %s id=%s (%s: %s %s)", name, pane, id, TIERS[t], model, effort));
+    if (summary) *summary = fmt("spawned %s in %s id=%s (%s: %s %s)", name, pane, id, TIERS[t], model, effort);
+    *pane_out = pane;
+    return 0;
+}
+
+static int tool_spawn(json_object *a, char **res) {
+    int wait = barg(a, "wait");
+    char id[9], *pane, *summary = NULL;
+    if (start_spawn(a, wait, id, &pane, wait ? NULL : &summary, res)) return 1;
+    int r = wait ? await_reply(id, pane, sarg(a, "name"), targ(a), NULL, res)
+                 : ok(res, summary);
     free(pane);
     return r;
+}
+
+struct gathered {
+    const char *kind, *agent, *status;
+    char id[9], *pane, *text;
+};
+
+static int tool_gather(json_object *a, char **res) {
+    json_object *tasks = NULL;
+    if (!json_object_object_get_ex(a, "tasks", &tasks) ||
+        !json_object_is_type(tasks, json_type_array) ||
+        json_object_array_length(tasks) == 0)
+        return fail(res, fmt("gather needs a nonempty tasks array"));
+
+    size_t count = json_object_array_length(tasks);
+    struct gathered *items = calloc(count, sizeof *items);
+    time_t deadline = time(NULL) + targ(a);
+    for (size_t i = 0; i < count; i++) {
+        struct gathered *item = &items[i];
+        json_object *task = json_object_array_get_idx(tasks, i), *unused;
+        item->kind = sarg(task, "kind");
+        item->agent = sarg(task, "to");
+        if (item->kind && strcmp(item->kind, "spawn") == 0)
+            item->agent = sarg(task, "name");
+        if (!json_object_is_type(task, json_type_object) ||
+            json_object_object_get_ex(task, "wait", &unused) ||
+            json_object_object_get_ex(task, "timeout", &unused)) {
+            item->text = strdup("gather task needs an object without wait or timeout");
+        } else if (cancelled()) {
+            item->text = strdup("gather cancelled before dispatch");
+        } else if (item->kind && strcmp(item->kind, "send") == 0) {
+            start_send(task, 1, item->id, &item->pane, &item->text);
+        } else if (item->kind && strcmp(item->kind, "spawn") == 0) {
+            start_spawn(task, 1, item->id, &item->pane, NULL, &item->text);
+        } else {
+            item->text = strdup("gather task kind must be send or spawn");
+        }
+        if (!item->pane) item->status = "failed";
+    }
+
+    int complete = 1;
+    for (size_t i = 0; i < count; i++) {
+        struct gathered *item = &items[i];
+        if (item->pane) {
+            int left = (int)(deadline - time(NULL)), timed_out = 0;
+            if (left < 0) left = 0;
+            int error = await_reply(item->id, item->pane, item->agent,
+                                    left, &timed_out, &item->text);
+            item->status = error ? "failed" : timed_out ? "timed_out" : "answered";
+            if (timed_out) { free(item->text); item->text = NULL; }
+        }
+        if (strcmp(item->status, "answered") != 0) complete = 0;
+    }
+
+    json_object *out = json_object_new_object(), *results = json_object_new_array();
+    json_object_object_add(out, "complete", json_object_new_boolean(complete));
+    json_object_object_add(out, "results", results);
+    for (size_t i = 0; i < count; i++) {
+        struct gathered *item = &items[i];
+        json_object *entry = json_object_new_object();
+        json_object_object_add(entry, "kind", json_object_new_string(item->kind ? item->kind : ""));
+        json_object_object_add(entry, "agent", json_object_new_string(item->agent ? item->agent : ""));
+        json_object_object_add(entry, "status", json_object_new_string(item->status));
+        if (*item->id) json_object_object_add(entry, "id", json_object_new_string(item->id));
+        if (item->text)
+            json_object_object_add(entry, strcmp(item->status, "answered") == 0 ? "text" : "error",
+                                   json_object_new_string(item->text));
+        json_object_array_add(results, entry);
+        free(item->pane);
+        free(item->text);
+    }
+    free(items);
+    char *wire = strdup(json_object_to_json_string_ext(out, JSON_C_TO_STRING_PLAIN));
+    json_object_put(out);
+    return ok(res, wire);
 }
 
 static int tool_kill(json_object *a, char **res) {
@@ -1145,6 +1279,7 @@ typedef int (*tool_fn)(json_object *args, char **res);
 static const struct { const char *name; tool_fn fn; int needs_pane; } TOOL_FNS[] = {
     {"list", tool_list, 0},
     {"send", tool_send, 1},
+    {"gather", tool_gather, 1},
     {"reply", tool_reply, 0},
     {"spawn", tool_spawn, 1},
     {"kill", tool_kill, 1},
@@ -1222,6 +1357,19 @@ static const char TOOLS[] =
     "\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"},"
     "\"timeout\":{\"type\":\"integer\",\"description\":\"Seconds to block when wait=true (default 600)\"}},"
     "\"required\":[\"to\",\"text\"]}},"
+    "{\"name\":\"gather\",\"description\":\"Dispatch delegated send or spawn tasks, then return one JSON result when all answer or the shared deadline expires. Check complete before deciding.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+    "\"tasks\":{\"type\":\"array\",\"minItems\":1,\"items\":{\"type\":\"object\",\"properties\":{"
+    "\"kind\":{\"type\":\"string\",\"enum\":[\"send\",\"spawn\"]},"
+    "\"to\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},"
+    "\"harness\":{\"type\":\"string\",\"enum\":[\"claude\",\"codex\",\"agy\"]},"
+    "\"name\":{\"type\":\"string\"},\"task\":{\"type\":\"string\"},"
+    "\"cwd\":{\"type\":\"string\"},\"tier\":{\"type\":\"string\"},"
+    "\"model\":{\"type\":\"string\"},\"effort\":{\"type\":\"string\"}},"
+    "\"required\":[\"kind\"]}},"
+    "\"timeout\":{\"type\":\"integer\",\"description\":\"Shared deadline in seconds (default 600)\"},"
+    "\"from\":{\"type\":\"string\",\"description\":\"Your agent name when cntctr runs outside your pane\"}},"
+    "\"required\":[\"tasks\"]}},"
     "{\"name\":\"reply\",\"description\":\"Answer a message you received. Use the id from its [cntctr from=... id=...] header. "
     "Always reply when you finish a task another agent gave you.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},"

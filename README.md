@@ -26,6 +26,9 @@ There is no daemon. tmux carries every message, and SQLite holds the shared know
 - Messages are pasted into the target pane as an envelope with an id. The receiver
   answers with `reply`, and the answer goes back to the sender's pane, or it returns
   directly from a blocking `send`.
+- Concurrent sends to the same target pane are serialized with an advisory per-pane
+  file lock, so multiple agents typing into the same terminal never interleave or corrupt
+  bracketed pastes.
 - tmux is called with an argv array and never through a shell. Message text reaches
   tmux only through a pipe.
 
@@ -67,9 +70,18 @@ tests for the parser. Wait for its answer."
 |---|---|
 | `spawn` | Starts `claude`, `codex` or `agy` in a new tmux window with a first task; optional `model` and `effort` |
 | `send` | Types a message into another agent's terminal; `wait=true` blocks for the reply |
+| `gather` | Dispatches several `send` or `spawn` tasks and collects their replies together |
 | `reply` | Answers a message by its id |
 | `list` | Shows agents, their panes, and whether they are alive |
 | `kill` | Closes an agent's pane |
+
+Use `gather` to collect replies when a decision needs every delegated answer. For example:
+
+```json
+{"tasks":[{"kind":"send","to":"tests","text":"Check the tests"},{"kind":"spawn","harness":"codex","name":"review","task":"Review the change"}],"timeout":600}
+```
+
+The result is JSON text with `complete` and one `results` entry per task in input order. Each entry identifies the agent, message id, and answer or failure (`status`: `"answered"`, `"timed_out"`, or `"failed"`). If the shared deadline passes before all answers arrive, `complete` is `false`; any late replies that finish after the deadline arrive in the leader's pane with their ids so no output is lost.
 
 `spawn` and `distill` pick each worker's model and effort from the task text, so the
 leader doesn't have to (`cntctr.c:route`, tables `RULES` and `ROUTES`):
@@ -87,6 +99,11 @@ Rules are checked in the order hard, review, light; tasks over
 Workers run with normal permissions. Approve their prompts in their own windows
 (`C-b w` to switch). cntctr will not type into a pane that is showing a
 permission dialog; the sender gets `<name> awaiting permission prompt; retry later`.
+
+Pane locking: cntctr serializes message injection with an advisory per-pane file lock
+(`/tmp/cntctr-inject-<uid>-<hash>.lock` via `flock`) across the bracketed paste and Enter key
+press. When multiple agents or tools send to the same pane concurrently, each message submits as
+its own separate prompt instead of colliding.
 
 Delivery tuning: `CNTCTR_ENTER_DELAY_MS` (default 150) is the pause between
 pasting a message and pressing Enter.
@@ -141,7 +158,7 @@ Tests run against a private tmux server (`tmux -L cntctr-test`) and need `jq`.
 
 | File | Purpose |
 |---|---|
-| `cntctr.c` | MCP server: JSON-RPC loop, tools, tmux helpers, model router |
+| `cntctr.c` | MCP server: JSON-RPC loop, tools, tmux helpers, pane locking, model router |
 | `kb.c`, `kb.h` | Knowledge store: entries, FTS5 search, history, board |
 | `watch.sh` | Live dashboard |
 | `test.sh` | End-to-end tests with fake harnesses |

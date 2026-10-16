@@ -5,3 +5,4 @@ cntctr-test
 .worktrees/
 .serena/
 .vscode/
+.DS_Store
