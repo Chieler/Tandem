@@ -30,6 +30,14 @@ static const char SCHEMA[] =
     "CREATE TABLE IF NOT EXISTS projects(root TEXT PRIMARY KEY, key TEXT NOT NULL);"
     "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);"
     "CREATE TABLE IF NOT EXISTS posts(scope TEXT NOT NULL, sender TEXT NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL);"
+    "CREATE TABLE IF NOT EXISTS tools(project TEXT NOT NULL, name TEXT NOT NULL, version INTEGER NOT NULL,"
+    " status TEXT NOT NULL, author TEXT NOT NULL, author_model TEXT NOT NULL DEFAULT '', description TEXT NOT NULL,"
+    " input_schema TEXT NOT NULL, interpreter TEXT NOT NULL, script TEXT NOT NULL, net INTEGER NOT NULL DEFAULT 0,"
+    " timeout INTEGER NOT NULL DEFAULT 60, source TEXT NOT NULL DEFAULT '', reviewer TEXT, reviewer_pane TEXT,"
+    " reviewer_model TEXT, review_root TEXT, deadline INTEGER, verdict_reason TEXT, calls INTEGER NOT NULL DEFAULT 0,"
+    " failures INTEGER NOT NULL DEFAULT 0, created INTEGER,"
+    " PRIMARY KEY(project, name, version, author));"   /* author: drafts are version 0, one per author */
+    "CREATE INDEX IF NOT EXISTS tools_name ON tools(project, name, status);"
     "INSERT OR IGNORE INTO meta VALUES ('schema', '1');";
 
 static const char *col(sqlite3_stmt *st, int i) {
@@ -256,5 +264,89 @@ char *kb_board(sqlite3 *db, const char *scope, int limit) {
         " WHERE scope = ?1 ORDER BY rowid DESC LIMIT ?2) ORDER BY rowid");
     sqlite3_bind_text(st, 1, scope, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(st, 2, limit);
+    return lines(st);
+}
+
+/* ---- fleet tools ---- */
+
+void kb_tool_free(struct kb_tool *t) {
+    free(t->description);
+    free(t->input_schema);
+    free(t->script);
+    memset(t, 0, sizeof *t);
+}
+
+int kb_tool_save_draft(sqlite3 *db, const char *project, const char *author, const char *author_model,
+                       const char *name, const char *description, const char *schema,
+                       const char *interpreter, const char *script, int net, int timeout) {
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) return -1;
+    sqlite3_stmt *st = prep(db, "DELETE FROM tools WHERE project = ?1 AND name = ?2 AND status = 'draft' AND author = ?3");
+    sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, author, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st) == SQLITE_DONE ? 0 : -1;
+    sqlite3_finalize(st);
+    if (rc == 0) {
+        st = prep(db,
+            "INSERT INTO tools(project, name, version, status, author, author_model, description, input_schema,"
+            " interpreter, script, net, timeout, created) VALUES (?1, ?2, 0, 'draft', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,"
+            " CAST(strftime('%s', 'now') AS INTEGER))");
+        const char *v[] = {project, name, author, author_model, description, schema, interpreter, script};
+        for (int i = 0; i < 8; i++) sqlite3_bind_text(st, i + 1, v[i], -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 9, net);
+        sqlite3_bind_int(st, 10, timeout);
+        rc = sqlite3_step(st) == SQLITE_DONE ? 0 : -1;
+        sqlite3_finalize(st);
+    }
+    if (sqlite3_exec(db, rc == 0 ? "COMMIT" : "ROLLBACK", NULL, NULL, NULL) != SQLITE_OK) rc = -1;
+    return rc;
+}
+
+/* The newest row of `name` in `project` matching `where` (?1 project, ?2 name, ?3 who), into *t. */
+static int tool_row(sqlite3 *db, const char *where, const char *project, const char *name, const char *who, struct kb_tool *t) {
+    char *sql = sqlite3_mprintf(
+        "SELECT project, name, status, interpreter, author, version, net, timeout, description, input_schema, script"
+        " FROM tools WHERE project = ?1 AND name = ?2 AND %s ORDER BY version DESC LIMIT 1", where);
+    sqlite3_stmt *st = prep(db, sql);
+    sqlite3_free(sql);
+    sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
+    if (who) sqlite3_bind_text(st, 3, who, -1, SQLITE_TRANSIENT);
+    int found = sqlite3_step(st) == SQLITE_ROW;
+    if (found) {
+        snprintf(t->project, sizeof t->project, "%s", col(st, 0));
+        snprintf(t->name, sizeof t->name, "%s", col(st, 1));
+        snprintf(t->status, sizeof t->status, "%s", col(st, 2));
+        snprintf(t->interpreter, sizeof t->interpreter, "%s", col(st, 3));
+        snprintf(t->author, sizeof t->author, "%s", col(st, 4));
+        t->version = sqlite3_column_int(st, 5);
+        t->net = sqlite3_column_int(st, 6);
+        t->timeout = sqlite3_column_int(st, 7);
+        t->description = strdup(col(st, 8));
+        t->input_schema = strdup(col(st, 9));
+        t->script = strdup(col(st, 10));
+    }
+    sqlite3_finalize(st);
+    return found;
+}
+
+int kb_tool_resolve(sqlite3 *db, const char *project, const char *name,
+                    const char *caller_name, const char *caller_pane, struct kb_tool *t) {
+    memset(t, 0, sizeof *t);
+    if (*caller_pane && tool_row(db, "status = 'pending' AND reviewer_pane = ?3", project, name, caller_pane, t)) return 0;
+    if (*caller_name && tool_row(db, "status = 'draft' AND author = ?3", project, name, caller_name, t)) return 0;
+    const char *scopes[] = {project, "global"};
+    for (int i = 0; i < 2; i++)
+        if (tool_row(db, "status IN ('active', 'revoked')", scopes[i], name, NULL, t)) return strcmp(t->status, "revoked") == 0;
+    return -1;
+}
+
+char *kb_tool_names(sqlite3 *db, const char *project, const char *caller_name, const char *caller_pane) {
+    sqlite3_stmt *st = prep(db,
+        "SELECT DISTINCT name FROM tools WHERE project IN (?1, 'global') AND (status IN ('active', 'revoked')"
+        " OR (status = 'draft' AND author = ?2) OR (status = 'pending' AND reviewer_pane = ?3)) ORDER BY name");
+    sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, caller_name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, caller_pane, -1, SQLITE_TRANSIENT);
     return lines(st);
 }

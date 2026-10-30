@@ -574,6 +574,23 @@ check "dashboard shows knowledge" "$out" " — parallel note "
 check "dashboard shows history" "$out" "reply $(lastid "$LB2") librarian-2→ka"
 check "dashboard shows the distill cursor" "$out" "last distill"
 
+# ---- fleet tools ----
+FA=$(newpane fa)
+FB=$(newpane fb)
+def='{"name":"hello","description":"Say hello","input_schema":{"type":"object","properties":{"who":{"type":"string"}},"required":["who"]},"interpreter":"sh","script":"read a; echo \"hi $a\""}'
+same "define saves a draft" "$(txt "$(call "$FA" tool_define "$def")")" "saved draft hello"
+lst() { session "$1" 2 "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | tail -n 1; }
+check "draft listed for its author" "$(lst "$FA")" '"name":"hello"'
+check "fleet tool is marked" "$(lst "$FA")" '[fleet] Say hello'
+refute "draft hidden from others" "$(lst "$FB")" '"name":"hello"'
+bad_def() { jq -c "$1" <<<"$def"; }
+same "required must name a property" "$(txt "$(call "$FA" tool_define "$(bad_def '.input_schema.required=["x"]')")")" "input_schema: required names missing property x"
+same "built-in names are reserved" "$(txt "$(call "$FA" tool_define "$(bad_def '.name="send"')")")" "send is a built-in tool"
+same "name must match the pattern" "$(txt "$(call "$FA" tool_define "$(bad_def '.name="Bad-Name"')")")" "name must match ^[a-z][a-z0-9_]{1,40}\$"
+same "description cap" "$(txt "$(call "$FA" tool_define "$(bad_def ".description=\"$(printf 'x%.0s' $(seq 501))\"")")")" "description is over 500 characters"
+same "unknown interpreter" "$(txt "$(call "$FA" tool_define "$(bad_def '.interpreter="ruby"')")")" "interpreter must be sh, bash, python3 or node"
+same "timeout cap" "$(txt "$(call "$FA" tool_define "$(bad_def '.timeout=601')")")" "timeout must be 1..600"
+
 # ---- summary ----
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

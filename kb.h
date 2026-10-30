@@ -26,4 +26,19 @@ char *kb_project_get(sqlite3 *db, const char *root);
 void kb_project_set(sqlite3 *db, const char *root, const char *key);   /* an empty key removes the override */
 int kb_post(sqlite3 *db, const char *scope, const char *sender, const char *text);   /* 0, or -1 */
 char *kb_board(sqlite3 *db, const char *scope, int limit);   /* "<UTC time> <sender>: <text>" lines, oldest first */
+
+/* Fleet tools: script-backed MCP tools. Drafts are private to their author; see the spec's "Resolving a name". */
+struct kb_tool {
+    char project[1024], name[64], status[16], interpreter[16], author[128];
+    int version, net, timeout;
+    char *description, *input_schema, *script;
+};
+void kb_tool_free(struct kb_tool *t);
+int kb_tool_save_draft(sqlite3 *db, const char *project, const char *author, const char *author_model,
+                       const char *name, const char *description, const char *schema,
+                       const char *interpreter, const char *script, int net, int timeout);   /* replaces the author's draft; 0, or -1 */
+/* 0 found, 1 revoked (t->status is "revoked"), -1 unknown. Free t with kb_tool_free. */
+int kb_tool_resolve(sqlite3 *db, const char *project, const char *name,
+                    const char *caller_name, const char *caller_pane, struct kb_tool *t);
+char *kb_tool_names(sqlite3 *db, const char *project, const char *caller_name, const char *caller_pane);   /* names with any candidate row, one per line; the caller resolves each */
 #endif

@@ -1275,6 +1275,7 @@ static int tool_board(json_object *a, char **res) {
 
 /* ---- dispatch ---- */
 
+static int tool_define(json_object *a, char **res);
 typedef int (*tool_fn)(json_object *args, char **res);
 static const struct { const char *name; tool_fn fn; int needs_pane; } TOOL_FNS[] = {
     {"list", tool_list, 0},
@@ -1291,8 +1292,83 @@ static const struct { const char *name; tool_fn fn; int needs_pane; } TOOL_FNS[]
     {"distill", tool_distill, 1},
     {"post", tool_post, 1},
     {"board", tool_board, 0},
+    {"tool_define", tool_define, 0},
     {NULL, NULL, 0},
 };
+
+/* ---- fleet tools ---- */
+
+static regex_t name_re;   /* a fleet tool's name; compiled in main */
+
+/* The first reason `a` is not a valid tool definition (caller frees), or NULL. */
+static char *gate_check(json_object *a) {
+    const char *name = sarg(a, "name"), *desc = sarg(a, "description"), *interp = sarg(a, "interpreter");
+    const char *script = sarg(a, "script");
+    if (!name || regexec(&name_re, name, 0, NULL, 0) != 0) return fmt("name must match ^[a-z][a-z0-9_]{1,40}$");
+    for (int i = 0; TOOL_FNS[i].name; i++)
+        if (strcmp(TOOL_FNS[i].name, name) == 0) return fmt("%s is a built-in tool", name);
+    if (!desc || !*desc) return fmt("description is required");
+    size_t chars = 0;
+    for (const char *c = desc; *c; c++) chars += (*c & 0xC0) != 0x80;
+    if (chars > 500) return fmt("description is over 500 characters");
+    json_object *sc = NULL, *v = NULL, *props = NULL;
+    if (!json_object_object_get_ex(a, "input_schema", &sc) || !json_object_is_type(sc, json_type_object))
+        return fmt("input_schema must be a JSON object");
+    if (strlen(json_object_to_json_string_ext(sc, JSON_C_TO_STRING_PLAIN)) > 8192) return fmt("input_schema is over 8 KB");
+    /* structural only, not full JSON Schema */
+    if (!json_object_object_get_ex(sc, "type", &v) || !json_object_is_type(v, json_type_string)
+        || strcmp(json_object_get_string(v), "object") != 0)
+        return fmt("input_schema: type must be \"object\"");
+    if (json_object_object_get_ex(sc, "properties", &props)) {
+        if (!json_object_is_type(props, json_type_object)) return fmt("input_schema: properties must be an object");
+        json_object_object_foreach(props, key, val)
+            if (!json_object_is_type(val, json_type_object)) return fmt("input_schema: property %s must be an object", key);
+    }
+    if (json_object_object_get_ex(sc, "required", &v)) {
+        if (!json_object_is_type(v, json_type_array)) return fmt("input_schema: required must be an array");
+        for (size_t i = 0; i < json_object_array_length(v); i++) {
+            json_object *r = json_object_array_get_idx(v, i);
+            if (!json_object_is_type(r, json_type_string)) return fmt("input_schema: required must be an array of strings");
+            if (!props || !json_object_object_get_ex(props, json_object_get_string(r), NULL))
+                return fmt("input_schema: required names missing property %s", json_object_get_string(r));
+        }
+    }
+    if (!interp || (strcmp(interp, "sh") && strcmp(interp, "bash") && strcmp(interp, "python3") && strcmp(interp, "node")))
+        return fmt("interpreter must be sh, bash, python3 or node");
+    if (!script || !*script) return fmt("script is required");
+    if (strlen(script) > 65536) return fmt("script is over 64 KB");
+    if (json_object_object_get_ex(a, "timeout", &v)
+        && (!json_object_is_type(v, json_type_int) || json_object_get_int(v) < 1 || json_object_get_int(v) > 600))
+        return fmt("timeout must be 1..600");
+    return NULL;
+}
+
+static int tool_define(json_object *a, char **res) {
+    char *bad = gate_check(a);
+    if (bad) return fail(res, bad);
+    if (!*caller_name) return fail(res, fmt("cntctr cannot tell who you are; pass from=<your agent name>"));
+    json_object *sc = NULL, *t = NULL;
+    json_object_object_get_ex(a, "input_schema", &sc);
+    int timeout = json_object_object_get_ex(a, "timeout", &t) ? json_object_get_int(t) : 60;
+    char *model = NULL;
+    if (!*caller_pane || TMUX(NULL, &model, "show", "-pqv", "-t", caller_pane, "@cntctr_model") != 0) {
+        free(model);
+        model = strdup("");
+    }
+    struct project p;
+    sqlite3 *db = kb_for_caller(&p, res);
+    if (!db) {
+        free(model);
+        return 1;
+    }
+    const char *name = sarg(a, "name");
+    int rc = kb_tool_save_draft(db, p.key, caller_name, model, name, sarg(a, "description"),
+                                json_object_to_json_string_ext(sc, JSON_C_TO_STRING_PLAIN), sarg(a, "interpreter"),
+                                sarg(a, "script"), barg(a, "net"), timeout);
+    sqlite3_close(db);
+    free(model);
+    return rc ? fail(res, fmt("cannot save draft %s", name)) : ok(res, fmt("saved draft %s", name));
+}
 
 /* Set caller_* from the `from` argument: an agent name, or a pane id ($TMUX_PANE) for a
  * leader started by hand, which is tagged on first use. Returns an error or NULL. */
@@ -1418,7 +1494,51 @@ static const char TOOLS[] =
     "\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"}},\"required\":[\"text\"]}},"
     "{\"name\":\"board\",\"description\":\"Read the latest posts on this project's board, oldest first.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"limit\":{\"type\":\"integer\",\"description\":\"Default 20, at most 200\"}," KFROM "}}}"
+    ",{\"name\":\"tool_define\",\"description\":\"Define a script-backed tool for your project. It is saved as a draft only you can call.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+    "\"name\":{\"type\":\"string\",\"description\":\"^[a-z][a-z0-9_]{1,40}$, not a built-in\"},"
+    "\"description\":{\"type\":\"string\",\"description\":\"At most 500 characters\"},"
+    "\"input_schema\":{\"type\":\"object\",\"description\":\"JSON Schema for the arguments: type object, at most 8 KB\"},"
+    "\"interpreter\":{\"type\":\"string\",\"enum\":[\"sh\",\"bash\",\"python3\",\"node\"]},"
+    "\"script\":{\"type\":\"string\",\"description\":\"At most 64 KB\"},"
+    "\"net\":{\"type\":\"boolean\",\"description\":\"The tool needs network access; default false\"},"
+    "\"timeout\":{\"type\":\"integer\",\"description\":\"Seconds, default 60, at most 600\"}," KFROM "},"
+    "\"required\":[\"name\",\"description\",\"input_schema\",\"interpreter\",\"script\"]}}"
     "]}";
+
+/* The built-ins plus each fleet tool this server's agent can call. Outside a pane (Codex) the
+ * project is unknown, so only global tools show. */
+static json_object *tools_list(void) {
+    json_object *r = json_tokener_parse(TOOLS), *arr = NULL;
+    json_object_object_get_ex(r, "tools", &arr);
+    char *err = NULL;
+    sqlite3 *db = kb(&err);
+    free(err);
+    if (!db) return r;
+    struct project p;
+    const char *key = "global";
+    if (*self_pane) {
+        resolve_project(db, self_pane, &p);
+        key = p.key;
+    }
+    char *names = kb_tool_names(db, key, self_name, self_pane), *save = NULL;
+    for (char *n = strtok_r(names, "\n", &save); n; n = strtok_r(NULL, "\n", &save)) {
+        struct kb_tool t;
+        if (kb_tool_resolve(db, key, n, self_name, self_pane, &t) == 0) {
+            json_object *e = json_object_new_object(), *schema = json_tokener_parse(t.input_schema);
+            char *desc = fmt("[fleet] %s%s", t.net ? "[net] " : "", t.description);
+            json_object_object_add(e, "name", json_object_new_string(t.name));
+            json_object_object_add(e, "description", json_object_new_string(desc));
+            json_object_object_add(e, "inputSchema", schema ? schema : json_object_new_object());
+            json_object_array_add(arr, e);
+            free(desc);
+        }
+        kb_tool_free(&t);
+    }
+    free(names);
+    sqlite3_close(db);
+    return r;
+}
 
 /* ---- MCP protocol ---- */
 
@@ -1561,7 +1681,7 @@ static void handle(const char *line) {
     if (!method) respond_error(id, -32600, "invalid request");
     else if (strcmp(method, "initialize") == 0) respond(id, initialize(params));
     else if (strcmp(method, "ping") == 0) respond(id, json_object_new_object());
-    else if (strcmp(method, "tools/list") == 0) respond(id, json_tokener_parse(TOOLS));
+    else if (strcmp(method, "tools/list") == 0) respond(id, tools_list());
     else if (strcmp(method, "notifications/cancelled") == 0) {
         json_object *rid = NULL;
         if (json_object_object_get_ex(params, "requestId", &rid) && rid) cancel(rid);
@@ -1574,6 +1694,7 @@ int main(void) {
     signal(SIGPIPE, SIG_IGN);
     const char *delay = getenv("CNTCTR_ENTER_DELAY_MS");
     if (delay) enter_delay_ms = atoi(delay);
+    regcomp(&name_re, "^[a-z][a-z0-9_]{1,40}$", REG_EXTENDED | REG_NOSUB);
     for (size_t i = 0; i < sizeof PROMPTS / sizeof *PROMPTS; i++)
         regcomp(&prompt_re[i], PROMPTS[i], REG_EXTENDED | REG_ICASE | REG_NOSUB);
     char *line = NULL;
