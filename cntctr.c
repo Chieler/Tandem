@@ -1425,7 +1425,7 @@ static int use_tool(const char *name, json_object *args, char **res) {
     char def[4096], *out = NULL;
     const char *argjson = args ? json_object_to_json_string_ext(args, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE) : "{}";
     struct fleet_run r = {.name = t.name, .root = p.root, .interpreter = t.interpreter, .script = t.script,
-                          .args_json = argjson, .db_path = kb_path(def, sizeof def), .net = t.net,
+                          .args_json = argjson, .db_path = kb_path(def, sizeof def), .net = t.net, .fork_mu = &fork_mu,
                           .timeout = t.timeout > 0 ? t.timeout : 60};
     int rc = fleet_run(&r, &out);
     char *err = NULL, *title = fmt("tool %s v%d %s %s", t.name, t.version, caller_name, rc ? "fail" : "ok");

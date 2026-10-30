@@ -4,7 +4,8 @@ set -u
 BIN=$(cd "$(dirname "${BIN:-./cntctr}")" && pwd)/$(basename "${BIN:-./cntctr}")
 TMPD=$(mktemp -d)
 INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"test"}}}'
-mkdir "$TMPD/bin"
+mkdir "$TMPD/bin" "$TMPD/home"
+export HOME="$TMPD/home"   # fleet tools keep their cache under ~/.cache
 export BIN INIT CNTCTR_ENTER_DELAY_MS=50 LC_ALL=en_US.UTF-8 PATH="$TMPD/bin:$PATH" CNTCTR_DB="$TMPD/kb.db" CNTCTR_MEM_URL=
 unset TMUX_PANE
 
@@ -718,8 +719,23 @@ for i in sh bash python3 node; do
   same "$i runs sandboxed" "$(txt "$(use i_$i)")" 1
 done
 check "DB under the project root disables fleet tools" "$(CNTCTR_DB="$TMPD/repo/kb2.db"; export CNTCTR_DB; deft dbin 'echo hi'; txt "$(use dbin)")" "fleet tools are disabled here because the knowledge DB is inside this project; move CNTCTR_DB"
-same "failed calls are counted" "$(sqlite3 "$CNTCTR_DB" "SELECT calls > 0 AND calls = failures FROM tools WHERE name='fails' AND project='$RK'")" 1
-same "good calls are counted" "$(sqlite3 "$CNTCTR_DB" "SELECT calls > 0 AND failures = 0 FROM tools WHERE name='hello' AND project='$RK'")" 1
+row "$RK" cnt 1 active fc "counts" ""
+row "$RK" cntf 1 active fc "counts" ""
+sqlite3 "$CNTCTR_DB" "UPDATE tools SET script='exit 3' WHERE name='cntf' AND project='$RK'"
+use cnt >/dev/null; use cntf >/dev/null
+same "good calls are counted" "$(sqlite3 "$CNTCTR_DB" "SELECT calls || '/' || failures FROM tools WHERE name='cnt' AND project='$RK'")" "1/0"
+same "failed calls are counted" "$(sqlite3 "$CNTCTR_DB" "SELECT calls || '/' || failures FROM tools WHERE name='cntf' AND project='$RK'")" "1/1"
+same "draft calls are not counted" "$(sqlite3 "$CNTCTR_DB" "SELECT sum(calls) FROM tools WHERE name='fails' AND project='$RK'")" 0
+# .git as a symlink to a directory inside the root: the target must be read-only too
+mkdir "$TMPD/gl"
+git -C "$TMPD/gl" init -q
+mv "$TMPD/gl/.git" "$TMPD/gl/realgit"; ln -s realgit "$TMPD/gl/.git"
+FG=$(t new-window -d -n fg -c "$TMPD/gl" -P -F '#{pane_id}' cat); t set -p -t "$FG" @cntctr_name fg
+call "$FG" tool_define '{"name":"gitlink","description":"t","input_schema":{"type":"object"},"interpreter":"sh","script":"echo x > realgit/evil"}' >/dev/null
+same "tool cannot write through a .git symlink" "$(iserr "$(call "$FG" use '{"tool":"gitlink"}')")" true
+[ -e "$TMPD/gl/realgit/evil" ] && bad "wrote into the symlinked git dir" || ok_
+call "$FG" tool_define '{"name":"gitok","description":"t","input_schema":{"type":"object"},"interpreter":"sh","script":"echo x > other.txt; echo fine"}' >/dev/null
+same "that root is otherwise writable" "$(txt "$(call "$FG" use '{"tool":"gitok"}')")" fine
 check "calls are logged as history" "$(sqlite3 "$CNTCTR_DB" "SELECT group_concat(title) FROM entries WHERE layer='history' AND title LIKE 'tool fails v0 fr %'")" "tool fails v0 fr fail"
 fi
 

@@ -3,9 +3,12 @@
 #ifndef FLEET_H
 #define FLEET_H
 
+#include <pthread.h>
+
 struct fleet_run {
     const char *name, *root, *interpreter, *script, *args_json, *db_path;
     int net, timeout;
+    pthread_mutex_t *fork_mu;   /* held from pipe() to fork(), as in cntctr's run(); may be NULL */
     /* serve one composition request line, return malloc'd reply line; NULL serve: error reply */
     char *(*serve)(void *ctx, const char *line);
     void *ctx;

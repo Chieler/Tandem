@@ -6,7 +6,7 @@
 #include "fleet.h"
 #include <errno.h>
 #include <fcntl.h>
-#include <ftw.h>
+#include <dirent.h>
 #include <limits.h>
 #include <poll.h>
 #include <signal.h>
@@ -77,21 +77,37 @@ char *fleet_cache_dir(const char *root) {
     return real;
 }
 
-static int rm_entry(const char *path, const struct stat *sb, int flag, struct FTW *ftw) {
-    (void)sb, (void)flag, (void)ftw;
-    remove(path);
-    return 0;
+/* Remove `path` and all below it, making directories accessible first so a tool cannot block cleanup.
+ * Returns the number of entries it failed to remove. */
+static int rm_rf(const char *path) {
+    struct stat sb;
+    int bad = 0;
+    if (lstat(path, &sb) != 0) return 0;
+    if (S_ISDIR(sb.st_mode)) {
+        chmod(path, 0700);
+        DIR *d = opendir(path);
+        struct dirent *e;
+        while (d && (e = readdir(d))) {
+            if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+            char *child = fmt("%s/%s", path, e->d_name);
+            bad += rm_rf(child);
+            free(child);
+        }
+        if (d) closedir(d);
+        else bad++;
+        return bad + (rmdir(path) != 0);
+    }
+    return unlink(path) != 0;
 }
 
-static void rm_rf(const char *path) { nftw(path, rm_entry, 16, FTW_DEPTH | FTW_PHYS); }
-
-static int on_path(const char *cmd) {
-    char *dirs = strdup(getenv("PATH") ? getenv("PATH") : ""), *save = NULL;
-    int found = 0;
+/* Absolute path of executable `cmd` found on PATH (caller frees), or NULL. */
+static char *which(const char *cmd) {
+    char *dirs = strdup(getenv("PATH") ? getenv("PATH") : ""), *save = NULL, *found = NULL;
     for (char *d = strtok_r(dirs, ":", &save); d && !found; d = strtok_r(NULL, ":", &save)) {
         char *f = fmt("%s/%s", d, cmd);
-        found = access(f, X_OK) == 0;
-        free(f);
+        struct stat sb;
+        if (*d == '/' && stat(f, &sb) == 0 && S_ISREG(sb.st_mode) && access(f, X_OK) == 0) found = f;
+        else free(f);
     }
     free(dirs);
     return found;
@@ -152,44 +168,52 @@ static char *sbpl_str(const char *path) {
     return b.p;
 }
 
-static char *sbpl(const char *root, const char *tmp, const char *cache, int net) {
-    char *git = fmt("%s/.git", root), *q[] = {sbpl_str(root), sbpl_str(tmp), sbpl_str(cache), sbpl_str(git)};
+/* `gitreal` is root/.git resolved through symlinks, or NULL if it is the same path or missing. */
+static char *sbpl(const char *root, const char *tmp, const char *cache, const char *gitreal, int net) {
+    char *git = fmt("%s/.git", root), *q[] = {sbpl_str(root), sbpl_str(tmp), sbpl_str(cache), sbpl_str(git),
+                                               sbpl_str(gitreal ? gitreal : git)};
     char *p = fmt("(version 1)(allow default)(deny file-write*)"
                   "(allow file-write* (subpath %s) (subpath %s) (subpath %s) (subpath \"/dev\"))"
-                  "(deny file-write* (subpath %s) (literal %s))%s",
-                  q[0], q[1], q[2], q[3], q[3], net ? "" : "(deny network*)");
-    for (int i = 0; i < 4; i++) free(q[i]);
+                  "(deny file-write* (subpath %s) (literal %s) (subpath %s) (literal %s))%s",
+                  q[0], q[1], q[2], q[3], q[3], q[4], q[4], net ? "" : "(deny network*)");
+    for (int i = 0; i < 5; i++) free(q[i]);
     free(git);
     return p;
 }
 
-/* argv for the sandbox around `<interp> <tmp>/tool`; NULL-terminated, strings malloc'd. */
-static char **sandbox_argv(const struct fleet_run *r, const char *root, const char *tmp, const char *cache,
-                           const char *tool) {
+/* argv for `sbx` (sandbox-exec or bwrap, absolute) around `<interp> <tmp>/tool`; NULL-terminated, malloc'd. */
+static char **sandbox_argv(const struct fleet_run *r, const char *sbx, const char *interp, const char *root,
+                           const char *tmp, const char *cache, const char *tool) {
     char **v = calloc(40, sizeof *v);
     int n = 0;
-    if (on_path("sandbox-exec")) {
-        v[n++] = strdup("sandbox-exec");
+    char *git = fmt("%s/.git", root), *gitreal = canon(git);
+    if (gitreal && strcmp(gitreal, git) == 0) {
+        free(gitreal);
+        gitreal = NULL;
+    }
+    if (strcmp(strrchr(sbx, '/') + 1, "sandbox-exec") == 0) {
+        v[n++] = strdup(sbx);
         v[n++] = strdup("-p");
-        v[n++] = sbpl(root, tmp, cache, r->net);
-    } else if (on_path("bwrap")) {
-        char *git = fmt("%s/.git", root);
+        v[n++] = sbpl(root, tmp, cache, gitreal, r->net);
+    } else {
         struct stat sb;
-        const char *fixed[] = {"bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"};
+        const char *fixed[] = {"--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc"};
+        v[n++] = strdup(sbx);
         for (size_t i = 0; i < sizeof fixed / sizeof *fixed; i++) v[n++] = strdup(fixed[i]);
         v[n++] = strdup("--bind"), v[n++] = strdup(root), v[n++] = strdup(root);
-        if (lstat(git, &sb) == 0) v[n++] = strdup("--ro-bind"), v[n++] = strdup(git), v[n++] = strdup(git);
+        /* the canonical .git is bound read-only when it lies in the root; outside it is read-only already */
+        const char *g = gitreal ? gitreal : git;
+        if (lstat(g, &sb) == 0 && strncmp(g, root, strlen(root)) == 0 && g[strlen(root)] == '/')
+            v[n++] = strdup("--ro-bind"), v[n++] = strdup(g), v[n++] = strdup(g);
         v[n++] = strdup("--bind"), v[n++] = strdup(tmp), v[n++] = strdup(tmp);
         v[n++] = strdup("--bind"), v[n++] = strdup(cache), v[n++] = strdup(cache);
         v[n++] = strdup("--unshare-pid"), v[n++] = strdup("--die-with-parent"), v[n++] = strdup("--new-session");
         if (!r->net) v[n++] = strdup("--unshare-net");
         v[n++] = strdup("--");
-        free(git);
-    } else {
-        free(v);
-        return NULL;
     }
-    v[n++] = strdup(r->interpreter);
+    free(git);
+    free(gitreal);
+    v[n++] = strdup(interp);
     v[n++] = strdup(tool);
     return v;
 }
@@ -282,14 +306,15 @@ static void serve_lines(const struct fleet_run *r, struct buf *in, struct buf *o
     }
 }
 
-/* Child side of fork: only async-signal-safe-ish calls, then exec. */
-static void child(char **argv, char **envp, const char *root, int in, int out, int err, int sock) {
+/* Child side of fork: async-signal-safe calls only, then execve. Everything it needs is built before the fork. */
+static void child(char **argv, char **envp, const char *root, int in, int out, int err, int sock, int maxfd) {
     int src[4] = {in, out, err, sock};
-    for (int i = 0; i < 4; i++) src[i] = fcntl(src[i], F_DUPFD, 10);   /* clear of 0..3 before dup2 */
-    setsid();
-    for (int i = 0; i < 4; i++) dup2(src[i], i);
-    int max = getdtablesize() < 65536 ? getdtablesize() : 65536;
-    for (int fd = 4; fd < max; fd++) close(fd);
+    for (int i = 0; i < 4; i++)
+        if ((src[i] = fcntl(src[i], F_DUPFD, 10)) < 0) _exit(127);   /* clear of 0..3 before dup2 */
+    if (setsid() < 0) _exit(127);
+    for (int i = 0; i < 4; i++)
+        if (dup2(src[i], i) < 0) _exit(127);
+    for (int fd = 4; fd < maxfd; fd++) close(fd);
     struct rlimit core = {0, 0};
     setrlimit(RLIMIT_CORE, &core);
     signal(SIGPIPE, SIG_DFL);
@@ -297,8 +322,7 @@ static void child(char **argv, char **envp, const char *root, int in, int out, i
     sigemptyset(&none);
     sigprocmask(SIG_SETMASK, &none, NULL);
     if (chdir(root) != 0) _exit(126);
-    environ = envp;
-    execvp(argv[0], argv);
+    execve(argv[0], argv, envp);
     _exit(127);
 }
 
@@ -322,7 +346,9 @@ int fleet_run(const struct fleet_run *r, char **out) {
         return 1;
     }
     free(db);
-    if (!on_path("sandbox-exec") && !on_path("bwrap")) {
+    char *sbx = which("sandbox-exec"), *interp = NULL;
+    if (!sbx) sbx = which("bwrap");
+    if (!sbx) {
         free(root);
         *out = fmt("fleet tools need sandbox-exec or bwrap; neither found");
         return 1;
@@ -351,29 +377,41 @@ int fleet_run(const struct fleet_run *r, char **out) {
     }
     tool = fmt("%s/tool", tmp);
     FILE *f = fopen(tool, "w");
-    if (!f || fputs(r->script, f) == EOF || fclose(f) != 0) {
+    int bad = !f;
+    if (f) {
+        bad |= fputs(r->script, f) == EOF;
+        bad |= fclose(f) != 0;
+    }
+    if (bad) {
         *out = fmt("cannot write the tool script: %s", strerror(errno));
         goto done;
     }
-    argv = sandbox_argv(r, root, tmp, cache, tool);
-    if (!argv) {
-        *out = fmt("fleet tools need sandbox-exec or bwrap; neither found");
+    interp = which(r->interpreter);
+    if (!interp) {
+        *out = fmt("interpreter %s not found on PATH", r->interpreter);
         goto done;
     }
+    argv = sandbox_argv(r, sbx, interp, root, tmp, cache, tool);
     envp = tool_env(root, tmp, cache);
+    struct rlimit nofile;
+    int maxfd = getrlimit(RLIMIT_NOFILE, &nofile) == 0 && nofile.rlim_cur != RLIM_INFINITY && nofile.rlim_cur < (1 << 20)
+                    ? (int)nofile.rlim_cur : 1 << 20;
 
-    if (pipe(pin) || pipe(pout) || pipe(perr) || socketpair(AF_UNIX, SOCK_STREAM, 0, sv)) {
-        *out = fmt("cannot create pipes: %s", strerror(errno));
-        goto done;
-    }
+    /* fork_mu from the first pipe to the fork, so no other fork inherits these ends */
+    if (r->fork_mu) pthread_mutex_lock(r->fork_mu);
+    int made = pipe(pin) == 0 && pipe(pout) == 0 && pipe(perr) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0;
+    int e = errno;
     int all[] = {pin[0], pin[1], pout[0], pout[1], perr[0], perr[1], sv[0], sv[1]};
-    for (int i = 0; i < 8; i++) fcntl(all[i], F_SETFD, FD_CLOEXEC);   /* so a concurrent fork elsewhere does not inherit them */
-    pid = fork();
+    for (int i = 0; i < 8; i++)
+        if (all[i] >= 0) fcntl(all[i], F_SETFD, FD_CLOEXEC);
+    pid = made ? fork() : -1;
+    if (pid == 0) child(argv, envp, root, pin[0], pout[1], perr[1], sv[1], maxfd);
+    if (r->fork_mu) pthread_mutex_unlock(r->fork_mu);
+    if (!made) errno = e;
     if (pid < 0) {
-        *out = fmt("cannot fork: %s", strerror(errno));
+        *out = fmt("cannot start the tool: %s", strerror(errno));
         goto done;
     }
-    if (pid == 0) child(argv, envp, root, pin[0], pout[1], perr[1], sv[1]);
     close_fd(&pin[0]);
     close_fd(&pout[1]);
     close_fd(&perr[1]);
@@ -387,7 +425,7 @@ int fleet_run(const struct fleet_run *r, char **out) {
     size_t woff = 0, soff = 0;
     long long deadline = now_ms() + (long long)r->timeout * 1000;
     struct buf req = {0};
-    int capped = 0, timed_out = 0, status = 0, exited = 0;
+    int ocap = 0, ecap = 0, timed_out = 0, status = 0, exited = 0;
     put(&req, "", 0);
 
     while (!exited) {
@@ -406,8 +444,8 @@ int fleet_run(const struct fleet_run *r, char **out) {
             if (w > 0) woff += (size_t)w;
             if (woff == sin.len || (w < 0 && errno != EAGAIN && errno != EINTR)) close_fd(&win);
         }
-        capped = drain(&rout, &obuf, OUT_CAP) || capped;
-        capped = drain(&rerr, &ebuf, ERR_CAP) || capped;
+        ocap |= drain(&rout, &obuf, OUT_CAP);
+        ecap |= drain(&rerr, &ebuf, ERR_CAP);
         if (sock >= 0) {
             drain(&sock, &req, LINE_CAP);
             if (req.len >= LINE_CAP) close_fd(&sock);
@@ -423,13 +461,13 @@ int fleet_run(const struct fleet_run *r, char **out) {
             }
             if (soff == sout.len) sout.len = soff = 0;
         }
-        if (capped) break;
+        if (ocap || ecap) break;
         siginfo_t si = {0};
         if (waitid(P_PID, (id_t)pid, &si, WEXITED | WNOHANG | WNOWAIT) == 0 && si.si_pid == pid) exited = 1;
     }
     if (exited) {   /* take what the tool wrote last, then stop stragglers it left holding the pipes */
-        capped = drain(&rout, &obuf, OUT_CAP) || capped;
-        capped = drain(&rerr, &ebuf, ERR_CAP) || capped;
+        ocap |= drain(&rout, &obuf, OUT_CAP);
+        ecap |= drain(&rerr, &ebuf, ERR_CAP);
     }
     killpg(pid, SIGKILL);
     while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
@@ -441,7 +479,11 @@ int fleet_run(const struct fleet_run *r, char **out) {
         char *head = fmt("tool %s timed out after %d s", r->name, r->timeout);
         *out = error_with(head, &ebuf);
         free(head);
-    } else if (capped) {
+    } else if (ecap && !ocap) {
+        char *head = fmt("tool %s was stopped: stderr over %d KB", r->name, ERR_CAP / 1024);
+        *out = error_with(head, &ebuf);
+        free(head);
+    } else if (ocap) {
         char *text = result_text(obuf.p ? obuf.p : "", obuf.len);
         *out = fmt("%s\ntool %s was stopped: output over %d KB", text, r->name, OUT_CAP / 1024);
         free(text);
@@ -461,7 +503,8 @@ done:
     }
     int *fds[] = {&pin[0], &pin[1], &pout[0], &pout[1], &perr[0], &perr[1], &sv[0], &sv[1]};
     for (int i = 0; i < 8; i++) close_fd(fds[i]);
-    if (tmp) rm_rf(tmp);
+    if (tmp && rm_rf(tmp)) fprintf(stderr, "cntctr: cannot remove tool temp dir %s\n", tmp);
+    free(sbx), free(interp);
     if (argv) free_strv(argv);
     if (envp) free_strv(envp);
     free(obuf.p), free(ebuf.p), free(sin.p), free(sout.p);
