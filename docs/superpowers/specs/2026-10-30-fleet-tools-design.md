@@ -218,8 +218,10 @@ The run itself:
 - At the deadline or a cap, cntctr sends `SIGKILL` to the process group and reaps
   the child. The temp dir is removed afterwards. The cache dir is kept.
 - stdout is the result. A non-zero exit returns `isError` with stderr's tail.
-- Every call increments `calls` (and `failures` on error), and is logged as
-  history: tool, version, caller, ok or fail.
+- Every call of a published version increments `calls` (and `failures` on
+  error). Draft calls are not counted: a draft can be replaced mid-call, and
+  counts only feed the `promote?` flag. Every call is logged as history: tool,
+  version, caller, ok or fail.
 - In-flight calls finish even if the tool is revoked meanwhile.
 
 Calls run on cntctr's existing per-call threads, so a long tool does not block
