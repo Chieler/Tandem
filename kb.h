@@ -41,4 +41,6 @@ int kb_tool_save_draft(sqlite3 *db, const char *project, const char *author, con
 int kb_tool_resolve(sqlite3 *db, const char *project, const char *name,
                     const char *caller_name, const char *caller_pane, struct kb_tool *t);
 char *kb_tool_names(sqlite3 *db, const char *project, const char *caller_name, const char *caller_pane);   /* names with any candidate row, one per line; the caller resolves each */
+void kb_tool_count(sqlite3 *db, const struct kb_tool *t, int ok); /* one more call on t's row, and a failure unless ok */
+char *kb_tool_reason(sqlite3 *db, const struct kb_tool *t);       /* why t was revoked or rejected; malloc'd, may be "" */
 #endif

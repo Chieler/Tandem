@@ -646,6 +646,83 @@ refute "a revoked newest row hides the name from others" "$(lst "$FB")" '"name":
 sqlite3 "$CNTCTR_DB" "DELETE FROM tools WHERE project='$PK' AND name='ord'"
 check "the global row shows once the project rows are gone" "$(lst "$FB")" '[fleet] g-desc'
 
+# ---- fleet tool runner ----
+FR=$(t new-window -d -n fr -c "$TMPD/repo" -P -F '#{pane_id}' cat); t set -p -t "$FR" @cntctr_name fr
+none='{}'
+deft() { call "$FR" tool_define "$(jq -nc --arg s "$2" --arg n "$1" '{name:$n,description:"t",input_schema:{type:"object"},interpreter:"sh",script:$s}' | jq -c ". + ${3:-$none}")" >/dev/null; }
+use() { call "$FR" use "$(jq -nc --arg t "$1" --argjson a "${2:-$none}" '{tool:$t,args:$a}')"; }
+RK=$(txt "$(call "$FR" project '{}')" | sed 's/^project \(.*\) (root .*/\1/')
+same "unknown tool" "$(iserr "$(use nope)")" true
+check "unknown tool text" "$(txt "$(use nope)")" "unknown tool"
+check "unknown name through dispatch" "$(txt "$(call "$FR" nope '{}')")" "unknown tool"
+row "$RK" rv 1 revoked fc "was bad" ""
+sqlite3 "$CNTCTR_DB" "UPDATE tools SET verdict_reason='bad idea' WHERE name='rv' AND project='$RK'"
+same "revoked tool says why" "$(txt "$(use rv)")" "tool rv was revoked: bad idea"
+same "revoked tool through dispatch" "$(txt "$(call "$FR" rv '{}')")" "tool rv was revoked: bad idea"
+deft hello 'read a; echo "hi $a"'
+same "draft is not callable by others" "$(txt "$(call "$FB" use '{"tool":"hello","args":{}}')")" "unknown tool hello"
+if ! command -v sandbox-exec >/dev/null && ! command -v bwrap >/dev/null; then
+    echo "SKIP: fleet tool runner tests need sandbox-exec or bwrap"
+    check "no sandbox fails closed" "$(txt "$(use hello)")" "fleet tools need sandbox-exec or bwrap; neither found"
+elif ! command -v sandbox-exec >/dev/null; then
+    echo "SKIP: bwrap runner tests are untested here (no sandbox-exec)"
+else
+same "use runs the draft with args on stdin" "$(txt "$(use hello '{"who":"x"}')")" 'hi {"who":"x"}'
+same "direct call works too" "$(txt "$(call "$FR" hello '{}')")" 'hi {}'
+deft wfile 'echo data > made.txt; mkdir -p sub; echo ok'
+same "tool writes in the project" "$(txt "$(use wfile)")" ok; [ -f "$TMPD/repo/made.txt" ] && ok_ || bad "made.txt missing"
+deft wgit 'echo x > .git/evil'
+same "tool cannot write .git" "$(iserr "$(use wgit)")" true
+[ -e "$TMPD/repo/.git/evil" ] && bad ".git/evil exists" || ok_
+deft wout "echo x > $TMPD/outside"
+same "tool cannot write outside" "$(iserr "$(use wout)")" true
+ln -s "$TMPD/plain" "$TMPD/repo/link"
+deft wlink 'echo x > link/evil'
+same "symlink out is not writable" "$(iserr "$(use wlink)")" true
+[ -e "$TMPD/plain/evil" ] && bad "wrote through the symlink" || ok_
+deft cache 'echo x > "$TMPDIR/a" && echo y > "$XDG_CACHE_HOME/b" && cat "$TMPDIR/a"'
+same "temp and cache are writable" "$(txt "$(use cache)")" x
+deft envt 'env'
+out=$(export FOO_TOKEN=s OPENAI_API_KEY=s MY_SECRET=s; txt "$(use envt)")
+check "env reaches the tool" "$out" "CNTCTR_FD=3"
+refute "no tokens" "$out" FOO_TOKEN; refute "no keys" "$out" API_KEY; refute "no secrets" "$out" MY_SECRET; refute "no TMUX" "$out" "TMUX="
+python3 -c "import socket,time;s=socket.socket();s.bind(('127.0.0.1',47124));s.listen();time.sleep(8)" & LP=$!
+sleep 0.5
+deft neto 'nc -z -w1 127.0.0.1 47124 && echo open'
+same "network denied by default" "$(iserr "$(use neto)")" true
+deft neta 'nc -z -w1 127.0.0.1 47124 && echo open' '{"net":true}'
+same "declared net works" "$(txt "$(use neta)")" open; kill $LP
+deft big 'yes | head -c 400000'
+check "stdout capped" "$(txt "$(use big)" | wc -c)" 262
+deft slow 'sleep 30 & sleep 30' '{"timeout":2}'
+check "timeout honored" "$(txt "$(use slow)")" "tool slow timed out after 2 s"
+deft first 'echo early; cat >/dev/null; echo late'
+check "write-before-read does not deadlock" "$(txt "$(use first "$(jq -nc --arg x "$(head -c 200000 /dev/zero | tr '\0' a)" '{x:$x}')")")" late
+deft empty 'true'
+same "empty output is fine" "$(iserr "$(use empty)")" false
+same "empty output is an empty string" "$(txt "$(use empty)")" ""
+deft bin 'printf "\377\376ab\000cd"'
+same "invalid utf-8 is replaced" "$(iserr "$(use bin)")" false
+check "valid bytes survive" "$(txt "$(use bin)")" ab
+deft fails 'echo boom >&2; exit 3'
+check "non-zero exit is an error with stderr" "$(txt "$(use fails)")" boom
+same "non-zero exit sets isError" "$(iserr "$(use fails)")" true
+deft fd3 'echo "{}" >&3; read -r r <&3; echo "$r"'
+same "fd 3 answers not available" "$(txt "$(use fd3)")" '{"error":"not available"}'
+deft cw 'sleep 1; echo done'
+call "$FR" cw '{}' > "$TMPD/cw1" & call "$FR" cw '{}' > "$TMPD/cw2" & wait
+check "concurrent call one finishes" "$(txt "$(cat "$TMPD/cw1")")" done
+check "concurrent call two finishes" "$(txt "$(cat "$TMPD/cw2")")" done
+for i in sh bash python3 node; do
+  call "$FR" tool_define "$(jq -nc --arg i $i '{name:("i_"+$i),description:"t",input_schema:{type:"object"},interpreter:$i,script:(if $i=="python3" then "print(1)" elif $i=="node" then "console.log(1)" else "echo 1" end)}')" >/dev/null
+  same "$i runs sandboxed" "$(txt "$(use i_$i)")" 1
+done
+check "DB under the project root disables fleet tools" "$(CNTCTR_DB="$TMPD/repo/kb2.db"; export CNTCTR_DB; deft dbin 'echo hi'; txt "$(use dbin)")" "fleet tools are disabled here because the knowledge DB is inside this project; move CNTCTR_DB"
+same "failed calls are counted" "$(sqlite3 "$CNTCTR_DB" "SELECT calls > 0 AND calls = failures FROM tools WHERE name='fails' AND project='$RK'")" 1
+same "good calls are counted" "$(sqlite3 "$CNTCTR_DB" "SELECT calls > 0 AND failures = 0 FROM tools WHERE name='hello' AND project='$RK'")" 1
+check "calls are logged as history" "$(sqlite3 "$CNTCTR_DB" "SELECT group_concat(title) FROM entries WHERE layer='history' AND title LIKE 'tool fails v0 fr %'")" "tool fails v0 fr fail"
+fi
+
 # ---- summary ----
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

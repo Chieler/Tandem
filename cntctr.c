@@ -22,6 +22,7 @@
 #include <unistd.h>
 #include <json-c/json.h>
 #include "kb.h"
+#include "fleet.h"
 
 static pthread_mutex_t out_mu = PTHREAD_MUTEX_INITIALIZER;   /* one JSON line at a time on stdout */
 static pthread_mutex_t live_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -252,10 +253,18 @@ static void find_self(void) {
 
 /* ---- knowledge ---- */
 
-static sqlite3 *kb(char **err) {
+/* Where the knowledge store lives: CNTCTR_DB, else under $HOME (in `def`). */
+static const char *kb_path(char *def, size_t n) {
     const char *path = getenv("CNTCTR_DB"), *home = getenv("HOME");
+    if (path && *path) return path;
+    snprintf(def, n, "%s/.local/share/cntctr/kb.db", home ? home : ".");
+    return def;
+}
+
+static sqlite3 *kb(char **err) {
     char def[4096];
-    if (!path || !*path) {
+    const char *path = kb_path(def, sizeof def), *home = getenv("HOME");
+    if (path == def) {
         home = home ? home : ".";
         snprintf(def, sizeof def, "%s/.local", home);
         mkdir(def, 0755);
@@ -263,8 +272,7 @@ static sqlite3 *kb(char **err) {
         mkdir(def, 0755);
         snprintf(def, sizeof def, "%s/.local/share/cntctr", home);
         mkdir(def, 0700);
-        snprintf(def, sizeof def, "%s/.local/share/cntctr/kb.db", home);
-        path = def;
+        path = kb_path(def, sizeof def);
     }
     char *why = NULL;
     sqlite3 *db = kb_open(path, &why);
@@ -1276,6 +1284,7 @@ static int tool_board(json_object *a, char **res) {
 /* ---- dispatch ---- */
 
 static int tool_define(json_object *a, char **res);
+static int tool_use(json_object *a, char **res);
 typedef int (*tool_fn)(json_object *args, char **res);
 static const struct { const char *name; tool_fn fn; int needs_pane; } TOOL_FNS[] = {
     {"list", tool_list, 0},
@@ -1293,6 +1302,7 @@ static const struct { const char *name; tool_fn fn; int needs_pane; } TOOL_FNS[]
     {"post", tool_post, 1},
     {"board", tool_board, 0},
     {"tool_define", tool_define, 0},
+    {"use", tool_use, 1},
     {NULL, NULL, 0},
 };
 
@@ -1385,6 +1395,59 @@ static int tool_define(json_object *a, char **res) {
     return rc ? fail(res, fmt("cannot save draft %s", name)) : ok(res, fmt("saved draft %s", name));
 }
 
+/* A copy of `args` without `from`, which names the caller. */
+static json_object *without_from(json_object *args) {
+    json_object *copy = json_object_new_object();
+    if (!json_object_is_type(args, json_type_object)) return copy;
+    json_object_object_foreach(args, key, val)
+        if (strcmp(key, "from") != 0) json_object_object_add(copy, key, json_object_get(val));
+    return copy;
+}
+
+/* Resolve `name` for the caller and run it in a sandbox. `args` may be NULL. */
+static int use_tool(const char *name, json_object *args, char **res) {
+    if (!*caller_pane)
+        return fail(res, fmt("cntctr cannot tell which pane you are in; pass from=<your agent name, or your $TMUX_PANE if you were started by hand>"));
+    struct project p;
+    struct kb_tool t;
+    sqlite3 *db = kb_for_caller(&p, res);
+    if (!db) return 1;
+    int found = kb_tool_resolve(db, p.key, name, caller_name, caller_pane, &t);
+    if (found != 0) {
+        char *why = found > 0 ? kb_tool_reason(db, &t) : NULL;
+        int rc = fail(res, found > 0 ? fmt("tool %s was revoked: %s", name, why) : fmt("unknown tool %s", name));
+        free(why);
+        kb_tool_free(&t);
+        sqlite3_close(db);
+        return rc;
+    }
+    sqlite3_close(db);   /* a tool can run for minutes; hold nothing meanwhile */
+    char def[4096], *out = NULL;
+    const char *argjson = args ? json_object_to_json_string_ext(args, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE) : "{}";
+    struct fleet_run r = {.name = t.name, .root = p.root, .interpreter = t.interpreter, .script = t.script,
+                          .args_json = argjson, .db_path = kb_path(def, sizeof def), .net = t.net,
+                          .timeout = t.timeout > 0 ? t.timeout : 60};
+    int rc = fleet_run(&r, &out);
+    char *err = NULL, *title = fmt("tool %s v%d %s %s", t.name, t.version, caller_name, rc ? "fail" : "ok");
+    if ((db = kb(&err))) {
+        kb_tool_count(db, &t, !rc);
+        sqlite3_close(db);
+    }
+    free(err);
+    log_history(caller_pane, title, title);
+    free(title);
+    kb_tool_free(&t);
+    return rc ? fail(res, out) : ok(res, out);
+}
+
+static int tool_use(json_object *a, char **res) {
+    const char *name = sarg(a, "tool");
+    json_object *args = NULL;
+    if (!name || !*name) return fail(res, fmt("use needs a tool name"));
+    json_object_object_get_ex(a, "args", &args);
+    return use_tool(name, args, res);
+}
+
 /* Set caller_* from the `from` argument: an agent name, or a pane id ($TMUX_PANE) for a
  * leader started by hand, which is tagged on first use. Returns an error or NULL. */
 static char *resolve_from(const char *from) {
@@ -1406,21 +1469,30 @@ static char *resolve_from(const char *from) {
     return NULL;
 }
 
+/* Make caller_* ours, or whoever `from` names. Returns an error or NULL. */
+static char *set_caller(json_object *args) {
+    snprintf(caller_pane, sizeof caller_pane, "%s", self_pane);
+    snprintf(caller_name, sizeof caller_name, "%s", self_name);
+    const char *from = sarg(args, "from");
+    return from && *from ? resolve_from(from) : NULL;
+}
+
 static int dispatch(const char *name, json_object *args, char **res) {
     for (int i = 0; TOOL_FNS[i].name; i++) {
         if (strcmp(TOOL_FNS[i].name, name ? name : "") != 0) continue;
-        snprintf(caller_pane, sizeof caller_pane, "%s", self_pane);
-        snprintf(caller_name, sizeof caller_name, "%s", self_name);
-        const char *from = sarg(args, "from");
-        if (from && *from) {
-            char *err = resolve_from(from);
-            if (err) return fail(res, err);
-        }
+        char *err = set_caller(args);
+        if (err) return fail(res, err);
         if (TOOL_FNS[i].needs_pane && !*caller_pane)
             return fail(res, fmt("cntctr cannot tell which pane you are in; pass from=<your agent name, or your $TMUX_PANE if you were started by hand>"));
         return TOOL_FNS[i].fn(args, res);
     }
-    return fail(res, fmt("unknown tool %s", name ? name : "(none)"));
+    char *err = set_caller(args);
+    if (err) return fail(res, err);
+    if (!name || !*name || !*caller_pane) return fail(res, fmt("unknown tool %s", name ? name : "(none)"));
+    json_object *plain = without_from(args);
+    int rc = use_tool(name, plain, res);
+    json_object_put(plain);
+    return rc;
 }
 
 #define KFROM "\"from\":{\"type\":\"string\",\"description\":\"Your agent name. Needed from Codex, whose cntctr runs outside your pane, to find your project\"}"
@@ -1509,6 +1581,9 @@ static const char TOOLS[] =
     "\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"}},\"required\":[\"text\"]}},"
     "{\"name\":\"board\",\"description\":\"Read the latest posts on this project's board, oldest first.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"limit\":{\"type\":\"integer\",\"description\":\"Default 20, at most 200\"}," KFROM "}}}"
+    ",{\"name\":\"use\",\"description\":\"Run a fleet tool by name with arguments. Same as calling the tool directly.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"tool\":{\"type\":\"string\"},\"args\":{\"type\":\"object\"}," KFROM "},"
+    "\"required\":[\"tool\"]}}"
     ",{\"name\":\"tool_define\",\"description\":\"Define a script-backed tool for your project. It is saved as a draft only you can call.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
     "\"name\":{\"type\":\"string\",\"description\":\"^[a-z][a-z0-9_]{1,40}$, not a built-in\"},"

@@ -351,3 +351,27 @@ char *kb_tool_names(sqlite3 *db, const char *project, const char *caller_name, c
     sqlite3_bind_text(st, 3, caller_pane, -1, SQLITE_TRANSIENT);
     return lines(st);
 }
+
+void kb_tool_count(sqlite3 *db, const struct kb_tool *t, int ok) {
+    sqlite3_stmt *st = prep(db,
+        "UPDATE tools SET calls = calls + 1, failures = failures + ?5 WHERE project = ?1 AND name = ?2 AND version = ?3 AND author = ?4");
+    sqlite3_bind_text(st, 1, t->project, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, t->name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 3, t->version);
+    sqlite3_bind_text(st, 4, t->author, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 5, !ok);
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+}
+
+char *kb_tool_reason(sqlite3 *db, const struct kb_tool *t) {
+    sqlite3_stmt *st = prep(db,
+        "SELECT COALESCE(verdict_reason, '') FROM tools WHERE project = ?1 AND name = ?2 AND version = ?3 AND author = ?4");
+    sqlite3_bind_text(st, 1, t->project, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, t->name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 3, t->version);
+    sqlite3_bind_text(st, 4, t->author, -1, SQLITE_TRANSIENT);
+    char *r = strdup(sqlite3_step(st) == SQLITE_ROW ? col(st, 0) : "");
+    sqlite3_finalize(st);
+    return r;
+}
