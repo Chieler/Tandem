@@ -751,6 +751,13 @@ check "nesting stops at 3" "$(txt "$(use deep)")" "fleet tools nested too deep"
 deft inner 'echo inner-ok'
 deft outer 'cntctr call use "{\"tool\":\"inner\"}"'
 same "a tool can use another tool" "$(txt "$(use outer)")" inner-ok
+check "a garbage CNTCTR_FD fails fast" "$(CNTCTR_FD=garbage "$BIN" call recall '{}' 2>&1)" "cntctr call works only inside a fleet tool"
+check "a non-socket CNTCTR_FD fails fast" "$(CNTCTR_FD=1 "$BIN" call recall '{}' 2>&1)" "cntctr call works only inside a fleet tool"
+deft slowin 'sleep 10'
+deft slowout 'cntctr call use "{\"tool\":\"slowin\"}"' '{"timeout":2}'
+t0=$SECONDS; out=$(use slowout); el=$((SECONDS - t0))
+same "a nested run inherits the outer deadline" "$(iserr "$out")" true
+[ "$el" -le 4 ] && ok_ || bad "nested slow tool took ${el}s, want <= 4"
 check "call outside a tool fails" "$("$BIN" call recall '{}' 2>&1)" "cntctr call works only inside a fleet tool"
 check "calls are logged as history" "$(sqlite3 "$CNTCTR_DB" "SELECT group_concat(title) FROM entries WHERE layer='history' AND title LIKE 'tool fails v0 fr %'")" "tool fails v0 fr fail"
 fi

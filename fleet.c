@@ -270,6 +270,7 @@ static long long now_ms(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
+long long fleet_now_ms(void) { return now_ms(); }
 
 /* Read what is available into `b`, up to `cap` bytes. Closes *fd at EOF. Returns 1 if it hit the cap. */
 static int drain(int *fd, struct buf *b, size_t cap) {
@@ -423,7 +424,7 @@ int fleet_run(const struct fleet_run *r, char **out) {
     put(&sin, r->args_json ? r->args_json : "{}", strlen(r->args_json ? r->args_json : "{}"));
     put(&sin, "\n", 1);
     size_t woff = 0, soff = 0;
-    long long deadline = now_ms() + (long long)r->timeout * 1000;
+    long long deadline = r->deadline_ms ? r->deadline_ms : now_ms() + (long long)r->timeout * 1000;
     struct buf req = {0};
     int ocap = 0, ecap = 0, timed_out = 0, status = 0, exited = 0;
     put(&req, "", 0);
@@ -448,8 +449,7 @@ int fleet_run(const struct fleet_run *r, char **out) {
         ecap |= drain(&rerr, &ebuf, ERR_CAP);
         if (sock >= 0) {
             drain(&sock, &req, LINE_CAP);
-            if (req.len >= LINE_CAP) close_fd(&sock);
-            serve_lines(r, &req, &sout);
+            serve_lines(r, &req, &sout);   /* complete lines first; an incomplete oversized one is never run */
             while (sock >= 0 && soff < sout.len) {
                 ssize_t w = write(sock, sout.p + soff, sout.len - soff);
                 if (w > 0) soff += (size_t)w;
@@ -460,6 +460,7 @@ int fleet_run(const struct fleet_run *r, char **out) {
                 }
             }
             if (soff == sout.len) sout.len = soff = 0;
+            if (req.len >= LINE_CAP && sout.len == 0) close_fd(&sock);
         }
         if (ocap || ecap) break;
         siginfo_t si = {0};

@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <ctype.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdint.h>
 #include <poll.h>
 #include <pthread.h>
@@ -55,6 +56,7 @@ static char self_name[128];              /* our agent name (the pane's @cntctr_n
  * server (Codex) serves many panes. Set per call in dispatch. */
 static _Thread_local char caller_pane[32], caller_name[128];
 static _Thread_local int fleet_depth;   /* fleet tools running above this call; at most 3 */
+static _Thread_local long long fleet_deadline;   /* deadline of the outermost running tool; nested runs get no more */
 static pthread_mutex_t fork_mu = PTHREAD_MUTEX_INITIALIZER;   /* held from pipe() to fork() */
 
 static char *fmt(const char *f, ...) {
@@ -1461,11 +1463,16 @@ static int use_tool(const char *name, json_object *args, char **res) {
     struct served who;
     snprintf(who.pane, sizeof who.pane, "%s", caller_pane);
     snprintf(who.name, sizeof who.name, "%s", caller_name);
+    int timeout = t.timeout > 0 ? t.timeout : 60;
+    long long deadline = fleet_now_ms() + (long long)timeout * 1000, outer = fleet_deadline;
+    if (outer && outer < deadline) deadline = outer;   /* a nested run counts against the outer tool's deadline */
     struct fleet_run r = {.name = t.name, .root = p.root, .interpreter = t.interpreter, .script = t.script,
                           .args_json = argjson, .db_path = kb_path(def, sizeof def), .net = t.net, .fork_mu = &fork_mu,
-                          .timeout = t.timeout > 0 ? t.timeout : 60, .serve = serve_call, .ctx = &who};
+                          .timeout = timeout, .deadline_ms = deadline, .serve = serve_call, .ctx = &who};
     fleet_depth++;
+    fleet_deadline = deadline;
     int rc = fleet_run(&r, &out);
+    fleet_deadline = outer;
     fleet_depth--;
     char *err = NULL, *title = fmt("tool %s v%d %s %s", t.name, t.version, caller_name, rc ? "fail" : "ok");
     if ((db = kb(&err))) {
@@ -1550,7 +1557,10 @@ static int dispatch_as(const char *pane, const char *name, const char *tool, jso
 static int dispatch(const char *name, json_object *args, char **res) {
     char *err = set_caller(args);
     if (err) return fail(res, err);
-    return dispatch_as(caller_pane, caller_name, name, args, res);
+    char pane[sizeof caller_pane], who[sizeof caller_name];   /* dispatch_as overwrites caller_* */
+    memcpy(pane, caller_pane, sizeof pane);
+    memcpy(who, caller_name, sizeof who);
+    return dispatch_as(pane, who, name, args, res);
 }
 
 #define KFROM "\"from\":{\"type\":\"string\",\"description\":\"Your agent name. Needed from Codex, whose cntctr runs outside your pane, to find your project\"}"
@@ -1840,11 +1850,16 @@ static void handle(const char *line) {
 
 /* cntctr call <tool> <json>: forward one request to the cntctr that is running this fleet tool */
 static int call_cmd(const char *tool, const char *args) {
-    const char *fdenv = getenv("CNTCTR_FD");
-    if (!fdenv) {
+    const char *fdenv = getenv("CNTCTR_FD"), *tenv = getenv("CNTCTR_CALL_TIMEOUT");
+    char *end = "x";
+    long fd = fdenv ? strtol(fdenv, &end, 10) : -1, secs = 600;
+    struct stat st;
+    if (!fdenv || !*fdenv || *end || fd < 3 || fd > INT_MAX || fstat((int)fd, &st) != 0 || !S_ISSOCK(st.st_mode)) {
         fprintf(stderr, "cntctr call works only inside a fleet tool\n");
         return 1;
     }
+    if (tenv && (secs = strtol(tenv, &end, 10)) <= 0) secs = 600;
+    if (tenv && *end) secs = 600;
     json_object *a = json_tokener_parse(args);
     if (!json_object_is_type(a, json_type_object)) {
         json_object_put(a);
@@ -1854,18 +1869,35 @@ static int call_cmd(const char *tool, const char *args) {
     json_object *req = json_object_new_object(), *reply = NULL, *v = NULL;
     json_object_object_add(req, "tool", json_object_new_string(tool));
     json_object_object_add(req, "args", a);
-    FILE *sock = fdopen(atoi(fdenv), "r+");
-    char *line = NULL;
-    size_t cap = 0;
-    int bad = !sock || fprintf(sock, "%s\n", json_object_to_json_string_ext(req, JSON_C_TO_STRING_PLAIN)) < 0 || fflush(sock) != 0
-              || getline(&line, &cap, sock) <= 0 || !(reply = json_tokener_parse(line));
+    char *msg = fmt("%s\n", json_object_to_json_string_ext(req, JSON_C_TO_STRING_PLAIN)), *line = NULL;
+    size_t n = strlen(msg), off = 0, len = 0;
+    while (off < n) {
+        ssize_t w = write((int)fd, msg + off, n - off);
+        if (w < 0 && errno == EINTR) continue;
+        if (w <= 0) break;
+        off += (size_t)w;
+    }
+    long long deadline = fleet_now_ms() + secs * 1000;
+    while (off == n && !(line && memchr(line, '\n', len))) {   /* read one reply line, waiting at most until the deadline */
+        long long left = deadline - fleet_now_ms();
+        struct pollfd pf = {(int)fd, POLLIN, 0};
+        if (left <= 0 || (poll(&pf, 1, left > INT_MAX ? INT_MAX : (int)left) < 0 && errno != EINTR)) break;
+        if (!(pf.revents & (POLLIN | POLLHUP))) continue;
+        line = realloc(line, len + 4097);
+        ssize_t r = read((int)fd, line + len, 4096);
+        if (r <= 0) break;
+        line[len += (size_t)r] = '\0';
+    }
+    char *nl = line ? memchr(line, '\n', len) : NULL;
+    if (nl) *nl = '\0';
+    int bad = !nl || !(reply = json_tokener_parse(line));
     int is_error = bad || (json_object_object_get_ex(reply, "isError", &v) && json_object_get_boolean(v));
     const char *text = bad ? "no answer from cntctr" : sarg(reply, "text");
     fprintf(is_error ? stderr : stdout, "%s\n", text ? text : "");
     json_object_put(reply);
     json_object_put(req);
+    free(msg);
     free(line);
-    if (sock) fclose(sock);
     return is_error;
 }
 
