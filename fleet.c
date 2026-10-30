@@ -82,7 +82,7 @@ char *fleet_cache_dir(const char *root) {
 static int rm_rf(const char *path) {
     struct stat sb;
     int bad = 0;
-    if (lstat(path, &sb) != 0) return 0;
+    if (lstat(path, &sb) != 0) return errno != ENOENT;
     if (S_ISDIR(sb.st_mode)) {
         chmod(path, 0700);
         DIR *d = opendir(path);
