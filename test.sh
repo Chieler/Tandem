@@ -624,6 +624,28 @@ check "the reviewer sees the pending version" "$(lst "$FA")" '[fleet] under revi
 refute "others do not see the pending version" "$(lst "$FB")" 'under review'
 same "published versions are unique" "$(row "$PK" prec 1 active fc dup "" 2>&1 | grep -c UNIQUE)" "1"
 
+# one name, five competing rows: pending (reviewer) > own draft > newest project active > global
+FR=$(newpane fr)
+FU=$(newpane fu)
+row global ord 1 active x "g-desc" ""
+row "$PK" ord 1 active x "p1-desc" ""
+row "$PK" ord 2 active x "p2-desc" ""
+call "$FU" tool_define "$(dnamed ord "d-desc")" > /dev/null
+row "$PK" ord 3 pending x "r-desc" "$FR"
+check "the reviewer sees the pending row" "$(lst "$FR")" '[fleet] r-desc'
+refute "the pending row beats the draft" "$(lst "$FR")" 'd-desc'
+check "the author sees its own draft" "$(lst "$FU")" '[fleet] d-desc'
+refute "the draft beats the project rows" "$(lst "$FU")" 'p2-desc'
+refute "the draft is private" "$(lst "$FB")" 'd-desc'
+refute "pending is private" "$(lst "$FB")" 'r-desc'
+check "others see the newest project version" "$(lst "$FB")" '[fleet] p2-desc'
+refute "the older project version is hidden" "$(lst "$FB")" 'p1-desc'
+refute "the project row beats the global one" "$(lst "$FB")" 'g-desc'
+row "$PK" ord 4 revoked x "v4-desc" ""
+refute "a revoked newest row hides the name from others" "$(lst "$FB")" '"name":"ord"'
+sqlite3 "$CNTCTR_DB" "DELETE FROM tools WHERE project='$PK' AND name='ord'"
+check "the global row shows once the project rows are gone" "$(lst "$FB")" '[fleet] g-desc'
+
 # ---- summary ----
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
