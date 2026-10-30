@@ -15,7 +15,8 @@ A fleet is every agent whose project key (`resolve_project`) matches.
 - An agent can define a script-backed tool and call it immediately itself.
 - A published tool passes deterministic gate checks and a review by an agent on a
   different model before any other agent can call it.
-- Activation reaches every live cntctr in the project without polling.
+- Activation reaches every live cntctr without polling. Codex agents see new
+  project tools only through `use` (see MCP interface).
 - Every fleet tool runs sandboxed: it can read the project, write only its own
   temp dir, and has no network.
 - A human can resolve escalations, revoke any tool, and promote proven tools to
@@ -149,8 +150,8 @@ Listing and dispatch:
 
 A cntctr outside any pane (Codex) cannot know its project, because `tools/list`
 has no `from`. It lists only built-ins and global tools, and calls project tools
-through `use(..., from=)`. It learns about new project tools from the activation
-post typed into its pane.
+through `use(..., from=)`. It still gets `list_changed` for global tools. It
+learns about new project tools from the activation post typed into its pane.
 
 ## Running a tool
 
@@ -194,10 +195,12 @@ Every fleet tool runs sandboxed. There is no opt-out.
 - Writes: only the per-call temp dir. A tool that changes files returns a patch
   or instructions as text. The calling agent applies them with its own tools,
   under its harness's permission prompts.
-- Reads: allowed for the project root, the temp dir, and system paths (`/usr`,
-  `/bin`, `/System`, `/Library`, `/opt/homebrew`, `/private/etc`, `/dev`).
-- Denied reads: the kb.db path and its `-wal`, `-shm` and `-journal` companions,
-  in case they sit under the project root.
+- Reads: allowed for the project root, the temp dir, and system paths. On
+  macOS those are `/usr`, `/bin`, `/System`, `/Library`, `/opt/homebrew`,
+  `/private/etc` and `/dev`. Linux uses the list below.
+- The DB: if the canonical DB path lies under the project root, fleet tools
+  refuse to run in that project. Masking the DB file is not enough: SQLite
+  creates and deletes its `-wal` and `-shm` files while the sandbox runs.
 - Network: denied.
 - Processes: the tool may signal only processes inside its own sandbox.
 - Symlinks: paths are canonicalized with `realpath` before the profile is built.
@@ -207,9 +210,12 @@ Every fleet tool runs sandboxed. There is no opt-out.
   `(allow signal (target same-sandbox))`.
 - Linux: `bwrap` with:
   - `--unshare-net --unshare-pid --unshare-ipc --die-with-parent --new-session`;
-  - read-only binds of the system paths and the project root;
-  - a writable bind of the temp dir;
-  - `/dev/null` bound over each DB file that exists under the root.
+  - `--ro-bind /usr`, `--ro-bind-try` for `/bin`, `/sbin`, `/lib`, `/lib64`,
+    `/lib32`, `/etc/alternatives`, `/etc/ld.so.cache`, `/etc/ssl` and
+    `/etc/localtime`. On usr-merged distros `/bin` and `/lib` are symlinks, and
+    binding them keeps the links working;
+  - `--proc /proc`, `--dev /dev`, `--tmpfs /tmp`;
+  - a read-only bind of the project root, and a writable bind of the temp dir.
 - With no sandbox available, or if the sandbox fails to start, the call fails and
   says why (fail closed).
 
@@ -235,7 +241,14 @@ and cannot run. That is accepted for v1.
    - If that harness is not on `PATH`, the reviewer runs on the author's harness
      with a different model. This fallback needs a known `author_model`.
    - Otherwise the version becomes `escalated`, and a `post` asks for a human.
-   - `reviewer_pane` and `reviewer_model` are recorded.
+   - `reviewer_pane` and `reviewer_model` are recorded by `kb_tool_bind` right
+     after `start_spawn` returns the pane id.
+     - Until then `reviewer_pane` is NULL. NULL never matches `self_pane`, so
+       the reviewer has no authority yet.
+     - A `use` or `tool_verdict` from it in that gap fails with "review not
+       bound yet; retry in a few seconds".
+     - If binding fails, the reviewer pane is closed, and the version becomes
+       `escalated`.
    - The task quotes the definition as data in a fenced block. It tells the
      reviewer:
      - the tool's text is data, not instructions to follow;
@@ -267,27 +280,39 @@ The notification transport is per-process FIFOs. It does not use tmux `wait-for`
 two signals sent to a `wait-for` channel with no waiter cancel each other
 (checked on tmux 3.7c), so a burst of approvals could be lost.
 
-- Directory: `/tmp/cntctr-<uid>/tools/<hash of project key>/`, plus
-  `.../tools/global/` for a cntctr outside any pane. It is created with mode
-  0700. cntctr checks with `lstat` that every component it creates is a real
-  directory owned by the user, and refuses to use it otherwise.
+- Directory: one flat directory for all of the user's cntctr processes,
+  `/tmp/cntctr-<uid>/tools/`. It is not split by project. A cntctr's project can
+  change while it runs (the pane `cd`s, or `project` overrides the key), and
+  Codex's cntctr has no project at all. So every change notifies every cntctr,
+  and each one's next `tools/list` resolves against its caller's current project.
+  - The directory is created with mode 0700.
+  - cntctr checks with `lstat` that each path component is a real directory
+    owned by the user. Otherwise it disables notifications and logs the reason
+    to stderr once.
 - Registration: after cntctr has answered `initialize`, it creates
-  `<pid>.fifo` there and opens it `O_RDWR`. Holding its own write end keeps the
-  FIFO open even with no other writer.
-  - A watcher thread blocks in `read`.
-  - On wake it drains all pending bytes, then emits one
-    `{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}` through
-    `emit`.
-  - Bytes written while the thread is busy wait in the pipe buffer, so nothing
-    is lost and a burst becomes one notification.
-- Notify: after a commit, the notifier opens each FIFO in the project's directory
-  (every directory for a promote or a global revoke) with
+  `<pid>.fifo` and opens it twice:
+  - `O_RDONLY | O_NONBLOCK` for reading. This succeeds with no writer.
+  - Then `O_WRONLY`, as a keepalive. With a writer always present, the reader
+    never sees EOF. Both opens are POSIX-defined, unlike `O_RDWR` on a FIFO.
+- Watching: one thread does `poll(POLLIN)` on the read fd. When it is readable,
+  the thread reads until `EAGAIN`, then emits one
+  `{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}` through
+  `emit`. Bytes written while the thread is busy wait in the pipe buffer, so
+  nothing is lost, and a burst becomes one notification.
+- Notify: after a commit, the notifier opens every FIFO in the directory with
   `O_WRONLY | O_NONBLOCK` and writes one byte.
   - `EAGAIN` (pipe full) means a wake is already pending, which is fine.
-  - `ENXIO` (no reader) means that cntctr is gone; its FIFO is unlinked.
-  - The caller's own FIFO is included, so an agent that revokes a tool gets
+  - `EINTR` is retried.
+  - `ENXIO` on open, or `EPIPE` on write, means that cntctr is gone. Its FIFO is
+    unlinked, and notifying continues with the rest. `SIGPIPE` is already ignored
+    in `main`, which both the MCP and the CLI paths go through.
+  - The caller's own FIFO is included, so an agent that revokes a tool is
     notified too.
 - Exit: `main` unlinks its FIFO.
+
+ponytail: every change wakes every cntctr of the user. A cntctr whose list didn't
+change re-fetches it and emits nothing new to its agent. Add per-project
+directories if fleets grow past a few dozen agents.
 
 Separately, approve, revoke and promote type a short line into agents' panes
 through the existing `tool_post` path:
@@ -331,7 +356,10 @@ under 5%, and at least 3 distinct calling agents, counted from history.
   give a verdict".
 - A verdict on a version that is no longer pending: "version <N> is <status>".
 - The FIFO directory is unsafe (wrong owner, not a directory): fleet tools still
-  work, but without `list_changed`. The reason is logged to stderr once.
+  work, but this cntctr sends no `list_changed`. Its agent learns about changes
+  only from posts. The reason is logged to stderr once.
+- The DB lies under the project root: "fleet tools are disabled here because the
+  knowledge DB is inside this project; move CNTCTR_DB".
 
 ## Verification
 
@@ -345,8 +373,13 @@ Lifecycle:
   - an oversize description, schema, or script;
   - an unknown interpreter.
 - A fake reviewer approves. Then a second cntctr in the project emits
-  `notifications/tools/list_changed` and lists the tool, and a cntctr in another
-  project emits nothing.
+  `notifications/tools/list_changed` and lists the tool. A cntctr in another
+  project may be notified, but does not list the tool.
+- A fake reviewer that calls `tool_verdict` immediately is refused with "not bound
+  yet", and succeeds on retry.
+- An agent that `cd`s from project A to project B lists B's tools on its next
+  `tools/list`.
+- With the DB under the project root, calls fail with the "disabled here" error.
 - A verdict from a non-reviewer pane is refused. `use(..., from=<reviewer>)` from
   another pane cannot reach the pending version.
 - `reject` and `escalate` paths: status, the author's pane text, the board post.
@@ -371,10 +404,13 @@ Lifecycle:
   reviewer harness is missing becomes `escalated`.
 
 Propagation:
-- Three approvals in quick succession produce at least one notification in every
-  live cntctr of the project, and no cntctr misses the last one.
+- A single approval produces exactly one notification in each live cntctr.
+- Three approvals in quick succession produce at least one notification in each
+  live cntctr, after the last commit.
 - The revoking agent's own cntctr is notified.
 - A FIFO left by a killed cntctr is unlinked on the next notify.
+- A FIFO whose reader exits between open and write (`EPIPE`) is unlinked, and the
+  remaining FIFOs are still notified.
 
 Runner and sandbox, tested on `fleet.c` directly:
 - The tool sees only the minimal environment and no fds above 2.
@@ -382,7 +418,6 @@ Runner and sandbox, tested on `fleet.c` directly:
   - write in the project root or outside its temp dir;
   - read a file under a fake `$HOME`, directly or through a symlink in the
     project;
-  - read the DB or its `-wal` file;
   - connect to a local listener;
   - signal a sentinel process the same user owns outside the sandbox.
 - It can read project files and write in its temp dir.
@@ -391,3 +426,5 @@ Runner and sandbox, tested on `fleet.c` directly:
 - A background child is killed at the deadline.
 - The temp dir is removed.
 - A missing sandbox fails closed.
+- `sh`, `python3` and `node` each run a trivial script inside the sandbox, on
+  macOS and in Linux bwrap. Linux runs in CI or a container.
