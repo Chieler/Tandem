@@ -54,6 +54,7 @@ static char self_name[128];              /* our agent name (the pane's @cntctr_n
 /* Who the current tool call is from: self_*, or the `from` argument when one shared
  * server (Codex) serves many panes. Set per call in dispatch. */
 static _Thread_local char caller_pane[32], caller_name[128];
+static _Thread_local int fleet_depth;   /* fleet tools running above this call; at most 3 */
 static pthread_mutex_t fork_mu = PTHREAD_MUTEX_INITIALIZER;   /* held from pipe() to fork() */
 
 static char *fmt(const char *f, ...) {
@@ -1404,8 +1405,41 @@ static json_object *without_from(json_object *args) {
     return copy;
 }
 
+static int dispatch_as(const char *pane, const char *name, const char *tool, json_object *args, char **res);
+
+/* Who a tool's fd 3 requests run as: the caller of the tool call. */
+struct served { char pane[32], name[128]; };
+static const char *const FLEET_CALLABLE[] = {"use", "recall", "read", "note", "post", "board", NULL};
+
+/* Serve one request line {"tool":..,"args":..} from a running tool; the reply is {"text":..,"isError":..}. */
+static char *serve_call(void *ctx, const char *line) {
+    const struct served *who = ctx;
+    json_object *req = json_tokener_parse(line), *args = NULL, *reply = json_object_new_object();
+    const char *tool = sarg(req, "tool");
+    int allowed = 0, is_error = 1;
+    for (int i = 0; tool && FLEET_CALLABLE[i]; i++)
+        if (strcmp(FLEET_CALLABLE[i], tool) == 0) allowed = 1;
+    char *text = NULL;
+    if (!allowed) {
+        text = fmt("tool %s is not callable from a fleet tool", tool ? tool : "(none)");
+    } else {
+        json_object_object_get_ex(req, "args", &args);
+        json_object *plain = without_from(args);
+        is_error = dispatch_as(who->pane, who->name, tool, plain, &text);
+        json_object_put(plain);
+    }
+    json_object_object_add(reply, "text", json_object_new_string(text));
+    json_object_object_add(reply, "isError", json_object_new_boolean(is_error));
+    char *out = strdup(json_object_to_json_string_ext(reply, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE));
+    json_object_put(reply);
+    json_object_put(req);
+    free(text);
+    return out;
+}
+
 /* Resolve `name` for the caller and run it in a sandbox. `args` may be NULL. */
 static int use_tool(const char *name, json_object *args, char **res) {
+    if (fleet_depth >= 3) return fail(res, fmt("fleet tools nested too deep"));
     if (!*caller_pane)
         return fail(res, fmt("cntctr cannot tell which pane you are in; pass from=<your agent name, or your $TMUX_PANE if you were started by hand>"));
     struct project p;
@@ -1424,10 +1458,15 @@ static int use_tool(const char *name, json_object *args, char **res) {
     sqlite3_close(db);   /* a tool can run for minutes; hold nothing meanwhile */
     char def[4096], *out = NULL;
     const char *argjson = args ? json_object_to_json_string_ext(args, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE) : "{}";
+    struct served who;
+    snprintf(who.pane, sizeof who.pane, "%s", caller_pane);
+    snprintf(who.name, sizeof who.name, "%s", caller_name);
     struct fleet_run r = {.name = t.name, .root = p.root, .interpreter = t.interpreter, .script = t.script,
                           .args_json = argjson, .db_path = kb_path(def, sizeof def), .net = t.net, .fork_mu = &fork_mu,
-                          .timeout = t.timeout > 0 ? t.timeout : 60};
+                          .timeout = t.timeout > 0 ? t.timeout : 60, .serve = serve_call, .ctx = &who};
+    fleet_depth++;
     int rc = fleet_run(&r, &out);
+    fleet_depth--;
     char *err = NULL, *title = fmt("tool %s v%d %s %s", t.name, t.version, caller_name, rc ? "fail" : "ok");
     if ((db = kb(&err))) {
         kb_tool_count(db, &t, !rc);
@@ -1477,22 +1516,41 @@ static char *set_caller(json_object *args) {
     return from && *from ? resolve_from(from) : NULL;
 }
 
-static int dispatch(const char *name, json_object *args, char **res) {
-    for (int i = 0; TOOL_FNS[i].name; i++) {
-        if (strcmp(TOOL_FNS[i].name, name ? name : "") != 0) continue;
-        char *err = set_caller(args);
-        if (err) return fail(res, err);
+/* Run `tool` as the given caller, ignoring any `from` in args. The thread's own caller is restored on
+ * return, so a nested call (a fleet tool calling use) does not change the outer call's identity. */
+static int dispatch_as(const char *pane, const char *name, const char *tool, json_object *args, char **res) {
+    char saved_pane[sizeof caller_pane], saved_name[sizeof caller_name];
+    memcpy(saved_pane, caller_pane, sizeof saved_pane);
+    memcpy(saved_name, caller_name, sizeof saved_name);
+    snprintf(caller_pane, sizeof caller_pane, "%s", pane);
+    snprintf(caller_name, sizeof caller_name, "%s", name);
+    int rc = -1;
+    for (int i = 0; rc < 0 && TOOL_FNS[i].name; i++) {
+        if (strcmp(TOOL_FNS[i].name, tool ? tool : "") != 0) continue;
         if (TOOL_FNS[i].needs_pane && !*caller_pane)
-            return fail(res, fmt("cntctr cannot tell which pane you are in; pass from=<your agent name, or your $TMUX_PANE if you were started by hand>"));
-        return TOOL_FNS[i].fn(args, res);
+            rc = fail(res, fmt("cntctr cannot tell which pane you are in; pass from=<your agent name, or your $TMUX_PANE if you were started by hand>"));
+        else
+            rc = TOOL_FNS[i].fn(args, res);
     }
+    if (rc < 0) {
+        if (!tool || !*tool || !*caller_pane) {
+            rc = fail(res, fmt("unknown tool %s", tool ? tool : "(none)"));
+        } else {
+            json_object *plain = without_from(args);
+            rc = use_tool(tool, plain, res);
+            json_object_put(plain);
+        }
+    }
+    memcpy(caller_pane, saved_pane, sizeof caller_pane);
+    memcpy(caller_name, saved_name, sizeof caller_name);
+    return rc;
+}
+
+/* Resolve the caller from self and `from`, then run as that caller. */
+static int dispatch(const char *name, json_object *args, char **res) {
     char *err = set_caller(args);
     if (err) return fail(res, err);
-    if (!name || !*name || !*caller_pane) return fail(res, fmt("unknown tool %s", name ? name : "(none)"));
-    json_object *plain = without_from(args);
-    int rc = use_tool(name, plain, res);
-    json_object_put(plain);
-    return rc;
+    return dispatch_as(caller_pane, caller_name, name, args, res);
 }
 
 #define KFROM "\"from\":{\"type\":\"string\",\"description\":\"Your agent name. Needed from Codex, whose cntctr runs outside your pane, to find your project\"}"
@@ -1780,7 +1838,43 @@ static void handle(const char *line) {
     json_object_put(req);
 }
 
-int main(void) {
+/* cntctr call <tool> <json>: forward one request to the cntctr that is running this fleet tool */
+static int call_cmd(const char *tool, const char *args) {
+    const char *fdenv = getenv("CNTCTR_FD");
+    if (!fdenv) {
+        fprintf(stderr, "cntctr call works only inside a fleet tool\n");
+        return 1;
+    }
+    json_object *a = json_tokener_parse(args);
+    if (!json_object_is_type(a, json_type_object)) {
+        json_object_put(a);
+        fprintf(stderr, "args must be a JSON object\n");
+        return 1;
+    }
+    json_object *req = json_object_new_object(), *reply = NULL, *v = NULL;
+    json_object_object_add(req, "tool", json_object_new_string(tool));
+    json_object_object_add(req, "args", a);
+    FILE *sock = fdopen(atoi(fdenv), "r+");
+    char *line = NULL;
+    size_t cap = 0;
+    int bad = !sock || fprintf(sock, "%s\n", json_object_to_json_string_ext(req, JSON_C_TO_STRING_PLAIN)) < 0 || fflush(sock) != 0
+              || getline(&line, &cap, sock) <= 0 || !(reply = json_tokener_parse(line));
+    int is_error = bad || (json_object_object_get_ex(reply, "isError", &v) && json_object_get_boolean(v));
+    const char *text = bad ? "no answer from cntctr" : sarg(reply, "text");
+    fprintf(is_error ? stderr : stdout, "%s\n", text ? text : "");
+    json_object_put(reply);
+    json_object_put(req);
+    free(line);
+    if (sock) fclose(sock);
+    return is_error;
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "call") == 0) {
+        if (argc == 4) return call_cmd(argv[2], argv[3]);
+        fprintf(stderr, "usage: cntctr call <tool> '<json args>'\n");
+        return 2;
+    }
     signal(SIGPIPE, SIG_IGN);
     const char *delay = getenv("CNTCTR_ENTER_DELAY_MS");
     if (delay) enter_delay_ms = atoi(delay);

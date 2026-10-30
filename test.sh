@@ -709,7 +709,7 @@ deft fails 'echo boom >&2; exit 3'
 check "non-zero exit is an error with stderr" "$(txt "$(use fails)")" boom
 same "non-zero exit sets isError" "$(iserr "$(use fails)")" true
 deft fd3 'echo "{}" >&3; read -r r <&3; echo "$r"'
-same "fd 3 answers not available" "$(txt "$(use fd3)")" '{"error":"not available"}'
+check "fd 3 rejects a request without a tool" "$(txt "$(use fd3)")" '"isError":true'
 deft cw 'sleep 1; echo done'
 call "$FR" cw '{}' > "$TMPD/cw1" & call "$FR" cw '{}' > "$TMPD/cw2" & wait
 check "concurrent call one finishes" "$(txt "$(cat "$TMPD/cw1")")" done
@@ -736,6 +736,22 @@ same "tool cannot write through a .git symlink" "$(iserr "$(call "$FG" use '{"to
 [ -e "$TMPD/gl/realgit/evil" ] && bad "wrote into the symlinked git dir" || ok_
 call "$FG" tool_define '{"name":"gitok","description":"t","input_schema":{"type":"object"},"interpreter":"sh","script":"echo x > other.txt; echo fine"}' >/dev/null
 same "that root is otherwise writable" "$(txt "$(call "$FG" use '{"tool":"gitok"}')")" fine
+# composition: a tool calls back into cntctr as its caller
+ln -s "$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")" "$TMPD/bin/cntctr"
+call "$FR" note '{"layer":"insight","title":"Enter in copy-mode","summary":"paste a CR instead","tags":"scrollback"}' >/dev/null
+deft rc 'cntctr call recall "{\"query\":\"copy-mode\"}"'
+check "tool can recall" "$(txt "$(use rc)")" "Enter in copy-mode"
+deft nt 'cntctr call note "{\"layer\":\"insight\",\"title\":\"from tool\",\"summary\":\"s\",\"from\":\"someone-else\"}"'
+use nt >/dev/null
+same "note from a tool is authored by the caller" "$(sqlite3 "$CNTCTR_DB" "select agent from entries where title='from tool'")" fr
+deft sp 'cntctr call spawn "{}"'
+check "spawn is not callable from a tool" "$(txt "$(use sp)")" "tool spawn is not callable from a fleet tool"
+deft deep 'cntctr call use "{\"tool\":\"deep\",\"args\":{}}"'
+check "nesting stops at 3" "$(txt "$(use deep)")" "fleet tools nested too deep"
+deft inner 'echo inner-ok'
+deft outer 'cntctr call use "{\"tool\":\"inner\"}"'
+same "a tool can use another tool" "$(txt "$(use outer)")" inner-ok
+check "call outside a tool fails" "$("$BIN" call recall '{}' 2>&1)" "cntctr call works only inside a fleet tool"
 check "calls are logged as history" "$(sqlite3 "$CNTCTR_DB" "SELECT group_concat(title) FROM entries WHERE layer='history' AND title LIKE 'tool fails v0 fr %'")" "tool fails v0 fr fail"
 fi
 
