@@ -37,6 +37,7 @@ static const char SCHEMA[] =
     " reviewer_model TEXT, review_root TEXT, deadline INTEGER, verdict_reason TEXT, calls INTEGER NOT NULL DEFAULT 0,"
     " failures INTEGER NOT NULL DEFAULT 0, created INTEGER,"
     " PRIMARY KEY(project, name, version, author));"   /* author: drafts are version 0, one per author */
+    "CREATE UNIQUE INDEX IF NOT EXISTS tools_version ON tools(project, name, version) WHERE version > 0;"
     "CREATE INDEX IF NOT EXISTS tools_name ON tools(project, name, status);"
     "INSERT OR IGNORE INTO meta VALUES ('schema', '1');";
 

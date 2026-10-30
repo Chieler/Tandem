@@ -591,6 +591,39 @@ same "description cap" "$(txt "$(call "$FA" tool_define "$(bad_def ".description
 same "unknown interpreter" "$(txt "$(call "$FA" tool_define "$(bad_def '.interpreter="ruby"')")")" "interpreter must be sh, bash, python3 or node"
 same "timeout cap" "$(txt "$(call "$FA" tool_define "$(bad_def '.timeout=601')")")" "timeout must be 1..600"
 
+# interpreter must resolve on PATH: a PATH with the usual tools but no node
+mkdir "$TMPD/nonode"
+for c in tmux git jq mktemp mkfifo head tail rm sh bash env cat; do ln -s "$(command -v "$c")" "$TMPD/nonode/$c"; done
+same "interpreter must be on PATH" "$(txt "$(PATH="$TMPD/nonode" call "$FA" tool_define "$(bad_def '.interpreter="node"')")")" "interpreter node not found on PATH"
+# resolver precedence, with rows inserted directly
+PK=$(txt "$(call "$FA" project '{}')" | sed 's/^project \(.*\) (root .*/\1/')
+row() { sqlite3 "$CNTCTR_DB" "INSERT INTO tools(project,name,version,status,author,description,input_schema,interpreter,script,reviewer_pane) VALUES ('$1','$2',$3,'$4','$5','$6','{\"type\":\"object\"}','sh','true','$7')"; }
+dnamed() { bad_def ".name=\"$1\" | .description=\"$2\""; }
+call "$FA" tool_define "$(dnamed dup "Desc A")" > /dev/null
+call "$FB" tool_define "$(dnamed dup "Desc B")" > /dev/null
+check "author sees its own draft" "$(lst "$FA")" '[fleet] Desc A'
+refute "author does not see the other draft" "$(lst "$FA")" 'Desc B'
+check "the other author sees theirs" "$(lst "$FB")" '[fleet] Desc B'
+refute "the other author does not see the first" "$(lst "$FB")" 'Desc A'
+call "$FA" tool_define "$(dnamed dup "Desc A2")" > /dev/null
+check "a redefined draft replaces the old one" "$(lst "$FA")" '[fleet] Desc A2'
+refute "the old draft text is gone" "$(lst "$FA")" '[fleet] Desc A"'
+same "one draft per author and name" "$(sqlite3 "$CNTCTR_DB" "SELECT count(*) FROM tools WHERE name='dup' AND author='fa'")" "1"
+row "$PK" prec 1 active fc "project active" ""
+call "$FA" tool_define "$(dnamed prec "my draft")" > /dev/null
+check "own draft beats the project active row" "$(lst "$FA")" '[fleet] my draft'
+refute "the active row is hidden behind the draft" "$(lst "$FA")" 'project active'
+check "others see the active row" "$(lst "$FB")" '[fleet] project active'
+row global mask 1 active fc "global mask" ""
+row "$PK" mask 1 revoked fc "revoked here" ""
+refute "a project revoked row masks the global tool" "$(lst "$FA")" '"name":"mask"'
+row global glob 1 active fc "global tool" ""
+check "a global tool is listed in any project" "$(lst "$FA")" '[fleet] global tool'
+row "$PK" pend 1 pending fc "under review" "$FA"
+check "the reviewer sees the pending version" "$(lst "$FA")" '[fleet] under review'
+refute "others do not see the pending version" "$(lst "$FB")" 'under review'
+same "published versions are unique" "$(row "$PK" prec 1 active fc dup "" 2>&1 | grep -c UNIQUE)" "1"
+
 # ---- summary ----
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

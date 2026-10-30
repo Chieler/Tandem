@@ -1300,6 +1300,20 @@ static const struct { const char *name; tool_fn fn; int needs_pane; } TOOL_FNS[]
 
 static regex_t name_re;   /* a fleet tool's name; compiled in main */
 
+/* Whether `cmd` is an executable file in a PATH directory. */
+static int on_path(const char *cmd) {
+    char *dirs = strdup(getenv("PATH") ? getenv("PATH") : ""), *save = NULL, *f;
+    int found = 0;
+    for (char *d = strtok_r(dirs, ":", &save); d && !found; d = strtok_r(NULL, ":", &save)) {
+        struct stat sb;
+        f = fmt("%s/%s", d, cmd);
+        found = stat(f, &sb) == 0 && S_ISREG(sb.st_mode) && access(f, X_OK) == 0;
+        free(f);
+    }
+    free(dirs);
+    return found;
+}
+
 /* The first reason `a` is not a valid tool definition (caller frees), or NULL. */
 static char *gate_check(json_object *a) {
     const char *name = sarg(a, "name"), *desc = sarg(a, "description"), *interp = sarg(a, "interpreter");
@@ -1335,6 +1349,7 @@ static char *gate_check(json_object *a) {
     }
     if (!interp || (strcmp(interp, "sh") && strcmp(interp, "bash") && strcmp(interp, "python3") && strcmp(interp, "node")))
         return fmt("interpreter must be sh, bash, python3 or node");
+    if (!on_path(interp)) return fmt("interpreter %s not found on PATH", interp);
     if (!script || !*script) return fmt("script is required");
     if (strlen(script) > 65536) return fmt("script is over 64 KB");
     if (json_object_object_get_ex(a, "timeout", &v)
