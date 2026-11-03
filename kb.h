@@ -43,4 +43,17 @@ int kb_tool_resolve(sqlite3 *db, const char *project, const char *name,
 char *kb_tool_names(sqlite3 *db, const char *project, const char *caller_name, const char *caller_pane);   /* names with any candidate row, one per line; the caller resolves each */
 void kb_tool_count(sqlite3 *db, const struct kb_tool *t, int ok); /* one more call on t's row, and a failure unless ok */
 char *kb_tool_reason(sqlite3 *db, const struct kb_tool *t);       /* why t was revoked or rejected; malloc'd, may be "" */
+char *kb_tool_field(sqlite3 *db, const char *project, const char *name, int version, const char *column);   /* one text column of a version, or NULL */
+/* Promote the author's draft to a new pending version (deadline in 20 min), rejecting older pending and escalated ones.
+ * *superseded gets "<pane>\t<review_root>\n" per pending review that was closed (caller frees). 0, or -1 (no draft). */
+int kb_tool_publish(sqlite3 *db, const char *project, const char *author, const char *name, int *version, char **superseded);
+int kb_tool_bind(sqlite3 *db, const char *project, const char *name, int version,
+                 const char *pane, const char *model, const char *review_root);   /* rows changed: 0 or 1 */
+int kb_tool_escalate(sqlite3 *db, const char *project, const char *name, int version);   /* pending -> escalated; rows changed */
+/* 0 applied. -1 not applied; status is the row's current status, "unbound" (pending, no reviewer yet), "unknown" or "busy". */
+int kb_tool_verdict(sqlite3 *db, const char *project, const char *name, int version, const char *pane,
+                    const char *verdict, const char *reason, char status[16]);
+/* Escalate pending rows past their deadline, once. "<pane>\t<review_root>\t<name>\t<version>\n" per row. */
+char *kb_tool_expire(sqlite3 *db, const char *project);
+int kb_tool_live(sqlite3 *db, const char *review_dir);   /* a pending row owns the review dir "<hash8>-<name>-v<N>" */
 #endif

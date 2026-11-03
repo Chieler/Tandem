@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 static const char SCHEMA[] =
@@ -374,4 +375,164 @@ char *kb_tool_reason(sqlite3 *db, const struct kb_tool *t) {
     char *r = strdup(sqlite3_step(st) == SQLITE_ROW ? col(st, 0) : "");
     sqlite3_finalize(st);
     return r;
+}
+
+/* A text column of one tool version (caller frees), or NULL if the row or the value is missing. `column` is a literal. */
+char *kb_tool_field(sqlite3 *db, const char *project, const char *name, int version, const char *column) {
+    char *sql = sqlite3_mprintf("SELECT %s FROM tools WHERE project = ?1 AND name = ?2 AND version = ?3", column);
+    sqlite3_stmt *st = prep(db, sql);
+    sqlite3_free(sql);
+    sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 3, version);
+    char *r = NULL;
+    if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_type(st, 0) != SQLITE_NULL) r = strdup(col(st, 0));
+    sqlite3_finalize(st);
+    return r;
+}
+
+int kb_tool_publish(sqlite3 *db, const char *project, const char *author, const char *name, int *version, char **superseded) {
+    *superseded = NULL;
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) return -1;
+    sqlite3_stmt *st = prep(db, "SELECT COALESCE(MAX(version), 0) + 1 FROM tools WHERE project = ?1 AND name = ?2");
+    sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
+    *version = sqlite3_step(st) == SQLITE_ROW ? sqlite3_column_int(st, 0) : 0;
+    sqlite3_finalize(st);
+    int rc = *version > 0 ? 0 : -1;
+    if (rc == 0) {   /* the reviews to close: "<pane>\t<review_root>" per live one */
+        st = prep(db, "SELECT COALESCE(reviewer_pane, '') || char(9) || COALESCE(review_root, '') FROM tools"
+                      " WHERE project = ?1 AND name = ?2 AND status = 'pending'");
+        sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
+        *superseded = lines(st);
+        rc = exec2(db, "UPDATE tools SET status = 'rejected', verdict_reason = 'superseded'"
+                       " WHERE project = ?1 AND name = ?2 AND status IN ('pending', 'escalated')", project, name) < 0 ? -1 : 0;
+    }
+    if (rc == 0) {
+        st = prep(db,
+            "INSERT INTO tools(project, name, version, status, author, author_model, description, input_schema, interpreter,"
+            " script, net, timeout, deadline, created) SELECT project, name, ?3, 'pending', author, author_model, description,"
+            " input_schema, interpreter, script, net, timeout, CAST(strftime('%s', 'now') AS INTEGER) + 1200,"
+            " CAST(strftime('%s', 'now') AS INTEGER) FROM tools WHERE project = ?1 AND name = ?2 AND status = 'draft' AND author = ?4");
+        sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 3, *version);
+        sqlite3_bind_text(st, 4, author, -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1 ? 0 : -1;   /* the draft is the content */
+        sqlite3_finalize(st);
+    }
+    if (rc == 0) {
+        st = prep(db, "DELETE FROM tools WHERE project = ?1 AND name = ?2 AND status = 'draft' AND author = ?3");
+        sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 3, author, -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(st) == SQLITE_DONE ? 0 : -1;
+        sqlite3_finalize(st);
+    }
+    if (sqlite3_exec(db, rc == 0 ? "COMMIT" : "ROLLBACK", NULL, NULL, NULL) != SQLITE_OK) rc = -1;
+    if (rc != 0) {
+        free(*superseded);
+        *superseded = NULL;
+    }
+    return rc;
+}
+
+int kb_tool_bind(sqlite3 *db, const char *project, const char *name, int version,
+                 const char *pane, const char *model, const char *review_root) {
+    sqlite3_stmt *st = prep(db,
+        "UPDATE tools SET reviewer_pane = ?4, reviewer_model = ?5, review_root = ?6"
+        " WHERE project = ?1 AND name = ?2 AND version = ?3 AND status = 'pending' AND reviewer_pane IS NULL");
+    sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 3, version);
+    sqlite3_bind_text(st, 4, pane, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 5, model, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 6, review_root, -1, SQLITE_TRANSIENT);
+    int n = sqlite3_step(st) == SQLITE_DONE ? sqlite3_changes(db) : 0;
+    sqlite3_finalize(st);
+    return n;
+}
+
+int kb_tool_escalate(sqlite3 *db, const char *project, const char *name, int version) {
+    sqlite3_stmt *st = prep(db,
+        "UPDATE tools SET status = 'escalated', reviewer_pane = NULL"
+        " WHERE project = ?1 AND name = ?2 AND version = ?3 AND status = 'pending'");
+    sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 3, version);
+    int n = sqlite3_step(st) == SQLITE_DONE ? sqlite3_changes(db) : 0;
+    sqlite3_finalize(st);
+    return n;
+}
+
+int kb_tool_verdict(sqlite3 *db, const char *project, const char *name, int version, const char *pane,
+                    const char *verdict, const char *reason, char status[16]) {
+    const char *to = strcmp(verdict, "approve") == 0 ? "active" : strcmp(verdict, "reject") == 0 ? "rejected" : "escalated";
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
+        snprintf(status, 16, "busy");
+        return -1;
+    }
+    sqlite3_stmt *st = prep(db,
+        "UPDATE tools SET status = ?5, verdict_reason = ?6, reviewer_pane = CASE WHEN ?5 = 'escalated' THEN NULL ELSE reviewer_pane END"
+        " WHERE project = ?1 AND name = ?2 AND version = ?3 AND status = 'pending' AND reviewer_pane = ?4");
+    sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 3, version);
+    sqlite3_bind_text(st, 4, pane, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 5, to, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 6, reason, -1, SQLITE_TRANSIENT);
+    int applied = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
+    sqlite3_finalize(st);
+    if (applied) {
+        if (strcmp(to, "active") == 0) {   /* at most one active row per tool */
+            st = prep(db, "UPDATE tools SET status = 'revoked', verdict_reason = 'superseded'"
+                          " WHERE project = ?1 AND name = ?2 AND status = 'active' AND version <> ?3");
+            sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int(st, 3, version);
+            applied = sqlite3_step(st) == SQLITE_DONE;
+            sqlite3_finalize(st);
+        }
+        if (sqlite3_exec(db, applied ? "COMMIT" : "ROLLBACK", NULL, NULL, NULL) != SQLITE_OK) applied = 0;
+        if (applied) return 0;
+        snprintf(status, 16, "busy");
+        return -1;
+    }
+    st = prep(db, "SELECT status, reviewer_pane IS NULL FROM tools WHERE project = ?1 AND name = ?2 AND version = ?3");
+    sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 3, version);
+    if (sqlite3_step(st) != SQLITE_ROW) snprintf(status, 16, "unknown");
+    else if (strcmp(col(st, 0), "pending") == 0 && sqlite3_column_int(st, 1)) snprintf(status, 16, "unbound");
+    else snprintf(status, 16, "%s", col(st, 0));
+    sqlite3_finalize(st);
+    sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    return -1;
+}
+
+char *kb_tool_expire(sqlite3 *db, const char *project) {
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) return strdup("");
+    sqlite3_stmt *st = prep(db,
+        "SELECT COALESCE(reviewer_pane, '') || char(9) || COALESCE(review_root, '') || char(9) || name || char(9) || version"
+        " FROM tools WHERE project = ?1 AND status = 'pending' AND deadline <= ?2");
+    sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, (long long)time(NULL));
+    char *out = lines(st);
+    st = prep(db, "UPDATE tools SET status = 'escalated', reviewer_pane = NULL"
+                  " WHERE project = ?1 AND status = 'pending' AND deadline <= ?2");
+    sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, (long long)time(NULL));
+    int ok = sqlite3_step(st) == SQLITE_DONE;
+    sqlite3_finalize(st);
+    if (sqlite3_exec(db, ok ? "COMMIT" : "ROLLBACK", NULL, NULL, NULL) != SQLITE_OK || !ok) *out = '\0';
+    return out;
+}
+
+int kb_tool_live(sqlite3 *db, const char *review_dir) {
+    sqlite3_stmt *st = prep(db, "SELECT 1 FROM tools WHERE status = 'pending' AND substr(?1, 10) = name || '-v' || version");
+    sqlite3_bind_text(st, 1, review_dir, -1, SQLITE_TRANSIENT);
+    int live = sqlite3_step(st) == SQLITE_ROW;
+    sqlite3_finalize(st);
+    return live;
 }

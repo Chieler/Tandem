@@ -47,9 +47,9 @@ txt() { printf '%s' "$1" | jq -r '.result.content[0].text'; }
 iserr() { printf '%s' "$1" | jq -r '.result.isError'; }
 
 screen() { t capture-pane -p -J -t "$1"; }
-# expect_screen <description> <pane> <text>: pass once the pane shows <text> (waits up to 5 s)
+# expect_screen <description> <pane> <text>: pass once the pane shows <text> (waits up to 15 s: a board post walks every pane)
 expect_screen() {
-    for _ in $(seq 50); do screen "$2" | grep -qF -- "$3" && { ok_; return; }; sleep 0.1; done
+    for _ in $(seq 150); do screen "$2" | grep -qF -- "$3" && { ok_; return; }; sleep 0.1; done
     bad "$1" "  pane $2 never showed: $3"
 }
 # lastid <pane>: id of the newest message envelope shown in the pane
@@ -312,6 +312,41 @@ cat > "$TMPD/bin/claude" <<'EOF'
 for a; do flags="${flags-} ${task-}"; task=$a; done    # the task is the last argument
 [ "$(basename "$0")" = codex ] && unset TMUX_PANE    # Codex hides TMUX_PANE from MCP servers
 printf 'flags:%s\n%s\n' "$flags" "$task"
+case $task in *toolcheck*)
+    # Fleet tool reviewer: use the tool, then give a verdict. CNTCTR_TEST_VERDICT: approve (default), reject,
+    # escalate or none; CNTCTR_TEST_FAST: ask for a verdict before the review is bound. Notes go to $D/rev-<tool>.*
+    D=$(dirname "$CNTCTR_DB")
+    tn=$(printf '%s\n' "$task" | sed -n 's/^Tool: \([a-z0-9_]*\) version \([0-9]*\)$/\1/p')
+    tv=$(printf '%s\n' "$task" | sed -n 's/^Tool: \([a-z0-9_]*\) version \([0-9]*\)$/\2/p')
+    mode=${CNTCTR_TEST_VERDICT-approve}
+    # ask <tool> <args>: sets R to the reply text. The cntctr keeps running on fd 4, so its cleanup thread can finish.
+    ask() {
+        exec 4>&-
+        f=$(mktemp -u "$D/rv.XXXXXX"); mkfifo "$f"
+        "$BIN" < "$f" > "$f.out" &
+        exec 4> "$f"
+        printf '%s\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"%s","arguments":%s}}\n' "$INIT" "$1" "$2" >&4
+        for _ in $(seq 100); do [ "$(wc -l < "$f.out")" -ge 2 ] && break; sleep 0.1; done
+        R=$(sed -n 2p "$f.out" | jq -r '.result.content[0].text')
+    }
+    [ -n "${CNTCTR_TEST_FAST-}" ] || sleep 0.5
+    [ "$mode" = none ] && exec cat
+    vargs="{\"name\":\"$tn\",\"version\":$tv,\"verdict\":\"$mode\",\"reason\":\"reviewer says $mode\"}"
+    if [ -n "${CNTCTR_TEST_FAST-}" ]; then
+        ask tool_verdict "$vargs"; printf '%s\n' "$R" > "$D/rev-$tn.first"
+    fi
+    for _ in $(seq 30); do
+        ask use "{\"tool\":\"$tn\",\"args\":{}}"
+        case $R in *"not bound yet"*) sleep 1 ;; *) break ;; esac
+    done
+    printf '%s\n' "$R" > "$D/rev-$tn.use"
+    for _ in $(seq 30); do
+        ask tool_verdict "$vargs"
+        case $R in *"not bound yet"*) sleep 1 ;; *) break ;; esac
+    done
+    printf '%s\n' "$R" > "$D/rev-$tn.last"
+    exec cat ;;
+esac
 id=$(printf '%s\n' "$task" | sed -n 's/^\[cntctr from=[^ ]* id=\([0-9a-f]\{8\}\)\]$/\1/p')
 sleep 0.5                                            # real harnesses take seconds to start
 printf '%s\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"reply","arguments":{"id":"%s","text":"done %s"}}}\n' \
@@ -648,6 +683,7 @@ sqlite3 "$CNTCTR_DB" "DELETE FROM tools WHERE project='$PK' AND name='ord'"
 check "the global row shows once the project rows are gone" "$(lst "$FB")" '[fleet] g-desc'
 
 # ---- fleet tool runner ----
+t set -p -t "$FR" @cntctr_name fr-old   # one pane per agent name from here on
 FR=$(t new-window -d -n fr -c "$TMPD/repo" -P -F '#{pane_id}' cat); t set -p -t "$FR" @cntctr_name fr
 none='{}'
 deft() { call "$FR" tool_define "$(jq -nc --arg s "$2" --arg n "$1" '{name:$n,description:"t",input_schema:{type:"object"},interpreter:"sh",script:$s}' | jq -c ". + ${3:-$none}")" >/dev/null; }
@@ -733,6 +769,193 @@ mv "$TMPD/gl/.git" "$TMPD/gl/realgit"; ln -s realgit "$TMPD/gl/.git"
 FG=$(t new-window -d -n fg -c "$TMPD/gl" -P -F '#{pane_id}' cat); t set -p -t "$FG" @cntctr_name fg
 call "$FG" tool_define '{"name":"gitlink","description":"t","input_schema":{"type":"object"},"interpreter":"sh","script":"echo x > realgit/evil"}' >/dev/null
 same "tool cannot write through a .git symlink" "$(iserr "$(call "$FG" use '{"tool":"gitlink"}')")" true
+
+# ---- fleet tool lifecycle: publish, review copy, reviewer, verdict, expiry ----
+RV="$(realpath /tmp)/cntctr-$(id -u)/review"
+tenv() { t set-environment -g "$1" "$2"; }
+tunset() { t set-environment -gu "$1"; }
+waitfor() { local d=$1; shift; for _ in $(seq 150); do eval "$@" && { ok_; return; }; sleep 0.1; done; bad "$d"; }
+st() { sqlite3 "$CNTCTR_DB" "select status from tools where name='$1' and version=${2:-1}"; }
+hasdir() { ls "$RV" 2>/dev/null | grep -qF -- "$1"; }
+haspane() { t list-panes -a -F '#{@cntctr_name}' | grep -qF -- "$1"; }
+nmap() { sqlite3 "$CNTCTR_DB" "select count(*) from projects where root like '%/review/%'"; }
+pubdef() { jq -nc --arg n "$1" --arg s "$2" --arg d "${3:-desc of $1}" '{name:$n,description:$d,input_schema:{type:"object"},interpreter:"sh",script:$s,publish:true}'; }
+publish() { txt "$(call "$1" tool_define "$(pubdef "${@:2}")")"; }
+board() { txt "$(call "${1:-$FR}" board '{"limit":200}')"; }
+t set -p -t "$FR" @cntctr_harness claude
+
+same "the gate runs before publishing" "$(publish "$FR" Bad_Name 'true')" "name must match ^[a-z][a-z0-9_]{1,40}\$"
+same "a failed gate stores nothing" "$(sqlite3 "$CNTCTR_DB" "select count(*) from tools where name='Bad_Name'")" 0
+
+# approve: the review copy has the untracked file; the tool runs there, not on the real tree
+echo untracked > "$TMPD/repo/u.txt"
+same "publish returns version and status" "$(publish "$FR" pw 'cat u.txt; echo touched > u.txt; pwd')" "pw v1 pending"
+expect_screen "approval reaches the author" "$FR" "new fleet tool pw v1 by fr; see tools/list"
+same "the reviewer ran on the copy, not the real tree" "$(cat "$TMPD/repo/u.txt")" untracked
+check "the copy includes the untracked file" "$(cat "$TMPD/rev-pw.use")" untracked
+check "the copy lives under the review dir" "$(cat "$TMPD/rev-pw.use")" "/cntctr-$(id -u)/review/"
+check "the copy is named by project, tool and version" "$(cat "$TMPD/rev-pw.use")" "-pw-v1"
+same "approved status" "$(st pw)" active
+same "the draft was consumed by publishing" "$(sqlite3 "$CNTCTR_DB" "select count(*) from tools where name='pw' and status='draft'")" 0
+check "the reviewer ran on a different harness's model" "$(sqlite3 "$CNTCTR_DB" "select reviewer_model from tools where name='pw'")" gemini
+same "the reviewer was deadline-bound" "$(sqlite3 "$CNTCTR_DB" "select deadline - created from tools where name='pw'")" 1200
+check "other agent in project sees it" "$(lst "$KR")" '"name":"pw"'
+refute "an agent in another project does not" "$(lst "$FG")" '"name":"pw"'
+waitfor "review copy removed" '! hasdir -pw-v1'
+waitfor "copy mapping removed" '[ "$(nmap)" = 0 ]'
+waitfor "reviewer pane closed" '! haspane -pw-v1'
+
+# a reviewer that asks for a verdict before the review is bound is told to retry
+tenv CNTCTR_TEST_FAST 1
+CNTCTR_TEST_HOLD_BIND=1 call "$FR" tool_define "$(pubdef pf 'echo fast')" >/dev/null
+waitfor "pf approved after retrying" '[ "$(st pf)" = active ]'
+same "an early verdict is refused" "$(cat "$TMPD/rev-pf.first")" "review not bound yet; retry in a few seconds"
+tunset CNTCTR_TEST_FAST
+
+# reject and escalate
+tenv CNTCTR_TEST_VERDICT reject
+publish "$FR" pr 'echo r' >/dev/null
+waitfor "pr rejected" '[ "$(st pr)" = rejected ]'
+same "the reject reason is stored" "$(sqlite3 "$CNTCTR_DB" "select verdict_reason from tools where name='pr'")" "reviewer says reject"
+expect_screen "the reason reaches the author" "$FR" "fleet tool pr v1 was rejected: reviewer says reject"
+refute "a rejected tool is not listed" "$(lst "$KR")" '"name":"pr"'
+tenv CNTCTR_TEST_VERDICT escalate
+publish "$FR" pe 'echo e' >/dev/null
+waitfor "pe escalated" '[ "$(st pe)" = escalated ]'
+same "escalating clears the reviewer's authority" "$(sqlite3 "$CNTCTR_DB" "select reviewer_pane is null from tools where name='pe'")" 1
+check "the board asks for a human" "$(board)" "fleet tool pe v1 needs a human"
+expect_screen "the author sees the request" "$FR" "fleet tool pe v1 needs a human"
+refute "an escalated tool is not listed" "$(lst "$KR")" '"name":"pe"'
+tunset CNTCTR_TEST_VERDICT
+
+# verdict guards, with rows inserted directly
+same "a verdict needs a valid verdict" "$(txt "$(call "$FB" tool_verdict '{"name":"x","version":1,"verdict":"maybe"}')")" "verdict must be approve, reject or escalate"
+row "$PK" nv 1 pending fc "not yours" "$FA"
+same "a verdict from a non-reviewer is refused" "$(txt "$(call "$FB" tool_verdict '{"name":"nv","version":1,"verdict":"approve","reason":"x"}')")" "only the assigned reviewer can give a verdict"
+same "from= does not make a reviewer" "$(txt "$(call "$FB" tool_verdict '{"name":"nv","version":1,"verdict":"approve","from":"fa"}')")" "only the assigned reviewer can give a verdict"
+same "the row is still pending" "$(st nv)" pending
+same "use from= cannot reach a pending version" "$(txt "$(call "$FB" use '{"tool":"nv","from":"fa"}')")" "unknown tool nv"
+same "a pending tool is callable by its reviewer" "$(iserr "$(call "$FA" use '{"tool":"nv"}')")" false
+ER=$(t new-window -d -n er -c "$TMPD/repo" -P -F '#{pane_id}' cat); t set -p -t "$ER" @cntctr_name er   # a verdict closes the reviewer pane
+row "$RK" ea 1 pending fc "esc" "$ER"
+check "the reviewer can escalate" "$(txt "$(call "$ER" tool_verdict '{"name":"ea","version":1,"verdict":"escalate","reason":"unsure"}')")" ok
+same "escalate sets the status" "$(st ea)" escalated
+same "approve after escalate is refused" "$(txt "$(call "$ER" tool_verdict '{"name":"ea","version":1,"verdict":"approve","reason":"x"}')")" "version 1 is escalated"
+same "the refused approval changed nothing" "$(st ea)" escalated
+same "a verdict on an unknown version" "$(txt "$(call "$ER" tool_verdict '{"name":"ea","version":9,"verdict":"approve"}')")" "unknown tool ea version 9"
+sqlite3 "$CNTCTR_DB" "insert into tools(project,name,version,status,author,description,input_schema,interpreter,script) values ('$RK','ub',1,'pending','fc','unbound','{\"type\":\"object\"}','sh','true')"
+UB=$(t new-window -d -n ub -c "$TMPD/repo" -P -F '#{pane_id}' cat); t set -p -t "$UB" @cntctr_name toolcheck-aaaaaaaa-ub-v1
+same "use before binding says to retry" "$(txt "$(call "$UB" use '{"tool":"ub"}')")" "review not bound yet; retry in a few seconds"
+same "a verdict before binding says to retry" "$(txt "$(call "$UB" tool_verdict '{"name":"ub","version":1,"verdict":"approve"}')")" "review not bound yet; retry in a few seconds"
+
+# supersede: v2 rejects the pending v1, and v1's late verdict is refused
+tenv CNTCTR_TEST_VERDICT none
+SR=$(newpane sr)   # superseding closes the old reviewer's pane
+row "$RK" sv 1 pending fc "old" "$SR"
+sqlite3 "$CNTCTR_DB" "update tools set deadline=strftime('%s','now')+1200 where name='sv'"
+same "v2 is published over a pending v1" "$(publish "$FR" sv 'echo 2')" "sv v2 pending"
+same "v1 was superseded" "$(st sv 1)" rejected
+same "the supersede reason is stored" "$(sqlite3 "$CNTCTR_DB" "select verdict_reason from tools where name='sv' and version=1")" superseded
+same "a late verdict on v1 is refused" "$(txt "$(call "$FR" tool_verdict '{"name":"sv","version":1,"verdict":"approve"}')")" "version 1 is rejected"
+same "v2 is pending" "$(st sv 2)" pending
+
+# resolution: while v2 is pending over an active v1 the reviewer gets v2 and everyone else v1
+tenv CNTCTR_TEST_VERDICT approve
+publish "$FR" rs 'echo 1' "rs one" >/dev/null
+waitfor "rs v1 active" '[ "$(st rs 1)" = active ]'
+tenv CNTCTR_TEST_VERDICT none
+publish "$FR" rs 'echo 2' "rs two" >/dev/null
+RP=$(sqlite3 "$CNTCTR_DB" "select reviewer_pane from tools where name='rs' and version=2")
+check "the reviewer has a pane" "$RP" "%"
+check "the reviewer gets the pending version" "$(lst "$RP")" "[fleet] rs two"
+check "everyone else keeps v1" "$(lst "$KR")" "[fleet] rs one"
+refute "others do not see the pending version" "$(lst "$KR")" "rs two"
+tenv CNTCTR_TEST_VERDICT approve
+publish "$FR" rs 'echo 3' "rs three" >/dev/null
+waitfor "rs v3 active" '[ "$(st rs 3)" = active ]'
+same "approving v3 revoked v1" "$(st rs 1)" revoked
+same "v2 was superseded" "$(st rs 2)" rejected
+check "others see v3" "$(lst "$KR")" "[fleet] rs three"
+
+# bind race: a supersede or revoke while the reviewer spawn is held before binding
+tenv CNTCTR_TEST_VERDICT none
+CNTCTR_TEST_HOLD_BIND=2 call "$FR" tool_define "$(pubdef br 'echo 1')" > "$TMPD/br1.out" & bgp=$!
+waitfor "br v1's reviewer is spawned" 'haspane -br-v1'
+publish "$FR" br 'echo 2' >/dev/null
+wait $bgp
+same "a supersede during the bind leaves v1 rejected" "$(st br 1)" rejected
+check "the publisher is told" "$(txt "$(cat "$TMPD/br1.out")")" "was superseded or revoked before its review started"
+waitfor "the held review's copy is cleaned up" '! hasdir -br-v1'
+waitfor "the held review's pane is closed" '! haspane -br-v1'
+CNTCTR_TEST_HOLD_BIND=2 call "$FR" tool_define "$(pubdef bq 'echo 1')" > "$TMPD/bq1.out" & bgp=$!
+waitfor "bq v1's reviewer is spawned" 'haspane -bq-v1'
+sqlite3 "$CNTCTR_DB" "update tools set status='revoked', verdict_reason='gone' where name='bq' and version=1"
+wait $bgp
+same "a revoke during the bind leaves v1 revoked" "$(st bq 1)" revoked
+waitfor "the revoked review's copy is cleaned up" '! hasdir -bq-v1'
+waitfor "the revoked review's pane is closed" '! haspane -bq-v1'
+same "no copy mapping is left" "$(sqlite3 "$CNTCTR_DB" "select count(*) from projects where root like '%-bq-v1' or root like '%-br-v1'")" 0
+
+# expiry: after the publisher is gone, the next tool_* call escalates once and cleans up
+publish "$FR" px 'echo x' >/dev/null
+same "px is pending" "$(st px)" pending
+check "px has a review copy" "$(ls "$RV")" "-px-v1"
+sqlite3 "$CNTCTR_DB" "update tools set deadline=0 where name='px' and status='pending'"
+deft trig 'true'
+same "an expired review is escalated" "$(st px)" escalated
+waitfor "the expired review's copy is removed" '! hasdir -px-v1'
+waitfor "the expired review's pane is closed" '! haspane -px-v1'
+same "expiry posted once" "$(board | grep -c 'fleet tool px v1 needs a human')" 1
+deft trig2 'true'
+call "$FR" use '{"tool":"trig2"}' >/dev/null
+same "a second expiry run posts nothing" "$(board | grep -c 'fleet tool px v1 needs a human')" 1
+mkdir -p "$RV/deadbeef-stray-v9"
+call "$FR" use '{"tool":"hello","args":{}}' >/dev/null
+[ ! -d "$RV/deadbeef-stray-v9" ] && ok_ || bad "stray review dir not swept"
+tunset CNTCTR_TEST_VERDICT
+
+# a project without git
+FP=$(t new-window -d -n fp -c "$TMPD/plain" -P -F '#{pane_id}' cat); t set -p -t "$FP" @cntctr_name fp; t set -p -t "$FP" @cntctr_harness claude
+same "a plain directory can publish" "$(publish "$FP" np 'pwd; ls')" "np v1 pending"
+waitfor "np approved" '[ "$(st np)" = active ]'
+check "the plain copy ran under the review dir" "$(cat "$TMPD/rev-np.use")" "/review/"
+
+# a linked worktree: the copy gets its own .git directory
+git -C "$TMPD" init -q wtmain
+git -C "$TMPD/wtmain" -c user.name=t -c user.email=t@t commit -q --allow-empty -m x
+git -C "$TMPD/wtmain" worktree add -q "$TMPD/wtlinked" -b wtb
+FW=$(t new-window -d -n fw -c "$TMPD/wtlinked" -P -F '#{pane_id}' cat); t set -p -t "$FW" @cntctr_name fw; t set -p -t "$FW" @cntctr_harness claude
+[ -f "$TMPD/wtlinked/.git" ] && ok_ || bad "wtlinked/.git should be a file"
+same "a worktree can publish" "$(publish "$FW" wt 'test -d .git && echo gitdir; git rev-parse --show-toplevel')" "wt v1 pending"
+waitfor "wt approved" '[ "$(st wt)" = active ]'
+check "the worktree copy has its own .git directory" "$(cat "$TMPD/rev-wt.use")" gitdir
+check "git resolves the copy as its own toplevel" "$(cat "$TMPD/rev-wt.use")" "/review/"
+same "the real worktree is unchanged" "$([ -f "$TMPD/wtlinked/.git" ] && echo file)" file
+
+# the author's model
+L2=$(newpane lead2)
+out=$(call "$L2" spawn '{"harness":"claude","name":"am","task":"x","model":"claude-sonnet-5","effort":"low"}')
+AM=$(pane_of "$out")
+same "spawn tags the pane with the model" "$(t show -pqv -t "$AM" @cntctr_model)" claude-sonnet-5
+same "a model-less spawn tags the routed model" "$(t show -pqv -t "$(pane_of "$(call "$L2" spawn '{"harness":"claude","name":"am2","task":"x"}')")" @cntctr_model)" claude-sonnet-5-5
+publish "$AM" ma 'echo m' >/dev/null
+same "the author's model is recorded" "$(sqlite3 "$CNTCTR_DB" "select author_model from tools where name='ma'")" claude-sonnet-5
+waitfor "ma approved" '[ "$(st ma)" = active ]'
+
+# no agy on PATH: a hand-started author escalates; a known model falls back to claude with another model
+mkdir "$TMPD/noagy"
+for c in tmux git jq mktemp mkfifo head tail rm sh bash env cat cp sed basename dirname sleep seq wc sqlite3; do ln -s "$(command -v "$c")" "$TMPD/noagy/$c"; done
+FH=$(newpane hand); t set -p -t "$FH" @cntctr_harness claude
+out=$(PATH="$TMPD/noagy" publish "$FH" hs 'echo h')
+check "no reviewer for an unknown model" "$out" "no reviewer on a different model"
+same "an author with no model escalates" "$(st hs)" escalated
+check "the board asks for a human" "$(board "$FH")" "fleet tool hs v1 needs a human"
+same "the copy was cleaned up" "$(hasdir -hs-v1 && echo left)" ""
+for c in claude headroom; do ln -s "$(command -v "$c")" "$TMPD/noagy/$c"; done   # start_spawn runs claude through headroom
+FM=$(newpane known); t set -p -t "$FM" @cntctr_harness claude; t set -p -t "$FM" @cntctr_model claude-sonnet-5-5
+same "a known model falls back to the same harness" "$(PATH="$TMPD/noagy" publish "$FM" fm 'echo f')" "fm v1 pending"
+waitfor "fm approved" '[ "$(st fm)" = active ]'
+same "the fallback reviewer uses another model" "$(sqlite3 "$CNTCTR_DB" "select reviewer_model from tools where name='fm'")" claude-opus-4-7
 [ -e "$TMPD/gl/realgit/evil" ] && bad "wrote into the symlinked git dir" || ok_
 call "$FG" tool_define '{"name":"gitok","description":"t","input_schema":{"type":"object"},"interpreter":"sh","script":"echo x > other.txt; echo fine"}' >/dev/null
 same "that root is otherwise writable" "$(txt "$(call "$FG" use '{"tool":"gitok"}')")" fine
