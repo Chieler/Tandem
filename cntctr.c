@@ -303,13 +303,9 @@ static void normalize_remote(const char *url, char *out, size_t n) {
     for (char *c = out; *c && *c != '/'; c++) *c = (char)tolower((unsigned char)*c);
 }
 
-static void resolve_project(sqlite3 *db, const char *pane, struct project *p) {
-    char *out = NULL, cwd[4096];
-    if (pane && *pane && TMUX(NULL, &out, "display", "-p", "-t", pane, "#{pane_current_path}") == 0 && *out)
-        snprintf(cwd, sizeof cwd, "%s", out);
-    else if (!getcwd(cwd, sizeof cwd))
-        snprintf(cwd, sizeof cwd, ".");
-    free(out);
+/* The project a process working in `cwd` belongs to. */
+static void resolve_cwd(sqlite3 *db, const char *cwd, struct project *p) {
+    char *out = NULL;
     if (run(NULL, &out, (const char *[]){"git", "-C", cwd, "rev-parse", "--show-toplevel", NULL}) == 0 && *out)
         snprintf(p->root, sizeof p->root, "%s", out);
     else
@@ -328,6 +324,16 @@ static void resolve_project(sqlite3 *db, const char *pane, struct project *p) {
     else
         snprintf(p->key, sizeof p->key, "%s", p->root);
     free(out);
+}
+
+static void resolve_project(sqlite3 *db, const char *pane, struct project *p) {
+    char *out = NULL, cwd[4096];
+    if (pane && *pane && TMUX(NULL, &out, "display", "-p", "-t", pane, "#{pane_current_path}") == 0 && *out)
+        snprintf(cwd, sizeof cwd, "%s", out);
+    else if (!getcwd(cwd, sizeof cwd))
+        snprintf(cwd, sizeof cwd, ".");
+    free(out);
+    resolve_cwd(db, cwd, p);
 }
 
 static char *first_line(const char *text, size_t max) {
@@ -1231,45 +1237,59 @@ static int tool_distill(json_object *a, char **res) {
     return r;
 }
 
-/* Type `text` into every other live agent in the caller's project, and keep it on the project's board. */
-static int tool_post(json_object *a, char **res) {
-    const char *text = sarg(a, "text");
-    if (!text || !*text) return fail(res, fmt("post needs 'text'"));
-    struct project p, q;
-    sqlite3 *db = kb_for_caller(&p, res);
-    if (!db) return 1;
+/* Keep `text` on project `key`'s board and type it into every other live agent in that project. Leaves `db` open. */
+static int post_to(sqlite3 *db, const char *key, const char *text, char **res) {
+    struct project q;
     char *panes;
-    if (kb_post(db, p.key, caller_name, text) != 0) {
-        char *err = fmt("post failed: %s", sqlite3_errmsg(db));
-        sqlite3_close(db);
-        return fail(res, err);
-    }
-    if (TMUX(NULL, &panes, "list-panes", "-a", "-F", "#{pane_id}\t#{pane_dead}\t#{@cntctr_name}") != 0) {
-        sqlite3_close(db);
+    if (kb_post(db, key, caller_name, text) != 0) return fail(res, fmt("post failed: %s", sqlite3_errmsg(db)));
+    if (TMUX(NULL, &panes, "list-panes", "-a", "-F", "#{pane_id}\t#{pane_dead}\t#{pane_current_path}\t#{@cntctr_name}") != 0)
         return fail(res, panes);
-    }
     char *env = fmt("[cntctr board from=%s] %s", caller_name, text), *sent = strdup(""), *skipped = strdup(""), *save, *t;
+    char *seen = strdup("");   /* "\n<path>\t<key>" per path looked up: one lookup per distinct path, not per pane */
     for (char *line = strtok_r(panes, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
-        char *dead = strchr(line, '\t'), *name = dead ? strchr(dead + 1, '\t') : NULL;
+        char *dead = strchr(line, '\t'), *path = dead ? strchr(dead + 1, '\t') : NULL, *name = path ? strchr(path + 1, '\t') : NULL;
         if (!name || !name[1]) continue;
         *dead++ = '\0';
+        *path++ = '\0';
         *name++ = '\0';
         if (strcmp(dead, "0") != 0 || strcmp(line, caller_pane) == 0) continue;
-        resolve_project(db, line, &q);
-        if (strcmp(q.key, p.key) != 0) continue;
+        char *want = fmt("\n%s\t", path), *hit = strstr(seen, want);
+        if (hit) {
+            hit += strlen(want);
+            snprintf(q.key, sizeof q.key, "%.*s", (int)strcspn(hit, "\n"), hit);
+        } else {
+            resolve_cwd(db, path, &q);
+            t = fmt("%s%s%s", seen, want, q.key);
+            free(seen);
+            seen = t;
+        }
+        free(want);
+        if (strcmp(q.key, key) != 0) continue;
         char *err = inject(line, name, env), **list = err ? &skipped : &sent;
         t = err ? fmt("%s %s (%s)", *list, name, err) : fmt("%s %s", *list, name);
         free(*list);
         *list = t;
         free(err);
     }
-    sqlite3_close(db);
+    free(seen);
     free(panes);
     free(env);
     char *r = fmt("posted to%s%s%s", *sent ? sent : " nobody else", *skipped ? "; skipped" : "", skipped);
     free(sent);
     free(skipped);
     return ok(res, r);
+}
+
+/* Type `text` into every other live agent in the caller's project, and keep it on the project's board. */
+static int tool_post(json_object *a, char **res) {
+    const char *text = sarg(a, "text");
+    if (!text || !*text) return fail(res, fmt("post needs 'text'"));
+    struct project p;
+    sqlite3 *db = kb_for_caller(&p, res);
+    if (!db) return 1;
+    int rc = post_to(db, p.key, text, res);
+    sqlite3_close(db);
+    return rc;
 }
 
 static int tool_board(json_object *a, char **res) {
@@ -1431,9 +1451,18 @@ static char *review_copy(const struct project *p, const char *name, int version,
     struct stat sb;
     err = tmux_do(NULL, (const char *[]){"cp", CP_CLONE, src, path, NULL});
     if (!err && lstat(git, &sb) == 0 && S_ISREG(sb.st_mode)) err = worktree_git(p->root, dst);
+    /* a .git symlink that leaves the copy still points at the real repo: copy what it points at in its place */
+    char *real = !err && lstat(git, &sb) == 0 && S_ISLNK(sb.st_mode) ? realpath(dst, NULL) : NULL;
+    size_t n = strlen(path);
+    if (real && !(strncmp(real, path, n) == 0 && real[n] == '/'))
+        if (!(err = tmux_do(NULL, (const char *[]){"rm", "-f", dst, NULL}))) err = tmux_do(NULL, (const char *[]){"cp", CP_CLONE, real, dst, NULL});
+    free(real);
     /* git must see the copy as its own repository, or none at all, never the real checkout */
     if (!err && run(NULL, &out, (const char *[]){"git", "-C", path, "rev-parse", "--show-toplevel", NULL}) == 0 && strcmp(out, path) != 0)
         err = fmt("the review copy resolves to another git checkout");
+    free(out), out = NULL;
+    if (!err && run(NULL, &out, (const char *[]){"git", "-C", path, "rev-parse", "--absolute-git-dir", NULL}) == 0 && !(strncmp(out, path, n) == 0 && out[n] == '/'))
+        err = fmt("the review copy's git dir is outside the copy");
     free(out), free(src), free(git), free(dst);
     return err;
 }
@@ -1453,15 +1482,12 @@ static void review_cleanup(const char *pane, const char *root) {
     if (pane && *pane) free(TMUXE(NULL, "kill-pane", "-t", pane));
 }
 
-/* Ask the project for a human with a board post. */
-static void needs_human(const char *name, int version, const char *why) {
-    json_object *a = json_object_new_object();
+/* Ask project `key` for a human with a board post. */
+static void needs_human(sqlite3 *db, const char *key, const char *name, int version, const char *why) {
     char *text = fmt("fleet tool %s v%d needs a human: %s", name, version, why), *res = NULL;
-    json_object_object_add(a, "text", json_object_new_string(text));
-    tool_post(a, &res);
+    post_to(db, key, text, &res);
     free(res);
     free(text);
-    json_object_put(a);
 }
 
 /* Close every review in `rows` ("<pane>\t<review_root>" lines). */
@@ -1490,16 +1516,28 @@ static void expire_reviews(void) {
         if (!ver) continue;
         *root++ = *name++ = *ver++ = '\0';
         review_cleanup(l, root);
-        needs_human(name, atoi(ver), "its review expired");
+        needs_human(db, p.key, name, atoi(ver), "its review expired");
     }
     free(rows);
+    /* a copy whose review is not bound yet is owned by the pending row its whole name (hash8-name-vN) spells */
+    char *unbound = kb_tool_unbound(db), *ids = strdup("\n");
+    for (char *l = strtok_r(unbound, "\n", &save); l; l = strtok_r(NULL, "\n", &save)) {   /* project, name, version */
+        char *name = strchr(l, '\t'), *ver = name ? strchr(name + 1, '\t') : NULL;
+        if (!ver) continue;
+        *name++ = *ver++ = '\0';
+        char *more = fmt("%s%08x-%s-v%s\n", ids, hash32(l), name, ver);
+        free(ids);
+        ids = more;
+    }
+    free(unbound);
     DIR *d = review_dir(dir) == 0 ? opendir(dir) : NULL;
     for (struct dirent *e; d && (e = readdir(d));) {
-        if (e->d_name[0] == '.' || kb_tool_live(db, e->d_name)) continue;
-        char *root = fmt("%s/%s", dir, e->d_name);
-        review_cleanup(NULL, root);
-        free(root);
+        if (e->d_name[0] == '.') continue;
+        char *root = fmt("%s/%s", dir, e->d_name), *id = fmt("\n%s\n", e->d_name);
+        if (!kb_tool_live(db, root) && !strstr(ids, id)) review_cleanup(NULL, root);
+        free(root), free(id);
     }
+    free(ids);
     if (d) closedir(d);
     sqlite3_close(db);
 }
@@ -1513,7 +1551,7 @@ static const char *reviewer_harness(const char *author_harness) {
 
 /* Make `name` v`version` escalated if it is still pending, and ask for a human. */
 static void escalate(sqlite3 *db, const char *key, const char *name, int version, const char *why) {
-    if (kb_tool_escalate(db, key, name, version) == 1) needs_human(name, version, why);
+    if (kb_tool_escalate(db, key, name, version) == 1) needs_human(db, key, name, version, why);
 }
 
 /* Review `name` v`version`: copy the project, start a reviewer on another model in the copy, and bind it.
@@ -1666,22 +1704,20 @@ static int tool_verdict(json_object *a, char **res) {
         return fail(res, fmt("version %d is %s", version, status));
     }
     char *author = kb_tool_field(db, p.key, name, version, "author"), *root = kb_tool_field(db, p.key, name, version, "review_root");
-    sqlite3_close(db);
     char *text, *pane = author ? find_agent(author) : NULL;
     if (!strcmp(verdict, "approve")) {
         text = fmt("new fleet tool %s v%d by %s; see tools/list", name, version, author ? author : "?");
-        json_object *args = json_object_new_object();
-        json_object_object_add(args, "text", json_object_new_string(text));
-        free(text);
-        tool_post(args, &text);
-        json_object_put(args);
+        char *r = NULL;
+        post_to(db, p.key, text, &r);   /* by key: a sweep may already have unmapped the reviewer's copy */
+        free(r);
     } else if (!strcmp(verdict, "reject")) {
         text = fmt("fleet tool %s v%d was rejected: %s", name, version, reason ? reason : "");
         if (pane) free(inject(pane, author, text));
     } else {
-        needs_human(name, version, reason && *reason ? reason : "the reviewer could not decide");
+        needs_human(db, p.key, name, version, reason && *reason ? reason : "the reviewer could not decide");
         text = NULL;
     }
+    sqlite3_close(db);
     free(text);
     free(pane);
     struct cleanup *c = calloc(1, sizeof *c);

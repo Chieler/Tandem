@@ -47,9 +47,9 @@ txt() { printf '%s' "$1" | jq -r '.result.content[0].text'; }
 iserr() { printf '%s' "$1" | jq -r '.result.isError'; }
 
 screen() { t capture-pane -p -J -t "$1"; }
-# expect_screen <description> <pane> <text>: pass once the pane shows <text> (waits up to 15 s: a board post walks every pane)
+# expect_screen <description> <pane> <text>: pass once the pane shows <text> (waits up to 5 s)
 expect_screen() {
-    for _ in $(seq 150); do screen "$2" | grep -qF -- "$3" && { ok_; return; }; sleep 0.1; done
+    for _ in $(seq 50); do screen "$2" | grep -qF -- "$3" && { ok_; return; }; sleep 0.1; done
     bad "$1" "  pane $2 never showed: $3"
 }
 # lastid <pane>: id of the newest message envelope shown in the pane
@@ -931,6 +931,17 @@ waitfor "wt approved" '[ "$(st wt)" = active ]'
 check "the worktree copy has its own .git directory" "$(cat "$TMPD/rev-wt.use")" gitdir
 check "git resolves the copy as its own toplevel" "$(cat "$TMPD/rev-wt.use")" "/review/"
 same "the real worktree is unchanged" "$([ -f "$TMPD/wtlinked/.git" ] && echo file)" file
+
+# a .git symlink to a directory outside the project: the copy gets that directory's contents, not the link
+git -C "$TMPD" init -q slgit
+git -C "$TMPD/slgit" -c user.name=t -c user.email=t@t commit -q --allow-empty -m x
+mkdir "$TMPD/slproj" && echo 1 > "$TMPD/slproj/f" && ln -s "$TMPD/slgit/.git" "$TMPD/slproj/.git"
+FL=$(t new-window -d -n fl -c "$TMPD/slproj" -P -F '#{pane_id}' cat); t set -p -t "$FL" @cntctr_name fl; t set -p -t "$FL" @cntctr_harness claude
+same "a symlinked .git can publish" "$(publish "$FL" sl 'git branch evil; git rev-parse --absolute-git-dir')" "sl v1 pending"
+waitfor "sl approved" '[ "$(st sl)" = active ]'
+check "the copy's git dir is inside the review dir" "$(cat "$TMPD/rev-sl.use")" "/review/"
+refute "the tool did not reach the real repo's git dir" "$(cat "$TMPD/rev-sl.use")" "slgit"
+same "the real repo has no new branch" "$(git -C "$TMPD/slgit" branch --list evil)" ""
 
 # the author's model
 L2=$(newpane lead2)
