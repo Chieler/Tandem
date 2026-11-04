@@ -19,6 +19,7 @@
 #include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -1457,6 +1458,7 @@ static char *review_copy(const struct project *p, const char *name, int version,
     if (real && !(strncmp(real, path, n) == 0 && real[n] == '/'))
         if (!(err = tmux_do(NULL, (const char *[]){"rm", "-f", dst, NULL}))) err = tmux_do(NULL, (const char *[]){"cp", CP_CLONE, real, dst, NULL});
     free(real);
+    if (!err) utimes(path, NULL);   /* cp -a can give the copy the source's old mtime; the stray sweep goes by age */
     /* git must see the copy as its own repository, or none at all, never the real checkout */
     if (!err && run(NULL, &out, (const char *[]){"git", "-C", path, "rev-parse", "--show-toplevel", NULL}) == 0 && strcmp(out, path) != 0)
         err = fmt("the review copy resolves to another git checkout");
@@ -1501,9 +1503,12 @@ static void close_reviews(char *rows) {
     }
 }
 
+#define STRAY_AGE (30 * 60)   /* a review lasts 20 min; a copy older than this by 10 is a leftover */
+
 /* At the start of every tool_* call and use: escalate reviews past their deadline, close them, and remove
  * review copies that no pending row owns (left by a cntctr that died mid-review). */
 static void expire_reviews(void) {
+    if (fleet_depth) return;   /* a composed call runs inside a tool's deadline: no tmux, git or rm work there */
     char *err = NULL, dir[4096];
     sqlite3 *db = kb(&err);
     free(err);
@@ -1519,25 +1524,15 @@ static void expire_reviews(void) {
         needs_human(db, p.key, name, atoi(ver), "its review expired");
     }
     free(rows);
-    /* a copy whose review is not bound yet is owned by the pending row its whole name (hash8-name-vN) spells */
-    char *unbound = kb_tool_unbound(db), *ids = strdup("\n");
-    for (char *l = strtok_r(unbound, "\n", &save); l; l = strtok_r(NULL, "\n", &save)) {   /* project, name, version */
-        char *name = strchr(l, '\t'), *ver = name ? strchr(name + 1, '\t') : NULL;
-        if (!ver) continue;
-        *name++ = *ver++ = '\0';
-        char *more = fmt("%s%08x-%s-v%s\n", ids, hash32(l), name, ver);
-        free(ids);
-        ids = more;
-    }
-    free(unbound);
     DIR *d = review_dir(dir) == 0 ? opendir(dir) : NULL;
     for (struct dirent *e; d && (e = readdir(d));) {
         if (e->d_name[0] == '.') continue;
-        char *root = fmt("%s/%s", dir, e->d_name), *id = fmt("\n%s\n", e->d_name);
-        if (!kb_tool_live(db, root) && !strstr(ids, id)) review_cleanup(NULL, root);
-        free(root), free(id);
+        char *root = fmt("%s/%s", dir, e->d_name);
+        struct stat sb;
+        /* a young copy may belong to a publish or a verdict still under way: only crash leftovers are old enough to go */
+        if (stat(root, &sb) == 0 && sb.st_mtime < time(NULL) - STRAY_AGE && !kb_tool_live(db, root)) review_cleanup(NULL, root);
+        free(root);
     }
-    free(ids);
     if (d) closedir(d);
     sqlite3_close(db);
 }

@@ -909,9 +909,12 @@ same "expiry posted once" "$(board | grep -c 'fleet tool px v1 needs a human')" 
 deft trig2 'true'
 call "$FR" use '{"tool":"trig2"}' >/dev/null
 same "a second expiry run posts nothing" "$(board | grep -c 'fleet tool px v1 needs a human')" 1
-mkdir -p "$RV/deadbeef-stray-v9"
+mkdir -p "$RV/deadbeef-stray-v9" "$RV/deadbeef-young-v9"
+touch -t "$(date -v-31M +%Y%m%d%H%M.%S 2>/dev/null || date -d '31 minutes ago' +%Y%m%d%H%M.%S)" "$RV/deadbeef-stray-v9"
 call "$FR" use '{"tool":"hello","args":{}}' >/dev/null
-[ ! -d "$RV/deadbeef-stray-v9" ] && ok_ || bad "stray review dir not swept"
+[ ! -d "$RV/deadbeef-stray-v9" ] && ok_ || bad "an old stray review dir is swept"
+[ -d "$RV/deadbeef-young-v9" ] && ok_ || bad "a young stray review dir survives the sweep"
+rmdir "$RV/deadbeef-young-v9"
 tunset CNTCTR_TEST_VERDICT
 
 # a project without git

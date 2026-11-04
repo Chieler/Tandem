@@ -55,7 +55,5 @@ int kb_tool_verdict(sqlite3 *db, const char *project, const char *name, int vers
                     const char *verdict, const char *reason, char status[16]);
 /* Escalate pending rows past their deadline, once. "<pane>\t<review_root>\t<name>\t<version>\n" per row. */
 char *kb_tool_expire(sqlite3 *db, const char *project);
-/* "<project>\t<name>\t<version>\n" per pending row whose review is being set up: its copy exists but is not bound yet. */
-char *kb_tool_unbound(sqlite3 *db);
 int kb_tool_live(sqlite3 *db, const char *review_root);   /* a pending row owns this review dir (its stored review_root) */
 #endif

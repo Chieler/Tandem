@@ -530,10 +530,6 @@ char *kb_tool_expire(sqlite3 *db, const char *project) {
     return out;
 }
 
-char *kb_tool_unbound(sqlite3 *db) {
-    return lines(prep(db, "SELECT project || char(9) || name || char(9) || version FROM tools WHERE status = 'pending' AND review_root IS NULL"));
-}
-
 int kb_tool_live(sqlite3 *db, const char *review_root) {
     sqlite3_stmt *st = prep(db, "SELECT 1 FROM tools WHERE status = 'pending' AND review_root = ?1");
     sqlite3_bind_text(st, 1, review_root, -1, SQLITE_TRANSIENT);
