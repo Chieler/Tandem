@@ -1775,6 +1775,7 @@ static int tool_verdict(json_object *a, char **res) {
     } else if (!strcmp(verdict, "reject")) {
         text = fmt("fleet tool %s v%d was rejected: %s", name, version, reason ? reason : "");
         if (pane) free(inject(pane, author, text));
+        free(announce(db, p.key, caller_name, text, pane));   /* the board keeps the reason if the author's pane is gone */
     } else {
         needs_human(db, p.key, name, version, reason && *reason ? reason : "the reviewer could not decide");
         text = NULL;

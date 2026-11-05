@@ -824,6 +824,7 @@ publish "$FR" pr 'echo r' >/dev/null
 waitfor "pr rejected" '[ "$(st pr)" = rejected ]'
 same "the reject reason is stored" "$(sqlite3 "$CNTCTR_DB" "select verdict_reason from tools where name='pr'")" "reviewer says reject"
 expect_screen "the reason reaches the author" "$FR" "fleet tool pr v1 was rejected: reviewer says reject"
+check "the reject reason is on the board" "$(txt "$(call "$FR" board '{}')")" "fleet tool pr v1 was rejected: reviewer says reject"
 refute "a rejected tool is not listed" "$(lst "$KR")" '"name":"pr"'
 tenv CNTCTR_TEST_VERDICT escalate
 publish "$FR" pe 'echo e' >/dev/null
