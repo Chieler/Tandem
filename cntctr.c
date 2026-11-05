@@ -1437,6 +1437,8 @@ static int review_dir(char dir[4096]) {
     return 0;
 }
 
+static void notify_all(void);
+
 static unsigned hash32(const char *s) {
     unsigned h = 2166136261u;
     for (; *s; s++) h = (h ^ (unsigned char)*s) * 16777619u;
@@ -1747,6 +1749,7 @@ static int tool_verdict(json_object *a, char **res) {
         if (!strcmp(status, "pending")) return fail(res, fmt("only the assigned reviewer can give a verdict"));
         return fail(res, fmt("version %d is %s", version, status));
     }
+    notify_all();
     char *author = kb_tool_field(db, p.key, name, version, "author"), *root = kb_tool_field(db, p.key, name, version, "review_root");
     char *text, *pane = author ? find_agent(author) : NULL;
     if (!strcmp(verdict, "approve")) {
@@ -1786,6 +1789,7 @@ static int tool_revoke(json_object *a, char **res) {
     }
     if (reviews) close_reviews(reviews);
     free(reviews);
+    notify_all();
     char *text = fmt("revoked fleet tool %s", name);
     free(announce(db, p.key, caller_name, text, NULL));
     sqlite3_close(db);
@@ -2149,6 +2153,90 @@ static void respond_error(json_object *id, int code, const char *message) {
     emit(m);
 }
 
+/* ---- live list_changed: one FIFO per cntctr in realpath(/tmp)/cntctr-<uid>/tools ---- */
+
+static char fifo_path[PATH_MAX];
+static int fifo_warned;
+
+/* The directory, made here and owned by us alone. /tmp itself needn't be ours (root-owned on macOS), only sticky. */
+static int fifo_dir(char dir[4096]) {
+    char base[PATH_MAX];
+    struct stat sb;
+    int ok = realpath("/tmp", base) && stat(base, &sb) == 0 && (sb.st_mode & S_ISVTX);
+    for (int i = 0; ok && i < 2; i++) {
+        snprintf(dir, 4096, i ? "%s/cntctr-%d/tools" : "%s/cntctr-%d", base, (int)getuid());
+        ok = (mkdir(dir, 0700) == 0 || errno == EEXIST) && lstat(dir, &sb) == 0 && S_ISDIR(sb.st_mode)
+             && sb.st_uid == getuid() && (sb.st_mode & 0777) == 0700;
+    }
+    if (!ok && !fifo_warned++) fprintf(stderr, "cntctr: tool notifications disabled: /tmp/cntctr-%d/tools is not a private directory of ours\n", (int)getuid());
+    return ok ? 0 : -1;
+}
+
+/* Wake every cntctr of ours: one byte into each FIFO; the ones nobody reads any more are removed. */
+static void notify_all(void) {
+    char dir[4096];
+    DIR *d = fifo_dir(dir) == 0 ? opendir(dir) : NULL;
+    for (struct dirent *e; d && (e = readdir(d));) {
+        size_t n = strlen(e->d_name);
+        if (n < 6 || strcmp(e->d_name + n - 5, ".fifo") != 0) continue;
+        char path[4200];
+        snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+        int fd = open(path, O_WRONLY | O_NONBLOCK), gone = fd < 0 && errno == ENXIO;
+        if (fd >= 0) {
+            ssize_t w;
+            while ((w = write(fd, "x", 1)) < 0 && errno == EINTR) {}
+            gone = w < 0 && errno == EPIPE;   /* EAGAIN: a wake is already pending */
+            close(fd);
+        }
+        if (gone) unlink(path);
+    }
+    if (d) closedir(d);
+}
+
+/* Turn any bytes in our FIFO into one list_changed; a burst is one notification. */
+static void *fifo_watch(void *arg) {
+    struct pollfd pf = {(int)(intptr_t)arg, POLLIN, 0};
+    char buf[256];
+    for (;;) {
+        if (poll(&pf, 1, -1) < 1) {
+            if (errno == EINTR) continue;
+            return NULL;
+        }
+        while (read(pf.fd, buf, sizeof buf) > 0) {}   /* until EAGAIN: our own keepalive writer means never EOF */
+        json_object *m = json_object_new_object();
+        json_object_object_add(m, "jsonrpc", json_object_new_string("2.0"));
+        json_object_object_add(m, "method", json_object_new_string("notifications/tools/list_changed"));
+        emit(m);
+    }
+}
+
+/* After initialize: create <pid>.fifo, read it nonblocking, and hold a writer so it never reads EOF.
+ * It is built under a name notify_all skips, so nobody sees it before it has a reader. */
+static void fifo_register(void) {
+    char dir[4096], tmp[4200];
+    if (*fifo_path || fifo_dir(dir) != 0) return;
+    snprintf(tmp, sizeof tmp, "%s/%d.tmp", dir, (int)getpid());
+    snprintf(fifo_path, sizeof fifo_path, "%s/%d.fifo", dir, (int)getpid());
+    unlink(tmp);
+    int rd = -1, wr = -1, ok = 0;
+    pthread_t th;
+    if (mkfifo(tmp, 0600) == 0) {
+        rd = open(tmp, O_RDONLY | O_NONBLOCK);
+        wr = rd >= 0 ? open(tmp, O_WRONLY) : -1;
+        ok = wr >= 0 && rename(tmp, fifo_path) == 0 && pthread_create(&th, NULL, fifo_watch, (void *)(intptr_t)rd) == 0;
+    }
+    if (ok) {
+        pthread_detach(th);
+        return;
+    }
+    fprintf(stderr, "cntctr: tool notifications disabled: cannot set up %s\n", fifo_path);
+    unlink(tmp);
+    unlink(fifo_path);
+    *fifo_path = '\0';
+    if (rd >= 0) close(rd);
+    if (wr >= 0) close(wr);
+}
+
 static const char GUIDE[] =
     "cntctr keeps a knowledge store shared by all agents (Claude, Codex, agy) across sessions. "
     "Before exploring a codebase or problem, call recall: no query lists the index, a query searches; read shows an entry in full. "
@@ -2188,7 +2276,9 @@ static json_object *initialize(json_object *params) {
     find_self();
 
     json_object *r = json_object_new_object(), *caps = json_object_new_object(), *server = json_object_new_object();
-    json_object_object_add(caps, "tools", json_object_new_object());
+    json_object *tcap = json_object_new_object();
+    json_object_object_add(tcap, "listChanged", json_object_new_boolean(1));
+    json_object_object_add(caps, "tools", tcap);
     json_object_object_add(server, "name", json_object_new_string("cntctr"));
     json_object_object_add(server, "version", json_object_new_string("0.1.0"));
     json_object_object_add(r, "protocolVersion", json_object_new_string(version ? version : "2025-06-18"));
@@ -2255,7 +2345,10 @@ static void handle(const char *line) {
     if (method && strcmp(method, "tools/call") == 0) { start_call(req); return; }   /* the thread owns req now */
 
     if (!method) respond_error(id, -32600, "invalid request");
-    else if (strcmp(method, "initialize") == 0) respond(id, initialize(params));
+    else if (strcmp(method, "initialize") == 0) {
+        respond(id, initialize(params));
+        fifo_register();
+    }
     else if (strcmp(method, "ping") == 0) respond(id, json_object_new_object());
     else if (strcmp(method, "tools/list") == 0) respond(id, tools_list());
     else if (strcmp(method, "notifications/cancelled") == 0) {
@@ -2335,6 +2428,7 @@ int main(int argc, char **argv) {
     size_t cap = 0;
     while (getline(&line, &cap, stdin) > 0) handle(line);
     free(line);
+    if (*fifo_path) unlink(fifo_path);
     /* Client gone: blocking sends stop within one wait slice and their replies
      * go to the pane instead. */
     cancel(NULL);

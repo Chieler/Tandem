@@ -35,13 +35,15 @@ session() {
     TMUX_PANE=$pane "$BIN" < "$fifo" | {
         exec 3> "$fifo"
         printf '%s\n' "$@" >&3
-        head -n "$n"
+        while [ "$n" -gt 0 ] && IFS= read -r l; do
+            case ${SKIP:+$l} in '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}') ;; *) printf '%s\n' "$l"; n=$((n - 1)) ;; esac
+        done
         exec 3>&-
     }
     rm -f "$fifo"
 }
 call() {
-    session "$1" 2 "$INIT" "$(printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"%s","arguments":%s}}' "$2" "$3")" | tail -n 1
+    SKIP=1 session "$1" 2 "$INIT" "$(printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"%s","arguments":%s}}' "$2" "$3")" | tail -n 1
 }
 txt() { printf '%s' "$1" | jq -r '.result.content[0].text'; }
 iserr() { printf '%s' "$1" | jq -r '.result.isError'; }
@@ -615,7 +617,7 @@ FA=$(newpane fa)
 FB=$(newpane fb)
 def='{"name":"hello","description":"Say hello","input_schema":{"type":"object","properties":{"who":{"type":"string"}},"required":["who"]},"interpreter":"sh","script":"read a; echo \"hi $a\""}'
 same "define saves a draft" "$(txt "$(call "$FA" tool_define "$def")")" "saved draft hello"
-lst() { session "$1" 2 "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | tail -n 1; }
+lst() { SKIP=1 session "$1" 2 "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | tail -n 1; }
 check "draft listed for its author" "$(lst "$FA")" '"name":"hello"'
 check "fleet tool is marked" "$(lst "$FA")" '[fleet] Say hello'
 refute "draft hidden from others" "$(lst "$FB")" '"name":"hello"'
@@ -1061,6 +1063,40 @@ wait $bgp
 same "a revoke before the bind leaves v1 revoked" "$(st rpb 1)" revoked
 waitfor "the unbound review's copy is cleaned up" '! hasdir -rpb-v1'
 waitfor "the unbound review's pane is closed" '! haspane -rpb-v1'
+
+# propagation: list_changed through per-process FIFOs in the real, private tools dir
+TD="$(dirname "$RV")/tools"
+LC='{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}'
+LIST='{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+revcall() { printf '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"tool_revoke","arguments":{"name":"%s","reason":"t"}}}' "$1"; }
+check "initialize advertises listChanged" "$(rpc "$INIT")" '"listChanged":true'
+tenv CNTCTR_TEST_VERDICT approve
+session "$KA" 4 "$INIT" "$LIST" | while read -r l; do echo "$l" >> "$TMPD/lc1"; done & lc1=$!
+waitfor "the listener registered a FIFO" '[ "$(grep -c . "$TMPD/lc1")" = 2 ] && ls "$TD" | grep -q "\.fifo$"'
+same "the tools dir is private" "$(stat -f %Lp "$TD" 2>/dev/null || stat -c %a "$TD")" 700
+publish "$FR" lcn 'echo 1' >/dev/null
+waitfor "lcn approved" '[ "$(st lcn)" = active ]'
+waitfor "an approval notifies another cntctr" 'grep -qxF "$LC" "$TMPD/lc1"'
+sleep 1
+same "one approval gives one notification" "$(grep -cxF "$LC" "$TMPD/lc1")" 1
+own=$(session "$KR" 3 "$INIT" "$(revcall lcn)")
+check "the revoker's own cntctr is notified" "$own" "$LC"
+wait $lc1
+same "a revoke notifies too" "$(grep -cxF "$LC" "$TMPD/lc1")" 2
+session "$KA" 3 "$INIT" "$LIST" | while read -r l; do echo "$l" >> "$TMPD/lc2"; done & lc2=$!
+waitfor "the second listener registered" '[ "$(grep -c . "$TMPD/lc2")" = 2 ]'
+for n in lcb1 lcb2 lcb3; do publish "$FR" $n 'echo b' >/dev/null; done
+waitfor "the burst is approved" '[ "$(st lcb1)$(st lcb2)$(st lcb3)" = activeactiveactive ]'
+wait $lc2
+check "a burst notifies after the last commit" "$(cat "$TMPD/lc2")" "$LC"
+mkfifo "$TD/999999.fifo"
+call "$KR" tool_revoke '{"name":"lcb1","reason":"t"}' >/dev/null
+waitfor "a FIFO with no reader is unlinked" '[ ! -e "$TD/999999.fifo" ]'
+chmod 755 "$TD"
+off=$(session "$KA" 2 "$INIT" "$(revcall lcb2)" 2>"$TMPD/lc.err")
+chmod 700 "$TD"
+same "a loose tools dir sends nothing" "$(printf '%s' "$off" | grep -cF "$LC")" 0
+same "a loose tools dir logs once" "$(grep -c 'notifications disabled' "$TMPD/lc.err")" 1
 fi
 
 # ---- summary ----
