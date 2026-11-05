@@ -19,6 +19,7 @@ pass=0 fail=0
 ok_() { pass=$((pass + 1)); }
 bad() { fail=$((fail + 1)); printf 'FAIL: %s\n' "$@"; }
 same() { [ "$2" = "$3" ] && ok_ || bad "$1" "  want: $3" "  got:  $2"; }
+sq() { sqlite3 -cmd '.timeout 5000' "$@" || { echo "FATAL: sqlite3 failed: $*" >&2; exit 1; }; }
 check() { case $2 in *"$3"*) ok_ ;; *) bad "$1" "  want substring: $3" "  got: $2" ;; esac; }
 refute() { case $2 in *"$3"*) bad "$1" "  unexpected: $3" ;; *) ok_ ;; esac; }
 
@@ -635,7 +636,7 @@ for c in tmux git jq mktemp mkfifo head tail rm sh bash env cat; do ln -s "$(com
 same "interpreter must be on PATH" "$(txt "$(PATH="$TMPD/nonode" call "$FA" tool_define "$(bad_def '.interpreter="node"')")")" "interpreter node not found on PATH"
 # resolver precedence, with rows inserted directly
 PK=$(txt "$(call "$FA" project '{}')" | sed 's/^project \(.*\) (root .*/\1/')
-row() { sqlite3 "$CNTCTR_DB" "INSERT INTO tools(project,name,version,status,author,description,input_schema,interpreter,script,reviewer_pane) VALUES ('$1','$2',$3,'$4','$5','$6','{\"type\":\"object\"}','sh','true','$7')"; }
+row() { sq "$CNTCTR_DB" "INSERT INTO tools(project,name,version,status,author,description,input_schema,interpreter,script,reviewer_pane) VALUES ('$1','$2',$3,'$4','$5','$6','{\"type\":\"object\"}','sh','true','$7')"; }
 dnamed() { bad_def ".name=\"$1\" | .description=\"$2\""; }
 call "$FA" tool_define "$(dnamed dup "Desc A")" > /dev/null
 call "$FB" tool_define "$(dnamed dup "Desc B")" > /dev/null
@@ -646,7 +647,7 @@ refute "the other author does not see the first" "$(lst "$FB")" 'Desc A'
 call "$FA" tool_define "$(dnamed dup "Desc A2")" > /dev/null
 check "a redefined draft replaces the old one" "$(lst "$FA")" '[fleet] Desc A2'
 refute "the old draft text is gone" "$(lst "$FA")" '[fleet] Desc A"'
-same "one draft per author and name" "$(sqlite3 "$CNTCTR_DB" "SELECT count(*) FROM tools WHERE name='dup' AND author='fa'")" "1"
+same "one draft per author and name" "$(sq "$CNTCTR_DB" "SELECT count(*) FROM tools WHERE name='dup' AND author='fa'")" "1"
 row "$PK" prec 1 active fc "project active" ""
 call "$FA" tool_define "$(dnamed prec "my draft")" > /dev/null
 check "own draft beats the project active row" "$(lst "$FA")" '[fleet] my draft'
@@ -681,7 +682,7 @@ refute "the older project version is hidden" "$(lst "$FB")" 'p1-desc'
 refute "the project row beats the global one" "$(lst "$FB")" 'g-desc'
 row "$PK" ord 4 revoked x "v4-desc" ""
 refute "a revoked newest row hides the name from others" "$(lst "$FB")" '"name":"ord"'
-sqlite3 "$CNTCTR_DB" "DELETE FROM tools WHERE project='$PK' AND name='ord'"
+sq "$CNTCTR_DB" "DELETE FROM tools WHERE project='$PK' AND name='ord'"
 check "the global row shows once the project rows are gone" "$(lst "$FB")" '[fleet] g-desc'
 
 # ---- fleet tool runner ----
@@ -695,7 +696,7 @@ same "unknown tool" "$(iserr "$(use nope)")" true
 check "unknown tool text" "$(txt "$(use nope)")" "unknown tool"
 check "unknown name through dispatch" "$(txt "$(call "$FR" nope '{}')")" "unknown tool"
 row "$RK" rv 1 revoked fc "was bad" ""
-sqlite3 "$CNTCTR_DB" "UPDATE tools SET verdict_reason='bad idea' WHERE name='rv' AND project='$RK'"
+sq "$CNTCTR_DB" "UPDATE tools SET verdict_reason='bad idea' WHERE name='rv' AND project='$RK'"
 same "revoked tool says why" "$(txt "$(use rv)")" "tool rv was revoked: bad idea"
 same "revoked tool through dispatch" "$(txt "$(call "$FR" rv '{}')")" "tool rv was revoked: bad idea"
 deft hello 'read a; echo "hi $a"'
@@ -763,11 +764,11 @@ done
 check "DB under the project root disables fleet tools" "$(CNTCTR_DB="$TMPD/repo/kb2.db"; export CNTCTR_DB; deft dbin 'echo hi'; txt "$(use dbin)")" "fleet tools are disabled here because the knowledge DB is inside this project; move CNTCTR_DB"
 row "$RK" cnt 1 active fc "counts" ""
 row "$RK" cntf 1 active fc "counts" ""
-sqlite3 "$CNTCTR_DB" "UPDATE tools SET script='exit 3' WHERE name='cntf' AND project='$RK'"
+sq "$CNTCTR_DB" "UPDATE tools SET script='exit 3' WHERE name='cntf' AND project='$RK'"
 use cnt >/dev/null; use cntf >/dev/null
-same "good calls are counted" "$(sqlite3 "$CNTCTR_DB" "SELECT calls || '/' || failures FROM tools WHERE name='cnt' AND project='$RK'")" "1/0"
-same "failed calls are counted" "$(sqlite3 "$CNTCTR_DB" "SELECT calls || '/' || failures FROM tools WHERE name='cntf' AND project='$RK'")" "1/1"
-same "draft calls are not counted" "$(sqlite3 "$CNTCTR_DB" "SELECT sum(calls) FROM tools WHERE name='fails' AND project='$RK'")" 0
+same "good calls are counted" "$(sq "$CNTCTR_DB" "SELECT calls || '/' || failures FROM tools WHERE name='cnt' AND project='$RK'")" "1/0"
+same "failed calls are counted" "$(sq "$CNTCTR_DB" "SELECT calls || '/' || failures FROM tools WHERE name='cntf' AND project='$RK'")" "1/1"
+same "draft calls are not counted" "$(sq "$CNTCTR_DB" "SELECT sum(calls) FROM tools WHERE name='fails' AND project='$RK'")" 0
 # .git as a symlink to a directory inside the root: the target must be read-only too
 mkdir "$TMPD/gl"
 git -C "$TMPD/gl" init -q
@@ -781,17 +782,17 @@ RV="$(realpath /tmp)/cntctr-$(id -u)/review"
 tenv() { t set-environment -g "$1" "$2"; }
 tunset() { t set-environment -gu "$1"; }
 waitfor() { local d=$1; shift; for _ in $(seq 150); do eval "$@" && { ok_; return; }; sleep 0.1; done; bad "$d"; }
-st() { sqlite3 "$CNTCTR_DB" "select status from tools where name='$1' and version=${2:-1}"; }
+st() { sq "$CNTCTR_DB" "select status from tools where name='$1' and version=${2:-1}"; }
 hasdir() { ls "$RV" 2>/dev/null | grep -qF -- "$1"; }
 haspane() { t list-panes -a -F '#{@cntctr_name}' | grep -qF -- "$1"; }
-nmap() { sqlite3 "$CNTCTR_DB" "select count(*) from projects where root like '%/review/%'"; }
+nmap() { sq "$CNTCTR_DB" "select count(*) from projects where root like '%/review/%'"; }
 pubdef() { jq -nc --arg n "$1" --arg s "$2" --arg d "${3:-desc of $1}" '{name:$n,description:$d,input_schema:{type:"object"},interpreter:"sh",script:$s,publish:true}'; }
 publish() { txt "$(call "$1" tool_define "$(pubdef "${@:2}")")"; }
 board() { txt "$(call "${1:-$FR}" board '{"limit":200}')"; }
 t set -p -t "$FR" @cntctr_harness claude
 
 same "the gate runs before publishing" "$(publish "$FR" Bad_Name 'true')" "name must match ^[a-z][a-z0-9_]{1,40}\$"
-same "a failed gate stores nothing" "$(sqlite3 "$CNTCTR_DB" "select count(*) from tools where name='Bad_Name'")" 0
+same "a failed gate stores nothing" "$(sq "$CNTCTR_DB" "select count(*) from tools where name='Bad_Name'")" 0
 
 # approve: the review copy has the untracked file; the tool runs there, not on the real tree
 echo untracked > "$TMPD/repo/u.txt"
@@ -802,9 +803,9 @@ check "the copy includes the untracked file" "$(cat "$TMPD/rev-pw.use")" untrack
 check "the copy lives under the review dir" "$(cat "$TMPD/rev-pw.use")" "/cntctr-$(id -u)/review/"
 check "the copy is named by project, tool and version" "$(cat "$TMPD/rev-pw.use")" "-pw-v1"
 same "approved status" "$(st pw)" active
-same "the draft was consumed by publishing" "$(sqlite3 "$CNTCTR_DB" "select count(*) from tools where name='pw' and status='draft'")" 0
-check "the reviewer ran on a different harness's model" "$(sqlite3 "$CNTCTR_DB" "select reviewer_model from tools where name='pw'")" gemini
-same "the reviewer was deadline-bound" "$(sqlite3 "$CNTCTR_DB" "select deadline - created from tools where name='pw'")" 1200
+same "the draft was consumed by publishing" "$(sq "$CNTCTR_DB" "select count(*) from tools where name='pw' and status='draft'")" 0
+check "the reviewer ran on a different harness's model" "$(sq "$CNTCTR_DB" "select reviewer_model from tools where name='pw'")" gemini
+same "the reviewer was deadline-bound" "$(sq "$CNTCTR_DB" "select deadline - created from tools where name='pw'")" 1200
 check "other agent in project sees it" "$(lst "$KR")" '"name":"pw"'
 refute "an agent in another project does not" "$(lst "$FG")" '"name":"pw"'
 waitfor "review copy removed" '! hasdir -pw-v1'
@@ -822,14 +823,14 @@ tunset CNTCTR_TEST_FAST
 tenv CNTCTR_TEST_VERDICT reject
 publish "$FR" pr 'echo r' >/dev/null
 waitfor "pr rejected" '[ "$(st pr)" = rejected ]'
-same "the reject reason is stored" "$(sqlite3 "$CNTCTR_DB" "select verdict_reason from tools where name='pr'")" "reviewer says reject"
+same "the reject reason is stored" "$(sq "$CNTCTR_DB" "select verdict_reason from tools where name='pr'")" "reviewer says reject"
 expect_screen "the reason reaches the author" "$FR" "fleet tool pr v1 was rejected: reviewer says reject"
 check "the reject reason is on the board" "$(txt "$(call "$FR" board '{}')")" "fleet tool pr v1 was rejected: reviewer says reject"
 refute "a rejected tool is not listed" "$(lst "$KR")" '"name":"pr"'
 tenv CNTCTR_TEST_VERDICT escalate
 publish "$FR" pe 'echo e' >/dev/null
 waitfor "pe escalated" '[ "$(st pe)" = escalated ]'
-same "escalating clears the reviewer's authority" "$(sqlite3 "$CNTCTR_DB" "select reviewer_pane is null from tools where name='pe'")" 1
+same "escalating clears the reviewer's authority" "$(sq "$CNTCTR_DB" "select reviewer_pane is null from tools where name='pe'")" 1
 check "the board asks for a human" "$(board)" "fleet tool pe v1 needs a human"
 expect_screen "the author sees the request" "$FR" "fleet tool pe v1 needs a human"
 refute "an escalated tool is not listed" "$(lst "$KR")" '"name":"pe"'
@@ -850,7 +851,7 @@ same "escalate sets the status" "$(st ea)" escalated
 same "approve after escalate is refused" "$(txt "$(call "$ER" tool_verdict '{"name":"ea","version":1,"verdict":"approve","reason":"x"}')")" "version 1 is escalated"
 same "the refused approval changed nothing" "$(st ea)" escalated
 same "a verdict on an unknown version" "$(txt "$(call "$ER" tool_verdict '{"name":"ea","version":9,"verdict":"approve"}')")" "unknown tool ea version 9"
-sqlite3 "$CNTCTR_DB" "insert into tools(project,name,version,status,author,description,input_schema,interpreter,script) values ('$RK','ub',1,'pending','fc','unbound','{\"type\":\"object\"}','sh','true')"
+sq "$CNTCTR_DB" "insert into tools(project,name,version,status,author,description,input_schema,interpreter,script) values ('$RK','ub',1,'pending','fc','unbound','{\"type\":\"object\"}','sh','true')"
 UB=$(t new-window -d -n ub -c "$TMPD/repo" -P -F '#{pane_id}' cat); t set -p -t "$UB" @cntctr_name toolcheck-aaaaaaaa-ub-v1
 same "use before binding says to retry" "$(txt "$(call "$UB" use '{"tool":"ub"}')")" "review not bound yet; retry in a few seconds"
 same "a verdict before binding says to retry" "$(txt "$(call "$UB" tool_verdict '{"name":"ub","version":1,"verdict":"approve"}')")" "review not bound yet; retry in a few seconds"
@@ -859,10 +860,10 @@ same "a verdict before binding says to retry" "$(txt "$(call "$UB" tool_verdict 
 tenv CNTCTR_TEST_VERDICT none
 SR=$(newpane sr)   # superseding closes the old reviewer's pane
 row "$RK" sv 1 pending fc "old" "$SR"
-sqlite3 "$CNTCTR_DB" "update tools set deadline=strftime('%s','now')+1200 where name='sv'"
+sq "$CNTCTR_DB" "update tools set deadline=strftime('%s','now')+1200 where name='sv'"
 same "v2 is published over a pending v1" "$(publish "$FR" sv 'echo 2')" "sv v2 pending"
 same "v1 was superseded" "$(st sv 1)" rejected
-same "the supersede reason is stored" "$(sqlite3 "$CNTCTR_DB" "select verdict_reason from tools where name='sv' and version=1")" superseded
+same "the supersede reason is stored" "$(sq "$CNTCTR_DB" "select verdict_reason from tools where name='sv' and version=1")" superseded
 same "a late verdict on v1 is refused" "$(txt "$(call "$FR" tool_verdict '{"name":"sv","version":1,"verdict":"approve"}')")" "version 1 is rejected"
 same "v2 is pending" "$(st sv 2)" pending
 
@@ -872,7 +873,7 @@ publish "$FR" rs 'echo 1' "rs one" >/dev/null
 waitfor "rs v1 active" '[ "$(st rs 1)" = active ]'
 tenv CNTCTR_TEST_VERDICT none
 publish "$FR" rs 'echo 2' "rs two" >/dev/null
-RP=$(sqlite3 "$CNTCTR_DB" "select reviewer_pane from tools where name='rs' and version=2")
+RP=$(sq "$CNTCTR_DB" "select reviewer_pane from tools where name='rs' and version=2")
 check "the reviewer has a pane" "$RP" "%"
 check "the reviewer gets the pending version" "$(lst "$RP")" "[fleet] rs two"
 check "everyone else keeps v1" "$(lst "$KR")" "[fleet] rs one"
@@ -896,18 +897,18 @@ waitfor "the held review's copy is cleaned up" '! hasdir -br-v1'
 waitfor "the held review's pane is closed" '! haspane -br-v1'
 CNTCTR_TEST_HOLD_BIND=2 call "$FR" tool_define "$(pubdef bq 'echo 1')" > "$TMPD/bq1.out" & bgp=$!
 waitfor "bq v1's reviewer is spawned" 'haspane -bq-v1'
-sqlite3 "$CNTCTR_DB" "update tools set status='revoked', verdict_reason='gone' where name='bq' and version=1"
+sq "$CNTCTR_DB" "update tools set status='revoked', verdict_reason='gone' where name='bq' and version=1"
 wait $bgp
 same "a revoke during the bind leaves v1 revoked" "$(st bq 1)" revoked
 waitfor "the revoked review's copy is cleaned up" '! hasdir -bq-v1'
 waitfor "the revoked review's pane is closed" '! haspane -bq-v1'
-same "no copy mapping is left" "$(sqlite3 "$CNTCTR_DB" "select count(*) from projects where root like '%-bq-v1' or root like '%-br-v1'")" 0
+same "no copy mapping is left" "$(sq "$CNTCTR_DB" "select count(*) from projects where root like '%-bq-v1' or root like '%-br-v1'")" 0
 
 # expiry: after the publisher is gone, the next tool_* call escalates once and cleans up
 publish "$FR" px 'echo x' >/dev/null
 same "px is pending" "$(st px)" pending
 check "px has a review copy" "$(ls "$RV")" "-px-v1"
-sqlite3 "$CNTCTR_DB" "update tools set deadline=0 where name='px' and status='pending'"
+sq "$CNTCTR_DB" "update tools set deadline=0 where name='px' and status='pending'"
 deft trig 'true'
 same "an expired review is escalated" "$(st px)" escalated
 waitfor "the expired review's copy is removed" '! hasdir -px-v1'
@@ -973,7 +974,7 @@ AM=$(pane_of "$out")
 same "spawn tags the pane with the model" "$(t show -pqv -t "$AM" @cntctr_model)" claude-sonnet-5
 same "a model-less spawn tags the routed model" "$(t show -pqv -t "$(pane_of "$(call "$L2" spawn '{"harness":"claude","name":"am2","task":"x"}')")" @cntctr_model)" claude-sonnet-5-5
 publish "$AM" ma 'echo m' >/dev/null
-same "the author's model is recorded" "$(sqlite3 "$CNTCTR_DB" "select author_model from tools where name='ma'")" claude-sonnet-5
+same "the author's model is recorded" "$(sq "$CNTCTR_DB" "select author_model from tools where name='ma'")" claude-sonnet-5
 waitfor "ma approved" '[ "$(st ma)" = active ]'
 
 # no agy on PATH: a hand-started author escalates; a known model falls back to claude with another model
@@ -989,7 +990,7 @@ for c in claude headroom; do ln -s "$(command -v "$c")" "$TMPD/noagy/$c"; done  
 FM=$(newpane known); t set -p -t "$FM" @cntctr_harness claude; t set -p -t "$FM" @cntctr_model claude-sonnet-5-5
 same "a known model falls back to the same harness" "$(PATH="$TMPD/noagy" publish "$FM" fm 'echo f')" "fm v1 pending"
 waitfor "fm approved" '[ "$(st fm)" = active ]'
-same "the fallback reviewer uses another model" "$(sqlite3 "$CNTCTR_DB" "select reviewer_model from tools where name='fm'")" claude-opus-4-7
+same "the fallback reviewer uses another model" "$(sq "$CNTCTR_DB" "select reviewer_model from tools where name='fm'")" claude-opus-4-7
 [ -e "$TMPD/gl/realgit/evil" ] && bad "wrote into the symlinked git dir" || ok_
 call "$FG" tool_define '{"name":"gitok","description":"t","input_schema":{"type":"object"},"interpreter":"sh","script":"echo x > other.txt; echo fine"}' >/dev/null
 same "that root is otherwise writable" "$(txt "$(call "$FG" use '{"tool":"gitok"}')")" fine
@@ -1000,7 +1001,7 @@ deft rc 'cntctr call recall "{\"query\":\"copy-mode\"}"'
 check "tool can recall" "$(txt "$(use rc)")" "Enter in copy-mode"
 deft nt 'cntctr call note "{\"layer\":\"insight\",\"title\":\"from tool\",\"summary\":\"s\",\"from\":\"someone-else\"}"'
 use nt >/dev/null
-same "note from a tool is authored by the caller" "$(sqlite3 "$CNTCTR_DB" "select agent from entries where title='from tool'")" fr
+same "note from a tool is authored by the caller" "$(sq "$CNTCTR_DB" "select agent from entries where title='from tool'")" fr
 deft sp 'cntctr call spawn "{}"'
 check "spawn is not callable from a tool" "$(txt "$(use sp)")" "tool spawn is not callable from a fleet tool"
 deft deep 'cntctr call use "{\"tool\":\"deep\",\"args\":{}}"'
@@ -1021,7 +1022,7 @@ out=$(use flood)
 check "unread composition replies are capped" "$(txt "$out")" "unread"
 same "cntctr survives the flood" "$(txt "$(use inner)")" inner-ok
 check "call outside a tool fails" "$("$BIN" call recall '{}' 2>&1)" "cntctr call works only inside a fleet tool"
-check "calls are logged as history" "$(sqlite3 "$CNTCTR_DB" "SELECT group_concat(title) FROM entries WHERE layer='history' AND title LIKE 'tool fails v0 fr %'")" "tool fails v0 fr fail"
+check "calls are logged as history" "$(sq "$CNTCTR_DB" "SELECT group_concat(title) FROM entries WHERE layer='history' AND title LIKE 'tool fails v0 fr %'")" "tool fails v0 fr fail"
 
 # revoke: use refuses, the fleet is told, a later version lists, no older version comes back
 tenv CNTCTR_TEST_VERDICT approve
@@ -1118,7 +1119,7 @@ publish "$FR" hp 'echo one' "hp one" >/dev/null
 waitfor "hp v1 active" '[ "$(st hp 1)" = active ]'
 publish "$FR" hp 'echo two' "hp two" >/dev/null
 waitfor "hp v2 active" '[ "$(st hp 2)" = active ]'
-sqlite3 "$CNTCTR_DB" "update tools set calls=0 where name='hp'"   # the reviewer's trial run counted one
+sq "$CNTCTR_DB" "update tools set calls=0 where name='hp'"   # the reviewer's trial run counted one
 same "list shows the live version" "$(cli list | grep '^hp ')" "hp v2 active net=0 calls=0 failures=0 promote?=no"
 out=$(cli show hp)
 check "show lists an older version" "$out" "v1 revoked"
@@ -1126,15 +1127,15 @@ check "show lists the live version" "$out" "v2 active"
 check "show prints the script" "$out" "echo two"
 check "show names the models" "$out" "author model unknown, reviewer model gemini"
 check "show gives the verdict" "$out" "verdict: superseded"
-sqlite3 "$CNTCTR_DB" "update tools set calls=17 where name='hp' and version=2"
+sq "$CNTCTR_DB" "update tools set calls=17 where name='hp' and version=2"
 call "$FR" use '{"tool":"hp"}' >/dev/null
 call "$KR" use '{"tool":"hp"}' >/dev/null
 check "promote? stays off with two agents" "$(cli list | grep '^hp ')" "promote?=no"
 call "$HQ" use '{"tool":"hp"}' >/dev/null
 check "promote? turns on at 20 calls from 3 agents" "$(cli list | grep '^hp ')" "calls=20 failures=0 promote?=yes"
-sqlite3 "$CNTCTR_DB" "update tools set failures=1 where name='hp' and version=2"
+sq "$CNTCTR_DB" "update tools set failures=1 where name='hp' and version=2"
 check "promote? needs a failure rate under 5%" "$(cli list | grep '^hp ')" "promote?=no"
-sqlite3 "$CNTCTR_DB" "update tools set failures=0 where name='hp' and version=2"
+sq "$CNTCTR_DB" "update tools set failures=0 where name='hp' and version=2"
 
 # promote? counts the current version only: three agents used v1, one agent makes 20 calls of v2
 publish "$FR" pc 'echo 1' >/dev/null
@@ -1143,18 +1144,18 @@ for p in "$FR" "$KR" "$HQ"; do call "$p" use '{"tool":"pc"}' >/dev/null; done
 publish "$FR" pc 'echo 2' >/dev/null
 waitfor "pc v2 active" '[ "$(st pc 2)" = active ]'
 call "$FR" use '{"tool":"pc"}' >/dev/null
-sqlite3 "$CNTCTR_DB" "update tools set calls=20 where name='pc' and version=2"
+sq "$CNTCTR_DB" "update tools set calls=20 where name='pc' and version=2"
 check "promote? ignores the agents of older versions" "$(cli list | grep '^pc ')" "calls=20 failures=0 promote?=no"
 
 same "promote copies the live version to global" "$(cli promote hp)" "promoted hp v2 to global v1"
-same "promote records its source" "$(sqlite3 "$CNTCTR_DB" "select source from tools where project='global' and name='hp'")" "$RK/hp/v2"
+same "promote records its source" "$(sq "$CNTCTR_DB" "select source from tools where project='global' and name='hp'")" "$RK/hp/v2"
 check "a promoted tool is visible in another project" "$(lst "$FG")" "[fleet] hp two"
 row "$GK" hp 1 active fc "gl hp" ""
 check "a project tool shadows the global one" "$(lst "$FG")" "[fleet] gl hp"
 same "promote from a second project" "$(CLID="$TMPD/gl" cli promote hp)" "promoted hp v1 to global v2"
-same "promote revokes the previous global version" "$(sqlite3 "$CNTCTR_DB" "select group_concat(version || status) from (select * from tools where project='global' and name='hp' order by version)")" "1revoked,2active"
+same "promote revokes the previous global version" "$(sq "$CNTCTR_DB" "select group_concat(version || status) from (select * from tools where project='global' and name='hp' order by version)")" "1revoked,2active"
 same "promote needs a live version" "$(cli promote nolive)" "no active version of nolive in this project"
-sqlite3 "$CNTCTR_DB" "update tools set status='revoked', verdict_reason='x' where project='$GK' and name='hp'"
+sq "$CNTCTR_DB" "update tools set status='revoked', verdict_reason='x' where project='$GK' and name='hp'"
 refute "a project revoke masks the global tool" "$(lst "$FG")" '"name":"hp"'
 
 # approve and promote notify; approve resolves an escalated row and tells the project
