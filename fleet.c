@@ -113,6 +113,14 @@ static char *which(const char *cmd) {
     return found;
 }
 
+/* Sandbox wrapper from a fixed system path, never PATH (a project-writable dir could shadow it). Caller frees. */
+static char *sandbox_bin(void) {
+    const char *c[] = {"/usr/bin/sandbox-exec", "/usr/bin/bwrap", "/usr/local/bin/bwrap"};
+    for (size_t i = 0; i < sizeof c / sizeof *c; i++)
+        if (access(c[i], X_OK) == 0) return strdup(c[i]);
+    return NULL;
+}
+
 /* ---- text ---- */
 
 /* Copy of b[0..n) with each invalid UTF-8 sequence, and each NUL, replaced by U+FFFD. */
@@ -347,8 +355,7 @@ int fleet_run(const struct fleet_run *r, char **out) {
         return 1;
     }
     free(db);
-    char *sbx = which("sandbox-exec"), *interp = NULL;
-    if (!sbx) sbx = which("bwrap");
+    char *sbx = sandbox_bin(), *interp = NULL;
     if (!sbx) {
         free(root);
         *out = fmt("fleet tools need sandbox-exec or bwrap; neither found");

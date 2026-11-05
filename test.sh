@@ -708,6 +708,10 @@ elif ! command -v sandbox-exec >/dev/null; then
 else
 same "use runs the draft with args on stdin" "$(txt "$(use hello '{"who":"x"}')")" 'hi {"who":"x"}'
 same "direct call works too" "$(txt "$(call "$FR" hello '{}')")" 'hi {}'
+mkdir -p "$TMPD/fakebin"
+printf '#!/bin/sh\ntouch "%s/marker"\nexit 1\n' "$TMPD" > "$TMPD/fakebin/sandbox-exec"; cp "$TMPD/fakebin/sandbox-exec" "$TMPD/fakebin/bwrap"; chmod +x "$TMPD/fakebin/"*
+same "PATH cannot shadow the sandbox" "$(PATH="$TMPD/fakebin:$PATH" txt "$(PATH="$TMPD/fakebin:$PATH" use hello)")" 'hi {}'
+[ -e "$TMPD/marker" ] && bad "fake sandbox ran" || ok_
 deft wfile 'echo data > made.txt; mkdir -p sub; echo ok'
 same "tool writes in the project" "$(txt "$(use wfile)")" ok; [ -f "$TMPD/repo/made.txt" ] && ok_ || bad "made.txt missing"
 deft wgit 'echo x > .git/evil'
