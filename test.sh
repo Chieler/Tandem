@@ -1097,6 +1097,93 @@ off=$(session "$KA" 2 "$INIT" "$(revcall lcb2)" 2>"$TMPD/lc.err")
 chmod 700 "$TD"
 same "a loose tools dir sends nothing" "$(printf '%s' "$off" | grep -cF "$LC")" 0
 same "a loose tools dir logs once" "$(grep -c 'notifications disabled' "$TMPD/lc.err")" 1
+
+# human CLI: list, show, approve, reject, revoke, promote
+cli() { (cd "${CLID:-$TMPD/repo}" && "$BIN" tools "$@" 2>&1); }
+GK=$(txt "$(call "$FG" project '{}')" | sed 's/^project \(.*\) (root .*/\1/')
+HQ=$(t new-window -d -n hq -c "$TMPD/repo" -P -F '#{pane_id}' cat); t set -p -t "$HQ" @cntctr_name hq
+check "tools needs a known command" "$(cli bogus)" "usage: cntctr tools"
+tenv CNTCTR_TEST_VERDICT approve
+publish "$FR" hp 'echo one' "hp one" >/dev/null
+waitfor "hp v1 active" '[ "$(st hp 1)" = active ]'
+publish "$FR" hp 'echo two' "hp two" >/dev/null
+waitfor "hp v2 active" '[ "$(st hp 2)" = active ]'
+sqlite3 "$CNTCTR_DB" "update tools set calls=0 where name='hp'"   # the reviewer's trial run counted one
+same "list shows the live version" "$(cli list | grep '^hp ')" "hp v2 active net=0 calls=0 failures=0 promote?=no"
+out=$(cli show hp)
+check "show lists an older version" "$out" "v1 revoked"
+check "show lists the live version" "$out" "v2 active"
+check "show prints the script" "$out" "echo two"
+check "show names the models" "$out" "author model unknown, reviewer model gemini"
+check "show gives the verdict" "$out" "verdict: superseded"
+sqlite3 "$CNTCTR_DB" "update tools set calls=17 where name='hp' and version=2"
+call "$FR" use '{"tool":"hp"}' >/dev/null
+call "$KR" use '{"tool":"hp"}' >/dev/null
+check "promote? stays off with two agents" "$(cli list | grep '^hp ')" "promote?=no"
+call "$HQ" use '{"tool":"hp"}' >/dev/null
+check "promote? turns on at 20 calls from 3 agents" "$(cli list | grep '^hp ')" "calls=20 failures=0 promote?=yes"
+sqlite3 "$CNTCTR_DB" "update tools set failures=1 where name='hp' and version=2"
+check "promote? needs a failure rate under 5%" "$(cli list | grep '^hp ')" "promote?=no"
+sqlite3 "$CNTCTR_DB" "update tools set failures=0 where name='hp' and version=2"
+
+same "promote copies the live version to global" "$(cli promote hp)" "promoted hp v2 to global v1"
+same "promote records its source" "$(sqlite3 "$CNTCTR_DB" "select source from tools where project='global' and name='hp'")" "$RK"
+check "a promoted tool is visible in another project" "$(lst "$FG")" "[fleet] hp two"
+row "$GK" hp 1 active fc "gl hp" ""
+check "a project tool shadows the global one" "$(lst "$FG")" "[fleet] gl hp"
+same "promote from a second project" "$(CLID="$TMPD/gl" cli promote hp)" "promoted hp v1 to global v2"
+same "promote revokes the previous global version" "$(sqlite3 "$CNTCTR_DB" "select group_concat(version || status) from (select * from tools where project='global' and name='hp' order by version)")" "1revoked,2active"
+same "promote needs a live version" "$(cli promote nolive)" "no active version of nolive in this project"
+sqlite3 "$CNTCTR_DB" "update tools set status='revoked', verdict_reason='x' where project='$GK' and name='hp'"
+refute "a project revoke masks the global tool" "$(lst "$FG")" '"name":"hp"'
+
+# approve and promote notify; approve resolves an escalated row and tells the project
+tenv CNTCTR_TEST_VERDICT escalate
+publish "$FR" he 'echo e' >/dev/null
+waitfor "he escalated" '[ "$(st he)" = escalated ]'
+session "$KA" 4 "$INIT" "$LIST" | while read -r l; do echo "$l" >> "$TMPD/lc3"; done & lc3=$!
+waitfor "the listener registered" '[ "$(grep -c . "$TMPD/lc3")" = 2 ]'
+same "approve resolves an escalated version" "$(cli approve he)" "approved he v1"
+same "the approved tool is active" "$(st he)" active
+same "the approved tool runs" "$(txt "$(use he)")" e
+check "approve tells the project" "$(board)" "new fleet tool he v1 by fr; see tools/list"
+sleep 1
+same "promote of the approved tool" "$(cli promote he)" "promoted he v1 to global v1"
+wait $lc3
+same "approve and promote each notify" "$(grep -cxF "$LC" "$TMPD/lc3")" 2
+check "promote tells the project" "$(board)" "promoted fleet tool he to global"
+tunset CNTCTR_TEST_VERDICT
+HP=$(newpane hrp)
+row "$RK" hpd 1 pending fc "pend" "$HP"
+same "approve resolves a pending version" "$(cli approve hpd)" "approved hpd v1"
+same "a pending version became active" "$(st hpd)" active
+waitfor "approving closes the reviewer's pane" '! haspane hrp'
+row "$RK" hrj 1 escalated fc "esc" ""
+same "reject resolves an escalated version" "$(cli reject hrj)" "rejected hrj v1"
+same "the rejected status" "$(st hrj)" rejected
+same "approve finds nothing to resolve" "$(cli approve hrj)" "no pending or escalated version of hrj"
+
+# revoke: project, then global; a global revoke reaches git projects that have no override and no tools
+same "revoke the project copy" "$(cli revoke he)" "revoked he"
+same "use says why" "$(txt "$(use he)")" "tool he was revoked: revoked by a human"
+same "a project revoke needs a live version" "$(cli revoke he)" "no active version of he"
+check "the global copy is still listed elsewhere" "$(lst "$FG")" '"name":"he"'
+for d in long:foo/bar short:bar; do
+    git init -q "$TMPD/sfx-${d%%:*}"
+    git -C "$TMPD/sfx-${d%%:*}" remote add origin "https://x.test/${d#*:}"
+    p=$(t new-window -d -n "sfx-${d%%:*}" -c "$TMPD/sfx-${d%%:*}" -P -F '#{pane_id}' cat); t set -p -t "$p" @cntctr_name "sfx-${d%%:*}"
+    eval "SFX_${d%%:*}=$p"
+done
+same "a global revoke" "$(cli revoke --global he)" "revoked he"
+refute "a global revoke hides the tool elsewhere" "$(lst "$FG")" '"name":"he"'
+check "a global announce posts for a git project with no override" "$(txt "$(call "$SFX_short" board '{}')")" "revoked global fleet tool he"
+check "and for a project whose key ends in the other's" "$(txt "$(call "$SFX_long" board '{}')")" "revoked global fleet tool he"
+same "a global revoke needs a global version" "$(cli revoke --global he)" "no active version of he"
+
+# the dashboard shows the tools of its directory's project
+out=$(cd "$TMPD/repo" && bash "$(dirname "$BIN")/watch.sh" --once)
+check "dashboard has a fleet tools block" "$out" "== fleet tools ("
+check "dashboard lists the tools" "$out" "hp v2 active"
 fi
 
 # ---- summary ----

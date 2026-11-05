@@ -2412,6 +2412,75 @@ static int call_cmd(const char *tool, const char *args) {
     return is_error;
 }
 
+/* cntctr tools list | show <name> | approve <name> | reject <name> | revoke [--global] <name> | promote <name>:
+ * the human's controls, for the project of the current directory. No MCP. */
+static int tools_cmd(int argc, char **argv) {
+    const char *cmd = argc > 2 ? argv[2] : "";
+    int global = argc > 3 && strcmp(argv[3], "--global") == 0, n = argc - 3 - global;
+    int list = strcmp(cmd, "list") == 0, approve = strcmp(cmd, "approve") == 0, revoke = strcmp(cmd, "revoke") == 0;
+    int promote = strcmp(cmd, "promote") == 0, show = strcmp(cmd, "show") == 0, reject = strcmp(cmd, "reject") == 0;
+    if (global ? !revoke || n != 1 : list ? n != 0 : !(show || approve || reject || revoke || promote) || n != 1) {
+        fprintf(stderr, "usage: cntctr tools list | show <name> | approve <name> | reject <name> | revoke [--global] <name> | promote <name>\n");
+        return 2;
+    }
+    const char *name = list ? NULL : argv[3 + global];
+    char *err = NULL, cwd[4096], *out = NULL, *text = NULL, *reviews = NULL;
+    sqlite3 *db = kb(&err);
+    if (!db) {
+        fprintf(stderr, "%s\n", err);
+        free(err);
+        return 1;
+    }
+    if (!getcwd(cwd, sizeof cwd)) snprintf(cwd, sizeof cwd, ".");
+    struct project p;
+    resolve_cwd(db, cwd, &p);
+    const char *scope = p.key;   /* where the announcement goes; NULL: every project */
+    int rc = 0, version, from;
+    if (list) out = kb_tool_list(db, p.key);
+    else if (show) out = kb_tool_show(db, p.key, name);
+    else if (approve || reject) {
+        if (kb_tool_resolve_human(db, p.key, name, approve, &version, &reviews) != 0) {
+            out = fmt("no pending or escalated version of %s", name);
+            rc = 1;
+        } else {
+            if (reviews) close_reviews(reviews);
+            out = fmt("%s %s v%d", approve ? "approved" : "rejected", name, version);
+            if (approve) {
+                notify_all();
+                char *author = kb_tool_field(db, p.key, name, version, "author");
+                text = fmt("new fleet tool %s v%d by %s; see tools/list", name, version, author ? author : "?");
+                free(author);
+            }
+        }
+    } else if (revoke) {
+        if (kb_tool_revoke(db, global ? "global" : p.key, name, "revoked by a human", &reviews) < 1) {
+            out = fmt("no active version of %s", name);
+            rc = 1;
+        } else {
+            if (reviews) close_reviews(reviews);
+            notify_all();
+            out = fmt("revoked %s", name);
+            text = fmt(global ? "revoked global fleet tool %s" : "revoked fleet tool %s", name);
+            if (global) scope = NULL;
+        }
+    } else if (kb_tool_promote(db, p.key, name, &from, &version) != 0) {
+        out = fmt("no active version of %s in this project", name);
+        rc = 1;
+    } else {
+        notify_all();
+        out = fmt("promoted %s v%d to global v%d", name, from, version);
+        text = fmt("promoted fleet tool %s to global; see tools/list", name);
+        scope = NULL;
+    }
+    free(reviews);
+    if (text) free(announce(db, scope, "human", text, NULL));
+    sqlite3_close(db);
+    if (*out) fprintf(rc ? stderr : stdout, "%s\n", out);
+    free(out);
+    free(text);
+    return rc;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "call") == 0) {
         if (argc == 4) return call_cmd(argv[2], argv[3]);
@@ -2424,6 +2493,7 @@ int main(int argc, char **argv) {
     regcomp(&name_re, "^[a-z][a-z0-9_]{1,40}$", REG_EXTENDED | REG_NOSUB);
     for (size_t i = 0; i < sizeof PROMPTS / sizeof *PROMPTS; i++)
         regcomp(&prompt_re[i], PROMPTS[i], REG_EXTENDED | REG_ICASE | REG_NOSUB);
+    if (argc > 1 && strcmp(argv[1], "tools") == 0) return tools_cmd(argc, argv);
     char *line = NULL;
     size_t cap = 0;
     while (getline(&line, &cap, stdin) > 0) handle(line);

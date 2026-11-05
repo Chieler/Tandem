@@ -1,5 +1,5 @@
 #!/bin/bash
-# Live view of cntctr: agents, the board, the knowledge store and the librarian.
+# Live view of cntctr: agents, the board, fleet tools, the knowledge store and the librarian.
 # Run it in a spare tmux pane. --once prints one frame and exits.
 db=${CNTCTR_DB:-$HOME/.local/share/cntctr/kb.db}
 q() { sqlite3 -separator '  ' "$db" "$1" 2>/dev/null; }
@@ -13,6 +13,8 @@ frame() {
     printf '\n== board (latest 10, all projects) ==\n'
     q "SELECT * FROM (SELECT rowid, datetime(at, 'unixepoch', 'localtime') || '  [' || scope || ']  ' || sender || ': ' ||
        $(printf "$short" text) FROM posts ORDER BY rowid DESC LIMIT 10) ORDER BY rowid" | cut -d' ' -f3-
+    printf '\n== fleet tools (this directory) ==\n'
+    cntctr tools list 2>/dev/null
     printf '\n== knowledge (latest 12; * = mirrored to claude-mem, x = retired) ==\n'
     q "SELECT datetime(updated, 'unixepoch', 'localtime'), CASE WHEN superseded_by IS NOT NULL THEN 'x' WHEN mem_id THEN '*' ELSE ' ' END,
        layer, agent, scope, title || ' — ' || $(printf "$short" summary) FROM entries WHERE layer != 'history'

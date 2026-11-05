@@ -58,4 +58,11 @@ int kb_tool_verdict(sqlite3 *db, const char *project, const char *name, int vers
 char *kb_tool_expire(sqlite3 *db, const char *project);
 int kb_tool_revoke(sqlite3 *db, const char *project, const char *name, const char *reason, char **reviews);   /* active, pending and escalated -> revoked; rows changed. *reviews: "<pane>	<review_root>" of the pending ones */
 int kb_tool_live(sqlite3 *db, const char *review_root);   /* a pending row owns this review dir (its stored review_root) */
+/* Human controls (CLI only). Lists are lines, "" when empty; the caller frees them. */
+char *kb_tool_list(sqlite3 *db, const char *project);                 /* one line per tool: name, live version, status, net, calls, failures, promote? */
+char *kb_tool_show(sqlite3 *db, const char *project, const char *name);   /* every version in project and global, with its script */
+/* Approve or reject the newest pending or escalated version. 0 applied (*version, *reviews as in kb_tool_revoke), or -1 none. */
+int kb_tool_resolve_human(sqlite3 *db, const char *project, const char *name, int approve, int *version, char **reviews);
+/* Copy the project's active version *from to global as a new active *version, revoking the previous one. 0, or -1 (no active version). */
+int kb_tool_promote(sqlite3 *db, const char *project, const char *name, int *from, int *version);
 #endif
