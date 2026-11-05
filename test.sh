@@ -1126,8 +1126,18 @@ sqlite3 "$CNTCTR_DB" "update tools set failures=1 where name='hp' and version=2"
 check "promote? needs a failure rate under 5%" "$(cli list | grep '^hp ')" "promote?=no"
 sqlite3 "$CNTCTR_DB" "update tools set failures=0 where name='hp' and version=2"
 
+# promote? counts the current version only: three agents used v1, one agent makes 20 calls of v2
+publish "$FR" pc 'echo 1' >/dev/null
+waitfor "pc v1 active" '[ "$(st pc 1)" = active ]'
+for p in "$FR" "$KR" "$HQ"; do call "$p" use '{"tool":"pc"}' >/dev/null; done
+publish "$FR" pc 'echo 2' >/dev/null
+waitfor "pc v2 active" '[ "$(st pc 2)" = active ]'
+call "$FR" use '{"tool":"pc"}' >/dev/null
+sqlite3 "$CNTCTR_DB" "update tools set calls=20 where name='pc' and version=2"
+check "promote? ignores the agents of older versions" "$(cli list | grep '^pc ')" "calls=20 failures=0 promote?=no"
+
 same "promote copies the live version to global" "$(cli promote hp)" "promoted hp v2 to global v1"
-same "promote records its source" "$(sqlite3 "$CNTCTR_DB" "select source from tools where project='global' and name='hp'")" "$RK"
+same "promote records its source" "$(sqlite3 "$CNTCTR_DB" "select source from tools where project='global' and name='hp'")" "$RK/hp/v2"
 check "a promoted tool is visible in another project" "$(lst "$FG")" "[fleet] hp two"
 row "$GK" hp 1 active fc "gl hp" ""
 check "a project tool shadows the global one" "$(lst "$FG")" "[fleet] gl hp"

@@ -572,7 +572,7 @@ char *kb_tool_list(sqlite3 *db, const char *project) {
         "SELECT name || ' v' || version || ' ' || status || ' net=' || net || ' calls=' || calls || ' failures=' || failures"
         " || ' promote?=' || CASE WHEN project <> 'global' AND status = 'active' AND calls >= 20 AND failures * 20 < calls"
         "   AND (SELECT count(DISTINCT agent) FROM entries WHERE layer = 'history' AND scope = t.project"
-        "        AND substr(title, 1, length(t.name) + 7) = 'tool ' || t.name || ' v') >= 3 THEN 'yes' ELSE 'no' END"
+        "        AND instr(title, 'tool ' || t.name || ' v' || t.version || ' ') = 1) >= 3 THEN 'yes' ELSE 'no' END"
         " || CASE WHEN project = 'global' THEN ' (global)' ELSE '' END"
         " FROM tools t WHERE project IN (?1, 'global') AND version > 0"
         " AND (status IN ('active', 'pending', 'escalated') OR (status = 'revoked' AND version = (SELECT MAX(version) FROM tools u"
@@ -660,7 +660,7 @@ int kb_tool_promote(sqlite3 *db, const char *project, const char *name, int *fro
         st = prep(db,
             "INSERT INTO tools(project, name, version, status, author, author_model, description, input_schema, interpreter,"
             " script, net, timeout, source, created) SELECT 'global', name, ?3, 'active', author, author_model, description,"
-            " input_schema, interpreter, script, net, timeout, project, CAST(strftime('%s', 'now') AS INTEGER)"
+            " input_schema, interpreter, script, net, timeout, project || '/' || name || '/v' || version, CAST(strftime('%s', 'now') AS INTEGER)"
             " FROM tools WHERE project = ?1 AND name = ?2 AND version = ?4");
         sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
