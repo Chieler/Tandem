@@ -603,7 +603,7 @@ out=$(txt "$(call "$KA" board '{}')")
 check "board shows posts" "$out" "ka: heads up: main is broken"
 same "board is oldest first" "$(printf '%s\n' "$out" | tail -n 1 | cut -d' ' -f3-)" "pb: fixed in abc123"
 same "board limit" "$(txt "$(call "$KA" board '{"limit":1}')" | cut -d' ' -f3-)" "pb: fixed in abc123"
-same "board of another project" "$(txt "$(call "$KR" board '{}')")" "no posts"
+refute "board of another project" "$(txt "$(call "$KR" board '{}')")" "heads up"
 same "post needs text" "$(txt "$(call "$KA" post '{}')")" "post needs 'text'"
 out=$(bash "$(dirname "$BIN")/watch.sh" --once)
 check "dashboard lists agents" "$out" "librarian-1"
@@ -1194,6 +1194,33 @@ same "a global revoke needs a global version" "$(cli revoke --global he)" "no ac
 out=$(cd "$TMPD/repo" && bash "$(dirname "$BIN")/watch.sh" --once)
 check "dashboard has a fleet tools block" "$out" "== fleet tools ("
 check "dashboard lists the tools" "$out" "hp v2 active"
+# skills announce, recall finds tools, the guide teaches both
+SK=$(t new-window -d -n sk -c "$TMPD/repo" -P -F '#{pane_id}' cat); t set -p -t "$SK" @cntctr_name sk
+call "$FR" note '{"layer":"skill","title":"Ship it","summary":"how to ship"}' >/dev/null
+expect_screen "a skill note tells the project" "$SK" "new skill Ship it ("
+refute "the author's own pane is skipped" "$(screen "$FR")" "new skill Ship it"
+call "$FR" note '{"layer":"insight","title":"Plain insight","summary":"no announce"}' >/dev/null
+call "$FR" note '{"layer":"doc","title":"Plain doc","summary":"no announce","body":"x"}' >/dev/null
+sleep 1
+refute "an insight does not announce" "$(screen "$SK")" "Plain insight"
+refute "a doc does not announce" "$(screen "$SK")" "Plain doc"
+call "$FR" note '{"layer":"skill","title":"Global way","summary":"for all","scope":"global"}' >/dev/null
+expect_screen "a global skill reaches the project" "$SK" "new skill Global way ("
+expect_screen "a global skill reaches other projects" "$FG" "new skill Global way ("
+row "$RK" rcl 1 active fc "Say hello" ""
+row "$RK" rcp 1 pending fc "Say hello pending" "$FR"
+row "$RK" rcv 1 revoked fc "Say hello revoked" ""
+row global rcg 1 active fc "Say hello global" ""
+row global rcm 1 active fc "Say hello masked" ""
+row "$RK" rcm 1 revoked fc "Say hello masking" ""
+out=$(txt "$(call "$SK" recall '{"query":"say hello"}')")
+check "recall lists a fleet tool" "$out" "[tool] rcl: Say hello"
+check "recall lists a global tool" "$out" "[tool] rcg: Say hello global"
+refute "recall hides another's pending tool" "$out" "rcp"
+refute "recall hides a revoked project tool" "$out" "rcv"
+refute "a revoked project tool masks the global one" "$out" "rcm"
+check "recall matches by name" "$(txt "$(call "$SK" recall '{"query":"rcl"}')")" "[tool] rcl:"
+check "initialize teaches fleet tools" "$(rpc "$INIT")" "make it a fleet tool with tool_define"
 fi
 
 # ---- summary ----

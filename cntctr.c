@@ -1081,6 +1081,8 @@ static int is_layer(const char *l) {
     return l && (strcmp(l, "insight") == 0 || strcmp(l, "skill") == 0 || strcmp(l, "doc") == 0);
 }
 
+static char *announce(sqlite3 *db, const char *scope, const char *sender, const char *text, const char *skip_pane);
+
 static int tool_note(json_object *a, char **res) {
     const char *layer = sarg(a, "layer"), *title = sarg(a, "title"), *summary = sarg(a, "summary");
     const char *body = sarg(a, "body"), *scope = sarg(a, "scope");
@@ -1123,6 +1125,11 @@ static int tool_note(json_object *a, char **res) {
     }
     long long mem = mem_save(global ? "cntctr-global" : p.base, id, layer, e.scope, title, line, body);
     if (mem) kb_set_mem(db, id, mem);
+    if (strcmp(layer, "skill") == 0) {
+        char *text = fmt("new skill %s (%s); read it with read", title, id);
+        free(announce(db, global ? NULL : p.key, caller_name, text, caller_pane));
+        free(text);
+    }
     free(line);
     sqlite3_close(db);
     return ok(res, fmt("noted %s", id));
@@ -1168,6 +1175,20 @@ static int tool_recall(json_object *a, char **res) {
         char *table = mem_search(query, strcmp(s1, "global") == 0 ? "cntctr-global" : p.base, limit);
         out = merge_mem(db, kb_search(db, s1, s2, query, layer, 1, limit), table);
         free(table);
+        if (!layer) {   /* fleet tools callable here: the same view as tools/list */
+            char *names = kb_tool_names(db, s1, caller_name, self_pane), *save = NULL;
+            for (char *n = strtok_r(names, "\n", &save); n; n = strtok_r(NULL, "\n", &save)) {
+                struct kb_tool t;
+                if (kb_tool_resolve(db, s1, n, caller_name, self_pane, &t) == 0 &&
+                    (strcasestr(t.name, query) || strcasestr(t.description, query))) {
+                    char *line = fmt(*out ? "%s\n[tool] %s: %s" : "%s[tool] %s: %s", out, t.name, t.description);
+                    free(out);
+                    out = line;
+                }
+                kb_tool_free(&t);
+            }
+            free(names);
+        }
     } else {
         out = kb_index(db, s1, s2, layer, since, limit);
     }
@@ -2243,7 +2264,9 @@ static const char GUIDE[] =
     "When you learn something durable (a fact, decision, gotcha, procedure, or the summary of a long analysis), store it with note: "
     "layer insight (1-5 lines), skill (a how-to) or doc (long text); point at code as file:symbol instead of copying it. "
     "When you reply to a task, add insights=[...]. "
-    "To tell every agent in this project something now, use post; board shows recent posts.";
+    "To tell every agent in this project something now, use post; board shows recent posts. "
+    "When you finish multi-step work that another agent would likely repeat, make it a fleet tool with tool_define (for a script) "
+    "or a skill with note (for a procedure). Before starting such work, check tools/list and recall.";
 
 /* Usage guide plus the knowledge index: our project's and global entries, or only
  * global ones for a server outside any pane (Codex), capped at 40 lines and 4 KB. */
