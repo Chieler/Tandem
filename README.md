@@ -132,6 +132,45 @@ Insights, skills and docs are also copied to claude-mem (`$CNTCTR_MEM_URL`, defa
 `http://127.0.0.1:37701`; set it empty to turn copying off), so `recall` gets semantic
 matches. If claude-mem is down, recall uses keyword search alone.
 
+## Fleet tools
+
+A fleet tool is a script (`sh`, `bash`, `python3` or `node`) that an agent turns into an MCP
+tool mid-session, so every agent in the same project can reuse the work. A skill
+(`note(layer=skill)`) is the written version: cntctr announces it to the fleet when it is stored.
+
+| Tool | What it does |
+|---|---|
+| `tool_define` | Save a draft, callable by its author only. With `publish=true` it starts a review. Optional `net`, `timeout` (default 60 s, max 600 s). |
+| `tool_verdict` | The reviewer's `approve`, `reject` or `escalate`. |
+| `tool_revoke` | Withdraw a project tool. |
+| `use` | Call a fleet tool by name. Needed by Codex, which sees no project tools in `tools/list`. |
+
+Every tool runs in a sandbox (`sandbox-exec` on macOS, `bwrap` on Linux; no sandbox, no run).
+It can write only inside the project directory, its temp dir and its cache dir. `.git` is
+read-only. Network is off unless the tool declared `net`. Reads are unrestricted, so this
+guards against mistakes, not against a hostile agent.
+
+Review flow: draft, publish, then a reviewer on a different harness (or model) runs the
+tool on a throwaway copy of the project and gives a verdict. `approve` makes it active;
+`reject` is sent to the author. `escalate`, a failed spawn or a 20-minute timeout leaves it
+`escalated` until a human resolves it.
+
+Approval, revoke and promote reach live agents through `notifications/tools/list_changed`
+(per-process FIFOs in `/tmp/cntctr-<uid>/tools`), plus a line typed into each pane and a board post.
+
+A tool can call cntctr: `cntctr call <tool> '<json args>'` works inside a fleet tool, and
+allows `use`, `recall`, `read`, `note`, `post` and `board`.
+
+Humans use the CLI, which resolves the project from the current directory:
+
+    cntctr tools list                 # name, version, status, net, calls, failures, promote?
+    cntctr tools show <name>          # every version with its script and verdict
+    cntctr tools approve|reject <name>
+    cntctr tools revoke [--global] <name>
+    cntctr tools promote <name>       # copy the live version to every project
+
+`promote?` shows at 20 or more calls, under 5% failures and 3 or more distinct callers.
+
 ## Watch it work
 
     ./watch.sh          # in a spare tmux pane; refreshes every 2 s ($CNTCTR_WATCH_SECS)

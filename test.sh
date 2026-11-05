@@ -73,7 +73,7 @@ check "initialize names the server" "$out" '"serverInfo":{"name":"cntctr"'
 out=$(rpc '{"jsonrpc":"2.0","id":7,"method":"ping"}')
 same "ping" "$out" '{"jsonrpc":"2.0","id":7,"result":{}}'
 out=$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')
-for tool in spawn send gather reply list kill note recall read forget project distill post board; do check "tools/list has $tool" "$out" "\"name\":\"$tool\""; done
+for tool in spawn send gather reply list kill note recall read forget project distill post board tool_define tool_verdict tool_revoke use; do check "tools/list has $tool" "$out" "\"name\":\"$tool\""; done
 out=$(rpc '{"jsonrpc":"2.0","id":3,"method":"nope"}')
 check "unknown method" "$out" '"code":-32601'
 out=$(rpc 'not json')
