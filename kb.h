@@ -25,6 +25,7 @@ void kb_meta_set(sqlite3 *db, const char *k, const char *v);
 char *kb_project_get(sqlite3 *db, const char *root);
 void kb_project_set(sqlite3 *db, const char *root, const char *key);   /* an empty key removes the override */
 int kb_post(sqlite3 *db, const char *scope, const char *sender, const char *text);   /* 0, or -1 */
+int kb_post_all(sqlite3 *db, const char *sender, const char *text);   /* one post per known project; 0, or -1 */
 char *kb_board(sqlite3 *db, const char *scope, int limit);   /* "<UTC time> <sender>: <text>" lines, oldest first */
 
 /* Fleet tools: script-backed MCP tools. Drafts are private to their author; see the spec's "Resolving a name". */
@@ -55,5 +56,6 @@ int kb_tool_verdict(sqlite3 *db, const char *project, const char *name, int vers
                     const char *verdict, const char *reason, char status[16]);
 /* Escalate pending rows past their deadline, once. "<pane>\t<review_root>\t<name>\t<version>\n" per row. */
 char *kb_tool_expire(sqlite3 *db, const char *project);
+int kb_tool_revoke(sqlite3 *db, const char *project, const char *name, const char *reason);   /* active -> revoked; rows changed */
 int kb_tool_live(sqlite3 *db, const char *review_root);   /* a pending row owns this review dir (its stored review_root) */
 #endif

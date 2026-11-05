@@ -260,6 +260,15 @@ int kb_post(sqlite3 *db, const char *scope, const char *sender, const char *text
     return rc;
 }
 
+int kb_post_all(sqlite3 *db, const char *sender, const char *text) {
+    sqlite3_stmt *st = prep(db, "INSERT INTO posts SELECT DISTINCT key, ?1, ?2, CAST(strftime('%s', 'now') AS INTEGER) FROM projects");
+    sqlite3_bind_text(st, 1, sender, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, text, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st) == SQLITE_DONE ? 0 : -1;
+    sqlite3_finalize(st);
+    return rc;
+}
+
 char *kb_board(sqlite3 *db, const char *scope, int limit) {
     sqlite3_stmt *st = prep(db,
         "SELECT line FROM (SELECT rowid, datetime(at, 'unixepoch') || ' ' || sender || ': ' || text AS line FROM posts"
@@ -528,6 +537,17 @@ char *kb_tool_expire(sqlite3 *db, const char *project) {
     sqlite3_finalize(st);
     if (sqlite3_exec(db, ok ? "COMMIT" : "ROLLBACK", NULL, NULL, NULL) != SQLITE_OK || !ok) *out = '\0';
     return out;
+}
+
+int kb_tool_revoke(sqlite3 *db, const char *project, const char *name, const char *reason) {
+    sqlite3_stmt *st = prep(db, "UPDATE tools SET status = 'revoked', verdict_reason = ?3"
+                                " WHERE project = ?1 AND name = ?2 AND status = 'active'");
+    sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, reason, -1, SQLITE_TRANSIENT);
+    int n = sqlite3_step(st) == SQLITE_DONE ? sqlite3_changes(db) : 0;
+    sqlite3_finalize(st);
+    return n;
 }
 
 int kb_tool_live(sqlite3 *db, const char *review_root) {

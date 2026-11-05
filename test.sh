@@ -1010,6 +1010,30 @@ same "a nested run inherits the outer deadline" "$(iserr "$out")" true
 [ "$el" -le 4 ] && ok_ || bad "nested slow tool took ${el}s, want <= 4"
 check "call outside a tool fails" "$("$BIN" call recall '{}' 2>&1)" "cntctr call works only inside a fleet tool"
 check "calls are logged as history" "$(sqlite3 "$CNTCTR_DB" "SELECT group_concat(title) FROM entries WHERE layer='history' AND title LIKE 'tool fails v0 fr %'")" "tool fails v0 fr fail"
+
+# revoke: use refuses, the fleet is told, a later version lists, no older version comes back
+tenv CNTCTR_TEST_VERDICT approve
+publish "$FR" rvk 'echo one' "rvk one" >/dev/null
+waitfor "rvk v1 active" '[ "$(st rvk 1)" = active ]'
+same "revoke needs an active version" "$(txt "$(call "$KR" tool_revoke '{"name":"nope","reason":"x"}')")" "no active version of nope"
+same "revoke answers" "$(txt "$(call "$KR" tool_revoke '{"name":"rvk","reason":"leaks keys"}')")" "revoked rvk"
+same "v1 is revoked" "$(st rvk 1)" revoked
+same "use says why" "$(txt "$(use rvk)")" "tool rvk was revoked: leaks keys"
+expect_screen "the revoker's own pane is told" "$KR" "revoked fleet tool rvk"
+expect_screen "the author's pane is told" "$FR" "revoked fleet tool rvk"
+check "the board keeps it" "$(txt "$(call "$KR" board '{}')")" "revoked fleet tool rvk"
+refute "a revoked tool is not listed" "$(lst "$KR")" '"name":"rvk"'
+same "revoking twice finds nothing" "$(txt "$(call "$KR" tool_revoke '{"name":"rvk","reason":"x"}')")" "no active version of rvk"
+publish "$FR" rvk 'echo two' "rvk two" >/dev/null
+waitfor "rvk v2 active" '[ "$(st rvk 2)" = active ]'
+check "a version published after a revoke is listed" "$(lst "$KR")" "[fleet] rvk two"
+publish "$FR" rnw 'echo 1' "rnw one" >/dev/null
+waitfor "rnw v1 active" '[ "$(st rnw 1)" = active ]'
+publish "$FR" rnw 'echo 2' "rnw two" >/dev/null
+waitfor "rnw v2 active" '[ "$(st rnw 2)" = active ]'
+call "$KR" tool_revoke '{"name":"rnw","reason":"bad"}' >/dev/null
+same "revoking v2 does not bring v1 back" "$(txt "$(use rnw)")" "tool rnw was revoked: bad"
+refute "v1 stays unlisted" "$(lst "$KR")" "rnw one"
 fi
 
 # ---- summary ----

@@ -1241,14 +1241,15 @@ static int tool_distill(json_object *a, char **res) {
     return r;
 }
 
-/* Keep `text` on project `key`'s board and type it into every other live agent in that project. Leaves `db` open. */
-static int post_to(sqlite3 *db, const char *key, const char *text, char **res) {
+/* Keep `text` on the board of `scope` (NULL: every project) and type it into every live agent there except `skip_pane`
+   (NULL: none). Returns the "posted to ..." summary, or the error. Leaves `db` open. */
+static char *announce(sqlite3 *db, const char *scope, const char *sender, const char *text, const char *skip_pane) {
     struct project q;
     char *panes;
-    if (kb_post(db, key, caller_name, text) != 0) return fail(res, fmt("post failed: %s", sqlite3_errmsg(db)));
+    if ((scope ? kb_post(db, scope, sender, text) : kb_post_all(db, sender, text)) != 0) return fmt("post failed: %s", sqlite3_errmsg(db));
     if (TMUX(NULL, &panes, "list-panes", "-a", "-F", "#{pane_id}\t#{pane_dead}\t#{pane_current_path}\t#{@cntctr_name}") != 0)
-        return fail(res, panes);
-    char *env = fmt("[cntctr board from=%s] %s", caller_name, text), *sent = strdup(""), *skipped = strdup(""), *save, *t;
+        return panes;
+    char *env = fmt("[cntctr board from=%s] %s", sender, text), *sent = strdup(""), *skipped = strdup(""), *save, *t;
     char *seen = strdup("");   /* "\n<path>\t<key>" per path looked up: one lookup per distinct path, not per pane */
     for (char *line = strtok_r(panes, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
         char *dead = strchr(line, '\t'), *path = dead ? strchr(dead + 1, '\t') : NULL, *name = path ? strchr(path + 1, '\t') : NULL;
@@ -1256,19 +1257,21 @@ static int post_to(sqlite3 *db, const char *key, const char *text, char **res) {
         *dead++ = '\0';
         *path++ = '\0';
         *name++ = '\0';
-        if (strcmp(dead, "0") != 0 || strcmp(line, caller_pane) == 0) continue;
-        char *want = fmt("\n%s\t", path), *hit = strstr(seen, want);
-        if (hit) {
-            hit += strlen(want);
-            snprintf(q.key, sizeof q.key, "%.*s", (int)strcspn(hit, "\n"), hit);
-        } else {
-            resolve_cwd(db, path, &q);
-            t = fmt("%s%s%s", seen, want, q.key);
-            free(seen);
-            seen = t;
+        if (strcmp(dead, "0") != 0 || (skip_pane && strcmp(line, skip_pane) == 0)) continue;
+        if (scope) {
+            char *want = fmt("\n%s\t", path), *hit = strstr(seen, want);
+            if (hit) {
+                hit += strlen(want);
+                snprintf(q.key, sizeof q.key, "%.*s", (int)strcspn(hit, "\n"), hit);
+            } else {
+                resolve_cwd(db, path, &q);
+                t = fmt("%s%s%s", seen, want, q.key);
+                free(seen);
+                seen = t;
+            }
+            free(want);
+            if (strcmp(q.key, scope) != 0) continue;
         }
-        free(want);
-        if (strcmp(q.key, key) != 0) continue;
         char *err = inject(line, name, env), **list = err ? &skipped : &sent;
         t = err ? fmt("%s %s (%s)", *list, name, err) : fmt("%s %s", *list, name);
         free(*list);
@@ -1281,7 +1284,7 @@ static int post_to(sqlite3 *db, const char *key, const char *text, char **res) {
     char *r = fmt("posted to%s%s%s", *sent ? sent : " nobody else", *skipped ? "; skipped" : "", skipped);
     free(sent);
     free(skipped);
-    return ok(res, r);
+    return r;
 }
 
 /* Type `text` into every other live agent in the caller's project, and keep it on the project's board. */
@@ -1291,9 +1294,9 @@ static int tool_post(json_object *a, char **res) {
     struct project p;
     sqlite3 *db = kb_for_caller(&p, res);
     if (!db) return 1;
-    int rc = post_to(db, p.key, text, res);
+    char *r = announce(db, p.key, caller_name, text, caller_pane);
     sqlite3_close(db);
-    return rc;
+    return strncmp(r, "posted to", 9) ? fail(res, r) : ok(res, r);
 }
 
 static int tool_board(json_object *a, char **res) {
@@ -1315,6 +1318,7 @@ static int tool_board(json_object *a, char **res) {
 static int tool_define(json_object *a, char **res);
 static int tool_use(json_object *a, char **res);
 static int tool_verdict(json_object *a, char **res);
+static int tool_revoke(json_object *a, char **res);
 typedef int (*tool_fn)(json_object *args, char **res);
 static const struct { const char *name; tool_fn fn; int needs_pane; } TOOL_FNS[] = {
     {"list", tool_list, 0},
@@ -1333,6 +1337,7 @@ static const struct { const char *name; tool_fn fn; int needs_pane; } TOOL_FNS[]
     {"board", tool_board, 0},
     {"tool_define", tool_define, 0},
     {"tool_verdict", tool_verdict, 0},
+    {"tool_revoke", tool_revoke, 0},
     {"use", tool_use, 1},
     {NULL, NULL, 0},
 };
@@ -1511,9 +1516,8 @@ static void review_cleanup(const char *pane, const char *root) {
 
 /* Ask project `key` for a human with a board post. */
 static void needs_human(sqlite3 *db, const char *key, const char *name, int version, const char *why) {
-    char *text = fmt("fleet tool %s v%d needs a human: %s", name, version, why), *res = NULL;
-    post_to(db, key, text, &res);
-    free(res);
+    char *text = fmt("fleet tool %s v%d needs a human: %s", name, version, why);
+    free(announce(db, key, caller_name, text, caller_pane));
     free(text);
 }
 
@@ -1727,9 +1731,7 @@ static int tool_verdict(json_object *a, char **res) {
     char *text, *pane = author ? find_agent(author) : NULL;
     if (!strcmp(verdict, "approve")) {
         text = fmt("new fleet tool %s v%d by %s; see tools/list", name, version, author ? author : "?");
-        char *r = NULL;
-        post_to(db, p.key, text, &r);   /* by key: a sweep may already have unmapped the reviewer's copy */
-        free(r);
+        free(announce(db, p.key, caller_name, text, caller_pane));   /* by key: a sweep may already have unmapped the reviewer's copy */
     } else if (!strcmp(verdict, "reject")) {
         text = fmt("fleet tool %s v%d was rejected: %s", name, version, reason ? reason : "");
         if (pane) free(inject(pane, author, text));
@@ -1749,6 +1751,23 @@ static int tool_verdict(json_object *a, char **res) {
     free(author);
     free(root);
     return ok(res, fmt("ok"));
+}
+
+static int tool_revoke(json_object *a, char **res) {
+    const char *name = sarg(a, "name"), *reason = sarg(a, "reason");
+    if (!name || !reason || !*reason) return fail(res, fmt("tool_revoke needs 'name' 'reason'"));
+    struct project p;
+    sqlite3 *db = kb_for_caller(&p, res);
+    if (!db) return 1;
+    if (kb_tool_revoke(db, p.key, name, reason) < 1) {
+        sqlite3_close(db);
+        return fail(res, fmt("no active version of %s", name));
+    }
+    char *text = fmt("revoked fleet tool %s", name);
+    free(announce(db, p.key, caller_name, text, NULL));
+    sqlite3_close(db);
+    free(text);
+    return ok(res, fmt("revoked %s", name));
 }
 
 /* A copy of `args` without `from`, which names the caller. */
@@ -2035,6 +2054,9 @@ static const char TOOLS[] =
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"version\":{\"type\":\"integer\"},"
     "\"verdict\":{\"type\":\"string\",\"enum\":[\"approve\",\"reject\",\"escalate\"]},\"reason\":{\"type\":\"string\"}," KFROM "},"
     "\"required\":[\"name\",\"version\",\"verdict\"]}}"
+    ",{\"name\":\"tool_revoke\",\"description\":\"Revoke your project's active fleet tool. Agents are told, and use answers with your reason.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"reason\":{\"type\":\"string\"}," KFROM "},"
+    "\"required\":[\"name\",\"reason\"]}}"
     "]}";
 
 /* The built-ins plus each fleet tool this server's agent can call. Outside a pane (Codex) the
