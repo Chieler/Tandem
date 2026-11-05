@@ -260,13 +260,8 @@ int kb_post(sqlite3 *db, const char *scope, const char *sender, const char *text
     return rc;
 }
 
-int kb_post_all(sqlite3 *db, const char *sender, const char *text) {
-    sqlite3_stmt *st = prep(db, "INSERT INTO posts SELECT DISTINCT key, ?1, ?2, CAST(strftime('%s', 'now') AS INTEGER) FROM projects");
-    sqlite3_bind_text(st, 1, sender, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 2, text, -1, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(st) == SQLITE_DONE ? 0 : -1;
-    sqlite3_finalize(st);
-    return rc;
+char *kb_tool_projects(sqlite3 *db) {
+    return lines(prep(db, "SELECT DISTINCT project FROM tools WHERE project <> 'global'"));
 }
 
 char *kb_board(sqlite3 *db, const char *scope, int limit) {
@@ -539,14 +534,26 @@ char *kb_tool_expire(sqlite3 *db, const char *project) {
     return out;
 }
 
-int kb_tool_revoke(sqlite3 *db, const char *project, const char *name, const char *reason) {
-    sqlite3_stmt *st = prep(db, "UPDATE tools SET status = 'revoked', verdict_reason = ?3"
-                                " WHERE project = ?1 AND name = ?2 AND status = 'active'");
+int kb_tool_revoke(sqlite3 *db, const char *project, const char *name, const char *reason, char **reviews) {
+    *reviews = NULL;
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) return 0;
+    sqlite3_stmt *st = prep(db, "SELECT COALESCE(reviewer_pane, '') || char(9) || COALESCE(review_root, '') FROM tools"
+                                " WHERE project = ?1 AND name = ?2 AND status = 'pending'");
+    sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
+    *reviews = lines(st);
+    st = prep(db, "UPDATE tools SET status = 'revoked', verdict_reason = ?3"
+                  " WHERE project = ?1 AND name = ?2 AND status IN ('active', 'pending', 'escalated')");
     sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st, 3, reason, -1, SQLITE_TRANSIENT);
-    int n = sqlite3_step(st) == SQLITE_DONE ? sqlite3_changes(db) : 0;
+    int n = sqlite3_step(st) == SQLITE_DONE ? sqlite3_changes(db) : -1;
     sqlite3_finalize(st);
+    if (sqlite3_exec(db, n >= 0 ? "COMMIT" : "ROLLBACK", NULL, NULL, NULL) != SQLITE_OK || n < 0) n = 0;
+    if (n == 0) {
+        free(*reviews);
+        *reviews = NULL;
+    }
     return n;
 }
 

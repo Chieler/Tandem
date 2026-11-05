@@ -1245,10 +1245,22 @@ static int tool_distill(json_object *a, char **res) {
    (NULL: none). Returns the "posted to ..." summary, or the error. Leaves `db` open. */
 static char *announce(sqlite3 *db, const char *scope, const char *sender, const char *text, const char *skip_pane) {
     struct project q;
-    char *panes;
-    if ((scope ? kb_post(db, scope, sender, text) : kb_post_all(db, sender, text)) != 0) return fmt("post failed: %s", sqlite3_errmsg(db));
-    if (TMUX(NULL, &panes, "list-panes", "-a", "-F", "#{pane_id}\t#{pane_dead}\t#{pane_current_path}\t#{@cntctr_name}") != 0)
+    char *panes, *posted = strdup("");   /* "<key>\n" per board written, for scope NULL */
+    if (scope && kb_post(db, scope, sender, text) != 0) return fmt("post failed: %s", sqlite3_errmsg(db));
+    if (!scope) {   /* projects with tools, even with no live pane; the panes' own projects follow below */
+        char *save, *t, *keys = kb_tool_projects(db);
+        for (char *k = strtok_r(keys, "\n", &save); k; k = strtok_r(NULL, "\n", &save)) {
+            if (kb_post(db, k, sender, text) != 0) continue;
+            t = fmt("%s%s\n", posted, k);
+            free(posted);
+            posted = t;
+        }
+        free(keys);
+    }
+    if (TMUX(NULL, &panes, "list-panes", "-a", "-F", "#{pane_id}\t#{pane_dead}\t#{pane_current_path}\t#{@cntctr_name}") != 0) {
+        free(posted);
         return panes;
+    }
     char *env = fmt("[cntctr board from=%s] %s", sender, text), *sent = strdup(""), *skipped = strdup(""), *save, *t;
     char *seen = strdup("");   /* "\n<path>\t<key>" per path looked up: one lookup per distinct path, not per pane */
     for (char *line = strtok_r(panes, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
@@ -1258,19 +1270,26 @@ static char *announce(sqlite3 *db, const char *scope, const char *sender, const 
         *path++ = '\0';
         *name++ = '\0';
         if (strcmp(dead, "0") != 0 || (skip_pane && strcmp(line, skip_pane) == 0)) continue;
-        if (scope) {
-            char *want = fmt("\n%s\t", path), *hit = strstr(seen, want);
-            if (hit) {
-                hit += strlen(want);
-                snprintf(q.key, sizeof q.key, "%.*s", (int)strcspn(hit, "\n"), hit);
-            } else {
-                resolve_cwd(db, path, &q);
-                t = fmt("%s%s%s", seen, want, q.key);
-                free(seen);
-                seen = t;
+        char *want = fmt("\n%s\t", path), *hit = strstr(seen, want);
+        if (hit) {
+            hit += strlen(want);
+            snprintf(q.key, sizeof q.key, "%.*s", (int)strcspn(hit, "\n"), hit);
+        } else {
+            resolve_cwd(db, path, &q);
+            t = fmt("%s%s%s", seen, want, q.key);
+            free(seen);
+            seen = t;
+        }
+        free(want);
+        if (scope && strcmp(q.key, scope) != 0) continue;
+        if (!scope) {   /* a review copy resolves to its project's key, so each board is written once */
+            char *mark = fmt("%s\n", q.key);
+            if (!strstr(posted, mark) && kb_post(db, q.key, sender, text) == 0) {
+                t = fmt("%s%s", posted, mark);
+                free(posted);
+                posted = t;
             }
-            free(want);
-            if (strcmp(q.key, scope) != 0) continue;
+            free(mark);
         }
         char *err = inject(line, name, env), **list = err ? &skipped : &sent;
         t = err ? fmt("%s %s (%s)", *list, name, err) : fmt("%s %s", *list, name);
@@ -1278,6 +1297,7 @@ static char *announce(sqlite3 *db, const char *scope, const char *sender, const 
         *list = t;
         free(err);
     }
+    free(posted);
     free(seen);
     free(panes);
     free(env);
@@ -1759,10 +1779,13 @@ static int tool_revoke(json_object *a, char **res) {
     struct project p;
     sqlite3 *db = kb_for_caller(&p, res);
     if (!db) return 1;
-    if (kb_tool_revoke(db, p.key, name, reason) < 1) {
+    char *reviews;
+    if (kb_tool_revoke(db, p.key, name, reason, &reviews) < 1) {
         sqlite3_close(db);
         return fail(res, fmt("no active version of %s", name));
     }
+    if (reviews) close_reviews(reviews);
+    free(reviews);
     char *text = fmt("revoked fleet tool %s", name);
     free(announce(db, p.key, caller_name, text, NULL));
     sqlite3_close(db);

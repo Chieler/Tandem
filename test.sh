@@ -1034,6 +1034,33 @@ waitfor "rnw v2 active" '[ "$(st rnw 2)" = active ]'
 call "$KR" tool_revoke '{"name":"rnw","reason":"bad"}' >/dev/null
 same "revoking v2 does not bring v1 back" "$(txt "$(use rnw)")" "tool rnw was revoked: bad"
 refute "v1 stays unlisted" "$(lst "$KR")" "rnw one"
+
+# revoke also closes versions still under review
+tenv CNTCTR_TEST_VERDICT approve
+publish "$FR" rpa 'echo 1' "rpa one" >/dev/null
+waitfor "rpa v1 active" '[ "$(st rpa 1)" = active ]'
+tenv CNTCTR_TEST_VERDICT none
+publish "$FR" rpa 'echo 2' "rpa two" >/dev/null
+waitfor "rpa v2's reviewer is bound" 'haspane -rpa-v2'
+call "$KR" tool_revoke '{"name":"rpa","reason":"unsafe"}' >/dev/null
+same "revoke takes the pending version too" "$(st rpa 2)" revoked
+same "revoke takes the active version" "$(st rpa 1)" revoked
+same "a verdict on the revoked pending version is refused" "$(txt "$(call "$FR" tool_verdict '{"name":"rpa","version":2,"verdict":"approve"}')")" "version 2 is revoked"
+same "use says revoked" "$(txt "$(use rpa)")" "tool rpa was revoked: unsafe"
+waitfor "the revoked review's copy is cleaned up" '! hasdir -rpa-v2'
+waitfor "the revoked review's pane is closed" '! haspane -rpa-v2'
+publish "$FR" rpo 'echo 1' >/dev/null
+waitfor "rpo v1's reviewer is bound" 'haspane -rpo-v1'
+call "$KR" tool_revoke '{"name":"rpo","reason":"no"}' >/dev/null
+same "a name with only a pending version can be revoked" "$(st rpo 1)" revoked
+waitfor "its review pane is closed" '! haspane -rpo-v1'
+CNTCTR_TEST_HOLD_BIND=2 call "$FR" tool_define "$(pubdef rpb 'echo 1')" > "$TMPD/rpb.out" & bgp=$!
+waitfor "rpb v1's reviewer is spawned" 'haspane -rpb-v1'
+call "$KR" tool_revoke '{"name":"rpb","reason":"early"}' >/dev/null
+wait $bgp
+same "a revoke before the bind leaves v1 revoked" "$(st rpb 1)" revoked
+waitfor "the unbound review's copy is cleaned up" '! hasdir -rpb-v1'
+waitfor "the unbound review's pane is closed" '! haspane -rpb-v1'
 fi
 
 # ---- summary ----
