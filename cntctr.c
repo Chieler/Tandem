@@ -1718,20 +1718,16 @@ static int tool_define(json_object *a, char **res) {
         return 1;
     }
     const char *name = sarg(a, "name");
-    int rc = kb_tool_save_draft(db, p.key, caller_name, model, name, sarg(a, "description"),
-                                json_object_to_json_string_ext(sc, JSON_C_TO_STRING_PLAIN), sarg(a, "interpreter"),
-                                sarg(a, "script"), barg(a, "net"), timeout);
-    int version = 0;
+    int version = 0, publish = barg(a, "publish");
     char *old = NULL, *text = NULL;
-    if (rc == 0 && barg(a, "publish")) {
-        if (kb_tool_publish(db, p.key, caller_name, name, &version, &old) != 0) {
-            rc = -1;
-        } else {
-            close_reviews(old);
-            text = start_review(db, &p, name, version, model);
-        }
-        free(old);
+    int rc = kb_tool_define(db, p.key, caller_name, model, name, sarg(a, "description"),
+                            json_object_to_json_string_ext(sc, JSON_C_TO_STRING_PLAIN), sarg(a, "interpreter"),
+                            sarg(a, "script"), barg(a, "net"), timeout, publish, &version, &old);
+    if (rc == 0 && publish) {
+        close_reviews(old);
+        text = start_review(db, &p, name, version, model);
     }
+    free(old);
     sqlite3_close(db);
     free(model);
     if (rc) return fail(res, fmt("cannot %s %s", barg(a, "publish") ? "publish" : "save draft", name));

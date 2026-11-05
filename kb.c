@@ -282,10 +282,10 @@ void kb_tool_free(struct kb_tool *t) {
     memset(t, 0, sizeof *t);
 }
 
-int kb_tool_save_draft(sqlite3 *db, const char *project, const char *author, const char *author_model,
+/* Replace the author's draft of `name`; the caller owns the transaction. */
+static int draft_put(sqlite3 *db, const char *project, const char *author, const char *author_model,
                        const char *name, const char *description, const char *schema,
                        const char *interpreter, const char *script, int net, int timeout) {
-    if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) return -1;
     sqlite3_stmt *st = prep(db, "DELETE FROM tools WHERE project = ?1 AND name = ?2 AND status = 'draft' AND author = ?3");
     sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
@@ -304,7 +304,6 @@ int kb_tool_save_draft(sqlite3 *db, const char *project, const char *author, con
         rc = sqlite3_step(st) == SQLITE_DONE ? 0 : -1;
         sqlite3_finalize(st);
     }
-    if (sqlite3_exec(db, rc == 0 ? "COMMIT" : "ROLLBACK", NULL, NULL, NULL) != SQLITE_OK) rc = -1;
     return rc;
 }
 
@@ -395,9 +394,9 @@ char *kb_tool_field(sqlite3 *db, const char *project, const char *name, int vers
     return r;
 }
 
-int kb_tool_publish(sqlite3 *db, const char *project, const char *author, const char *name, int *version, char **superseded) {
+/* Publish the author's draft as the next version; the caller owns the transaction. */
+static int publish_in(sqlite3 *db, const char *project, const char *author, const char *name, int *version, char **superseded) {
     *superseded = NULL;
-    if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) return -1;
     sqlite3_stmt *st = prep(db, "SELECT COALESCE(MAX(version), 0) + 1 FROM tools WHERE project = ?1 AND name = ?2");
     sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
@@ -434,6 +433,41 @@ int kb_tool_publish(sqlite3 *db, const char *project, const char *author, const 
         rc = sqlite3_step(st) == SQLITE_DONE ? 0 : -1;
         sqlite3_finalize(st);
     }
+    return rc;
+}
+
+/* Save the draft and, with publish, publish it, all in one transaction so a parallel define cannot swap the script between. */
+int kb_tool_define(sqlite3 *db, const char *project, const char *author, const char *author_model,
+                   const char *name, const char *description, const char *schema,
+                   const char *interpreter, const char *script, int net, int timeout,
+                   int publish, int *version, char **superseded) {
+    *version = 0;
+    *superseded = NULL;
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) return -1;
+    int rc = draft_put(db, project, author, author_model, name, description, schema, interpreter, script, net, timeout);
+    if (rc == 0 && publish) rc = publish_in(db, project, author, name, version, superseded);
+    if (sqlite3_exec(db, rc == 0 ? "COMMIT" : "ROLLBACK", NULL, NULL, NULL) != SQLITE_OK) rc = -1;
+    if (rc != 0) {
+        free(*superseded);
+        *superseded = NULL;
+    }
+    return rc;
+}
+
+int kb_tool_save_draft(sqlite3 *db, const char *project, const char *author, const char *author_model,
+                       const char *name, const char *description, const char *schema,
+                       const char *interpreter, const char *script, int net, int timeout) {
+    int v;
+    char *old;
+    return kb_tool_define(db, project, author, author_model, name, description, schema, interpreter, script, net,
+                          timeout, 0, &v, &old);
+}
+
+int kb_tool_publish(sqlite3 *db, const char *project, const char *author, const char *name, int *version, char **superseded) {
+    *version = 0;
+    *superseded = NULL;
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) return -1;
+    int rc = publish_in(db, project, author, name, version, superseded);
     if (sqlite3_exec(db, rc == 0 ? "COMMIT" : "ROLLBACK", NULL, NULL, NULL) != SQLITE_OK) rc = -1;
     if (rc != 0) {
         free(*superseded);

@@ -47,6 +47,10 @@ char *kb_tool_reason(sqlite3 *db, const struct kb_tool *t);       /* why t was r
 char *kb_tool_field(sqlite3 *db, const char *project, const char *name, int version, const char *column);   /* one text column of a version, or NULL */
 /* Promote the author's draft to a new pending version (deadline in 20 min), rejecting older pending and escalated ones.
  * *superseded gets "<pane>\t<review_root>\n" per pending review that was closed (caller frees). 0, or -1 (no draft). */
+int kb_tool_define(sqlite3 *db, const char *project, const char *author, const char *author_model,
+                   const char *name, const char *description, const char *schema,
+                   const char *interpreter, const char *script, int net, int timeout,
+                   int publish, int *version, char **superseded);
 int kb_tool_publish(sqlite3 *db, const char *project, const char *author, const char *name, int *version, char **superseded);
 int kb_tool_bind(sqlite3 *db, const char *project, const char *name, int version,
                  const char *pane, const char *model, const char *review_root);   /* rows changed: 0 or 1 */
