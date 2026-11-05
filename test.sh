@@ -13,7 +13,7 @@ t() { tmux -L cntctr-test -f /dev/null "$@"; }
 t kill-server 2>/dev/null
 t new-session -d -s test -x 200 -y 50 cat
 export TMUX="$(t display -p '#{socket_path}'),0,0"
-trap 't kill-server 2>/dev/null; rm -rf "$TMPD"' EXIT
+trap 't kill-server 2>/dev/null; sqlite3 "$CNTCTR_DB" "select review_root from tools where review_root > \"\"" 2>/dev/null | xargs rm -rf; rm -rf "$TMPD"' EXIT
 
 pass=0 fail=0
 ok_() { pass=$((pass + 1)); }
@@ -915,6 +915,19 @@ call "$FR" use '{"tool":"hello","args":{}}' >/dev/null
 [ ! -d "$RV/deadbeef-stray-v9" ] && ok_ || bad "an old stray review dir is swept"
 [ -d "$RV/deadbeef-young-v9" ] && ok_ || bad "a young stray review dir survives the sweep"
 rmdir "$RV/deadbeef-young-v9"
+
+# publishing never clobbers what is already under the final name, empty directory or not
+HK=$(python3 -c 'import sys;h=2166136261
+for c in sys.argv[1].encode(): h=((h^c)*16777619)&0xffffffff
+print("%08x"%h)' "$RK")
+for kind in full empty; do
+    d="$RV/$HK-cl$kind-v1"
+    mkdir -p "$d"
+    [ $kind = full ] && echo marker > "$d/marker"
+    check "publishing over an existing $kind copy dir fails" "$(publish "$FR" cl$kind 'true')" "already exists"
+    same "the existing $kind copy dir is left as it was" "$(ls -A "$d")" "$([ $kind = full ] && echo marker)"
+    rm -rf "$d"
+done
 tunset CNTCTR_TEST_VERDICT
 
 # a project without git

@@ -19,6 +19,9 @@
 #include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#ifndef __APPLE__
+#include <sys/syscall.h>
+#endif
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -1443,6 +1446,15 @@ static char *worktree_git(const char *root, const char *dst) {
 
 static void review_cleanup(const char *pane, const char *root);
 
+/* rename(2) that fails with EEXIST instead of replacing `to`, even an empty directory. */
+static int rename_noclobber(const char *from, const char *to) {
+#ifdef __APPLE__
+    return renamex_np(from, to, RENAME_EXCL);
+#else
+    return (int)syscall(SYS_renameat2, AT_FDCWD, from, AT_FDCWD, to, 1u /* RENAME_NOREPLACE */);   /* glibc before 2.28 has no wrapper */
+#endif
+}
+
 /* Copy the project root to a fresh review dir (untracked files included) and put its path in `path`.
  * The copy is built under a dot-prefixed name, which the stray sweep skips, and renamed when it is ready.
  * Returns NULL or an error (caller frees); `path` is set only on success. */
@@ -1471,8 +1483,10 @@ static char *review_copy(const struct project *p, const char *name, int version,
     /* cp -a can give the copy the source's old mtime and the sweep goes by age: make it young, then publish it by rename */
     if (!err && utimes(stage, NULL) != 0) err = fmt("cannot touch %s: %s", stage, strerror(errno));
     snprintf(path, 4096, "%s/%08x-%s-v%d", dir, hash32(p->key), name, version);
-    if (!err) review_cleanup(NULL, path);   /* this version is new, so a copy already under its name is a crash leftover */
-    if (!err && rename(stage, path) != 0) err = fmt("cannot move the review copy to %s: %s", path, strerror(errno));
+    /* never replace what is under the final name: it may be another project's live copy (the hash can collide) */
+    if (!err && rename_noclobber(stage, path) != 0)
+        err = errno == ENOTEMPTY || errno == EEXIST ? fmt("a review copy for %s v%d already exists; retry later", name, version)
+                                                    : fmt("cannot move the review copy to %s: %s", path, strerror(errno));
     if (err) {
         review_cleanup(NULL, stage);
         *path = '\0';
