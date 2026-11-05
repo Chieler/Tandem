@@ -1245,7 +1245,7 @@ static int tool_distill(json_object *a, char **res) {
    (NULL: none). Returns the "posted to ..." summary, or the error. Leaves `db` open. */
 static char *announce(sqlite3 *db, const char *scope, const char *sender, const char *text, const char *skip_pane) {
     struct project q;
-    char *panes, *posted = strdup("");   /* "<key>\n" per board written, for scope NULL */
+    char *panes, *posted = strdup("\n");   /* "\n" then "<key>\n" per board written, for scope NULL */
     if (scope && kb_post(db, scope, sender, text) != 0) return fmt("post failed: %s", sqlite3_errmsg(db));
     if (!scope) {   /* projects with tools, even with no live pane; the panes' own projects follow below */
         char *save, *t, *keys = kb_tool_projects(db);
@@ -1283,9 +1283,9 @@ static char *announce(sqlite3 *db, const char *scope, const char *sender, const 
         free(want);
         if (scope && strcmp(q.key, scope) != 0) continue;
         if (!scope) {   /* a review copy resolves to its project's key, so each board is written once */
-            char *mark = fmt("%s\n", q.key);
+            char *mark = fmt("\n%s\n", q.key);
             if (!strstr(posted, mark) && kb_post(db, q.key, sender, text) == 0) {
-                t = fmt("%s%s", posted, mark);
+                t = fmt("%s%s\n", posted, q.key);
                 free(posted);
                 posted = t;
             }
