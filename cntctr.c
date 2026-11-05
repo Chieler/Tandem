@@ -1441,31 +1441,42 @@ static char *worktree_git(const char *root, const char *dst) {
     return err;
 }
 
+static void review_cleanup(const char *pane, const char *root);
+
 /* Copy the project root to a fresh review dir (untracked files included) and put its path in `path`.
- * Returns NULL or an error (caller frees); the caller removes `path` on error. */
+ * The copy is built under a dot-prefixed name, which the stray sweep skips, and renamed when it is ready.
+ * Returns NULL or an error (caller frees); `path` is set only on success. */
 static char *review_copy(const struct project *p, const char *name, int version, char path[4096]) {
-    char dir[4096], *err, *out = NULL;
+    char dir[4096], stage[4096], *err, *out = NULL;
     if (review_dir(dir)) return fmt("cannot create the review directory");
-    snprintf(path, 4096, "%s/%08x-%s-v%d", dir, hash32(p->key), name, version);
-    if (mkdir(path, 0700) != 0) return fmt("cannot create %s: %s", path, strerror(errno));
-    char *src = fmt("%s/.", p->root), *git = fmt("%s/.git", p->root), *dst = fmt("%s/.git", path);
+    snprintf(stage, sizeof stage, "%s/.%08x-%s-v%d", dir, hash32(p->key), name, version);
+    if (mkdir(stage, 0700) != 0) return fmt("cannot create %s: %s", stage, strerror(errno));
+    char *src = fmt("%s/.", p->root), *git = fmt("%s/.git", p->root), *dst = fmt("%s/.git", stage);
     struct stat sb;
-    err = tmux_do(NULL, (const char *[]){"cp", CP_CLONE, src, path, NULL});
+    err = tmux_do(NULL, (const char *[]){"cp", CP_CLONE, src, stage, NULL});
     if (!err && lstat(git, &sb) == 0 && S_ISREG(sb.st_mode)) err = worktree_git(p->root, dst);
     /* a .git symlink that leaves the copy still points at the real repo: copy what it points at in its place */
     char *real = !err && lstat(git, &sb) == 0 && S_ISLNK(sb.st_mode) ? realpath(dst, NULL) : NULL;
-    size_t n = strlen(path);
-    if (real && !(strncmp(real, path, n) == 0 && real[n] == '/'))
+    size_t n = strlen(stage);
+    if (real && !(strncmp(real, stage, n) == 0 && real[n] == '/'))
         if (!(err = tmux_do(NULL, (const char *[]){"rm", "-f", dst, NULL}))) err = tmux_do(NULL, (const char *[]){"cp", CP_CLONE, real, dst, NULL});
     free(real);
-    if (!err) utimes(path, NULL);   /* cp -a can give the copy the source's old mtime; the stray sweep goes by age */
     /* git must see the copy as its own repository, or none at all, never the real checkout */
-    if (!err && run(NULL, &out, (const char *[]){"git", "-C", path, "rev-parse", "--show-toplevel", NULL}) == 0 && strcmp(out, path) != 0)
+    if (!err && run(NULL, &out, (const char *[]){"git", "-C", stage, "rev-parse", "--show-toplevel", NULL}) == 0 && strcmp(out, stage) != 0)
         err = fmt("the review copy resolves to another git checkout");
     free(out), out = NULL;
-    if (!err && run(NULL, &out, (const char *[]){"git", "-C", path, "rev-parse", "--absolute-git-dir", NULL}) == 0 && !(strncmp(out, path, n) == 0 && out[n] == '/'))
+    if (!err && run(NULL, &out, (const char *[]){"git", "-C", stage, "rev-parse", "--absolute-git-dir", NULL}) == 0 && !(strncmp(out, stage, n) == 0 && out[n] == '/'))
         err = fmt("the review copy's git dir is outside the copy");
     free(out), free(src), free(git), free(dst);
+    /* cp -a can give the copy the source's old mtime and the sweep goes by age: make it young, then publish it by rename */
+    if (!err && utimes(stage, NULL) != 0) err = fmt("cannot touch %s: %s", stage, strerror(errno));
+    snprintf(path, 4096, "%s/%08x-%s-v%d", dir, hash32(p->key), name, version);
+    if (!err) review_cleanup(NULL, path);   /* this version is new, so a copy already under its name is a crash leftover */
+    if (!err && rename(stage, path) != 0) err = fmt("cannot move the review copy to %s: %s", path, strerror(errno));
+    if (err) {
+        review_cleanup(NULL, stage);
+        *path = '\0';
+    }
     return err;
 }
 
