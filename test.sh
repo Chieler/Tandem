@@ -1014,6 +1014,11 @@ deft slowout 'cntctr call use "{\"tool\":\"slowin\"}"' '{"timeout":2}'
 t0=$SECONDS; out=$(use slowout); el=$((SECONDS - t0))
 same "a nested run inherits the outer deadline" "$(iserr "$out")" true
 [ "$el" -le 4 ] && ok_ || bad "nested slow tool took ${el}s, want <= 4"
+deft kb10 'yes a | head -c 10000'
+deft flood 'python3 -c "import socket,time;s=socket.socket(fileno=3);[s.sendall(b\"{\\\"tool\\\":\\\"use\\\",\\\"args\\\":{\\\"tool\\\":\\\"kb10\\\",\\\"args\\\":{}}}\\n\") for _ in range(100)];time.sleep(20)"' '{"timeout":30}'
+out=$(use flood)
+check "unread composition replies are capped" "$(txt "$out")" "unread"
+same "cntctr survives the flood" "$(txt "$(use inner)")" inner-ok
 check "call outside a tool fails" "$("$BIN" call recall '{}' 2>&1)" "cntctr call works only inside a fleet tool"
 check "calls are logged as history" "$(sqlite3 "$CNTCTR_DB" "SELECT group_concat(title) FROM entries WHERE layer='history' AND title LIKE 'tool fails v0 fr %'")" "tool fails v0 fr fail"
 

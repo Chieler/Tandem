@@ -433,7 +433,7 @@ int fleet_run(const struct fleet_run *r, char **out) {
     size_t woff = 0, soff = 0;
     long long deadline = r->deadline_ms ? r->deadline_ms : now_ms() + (long long)r->timeout * 1000;
     struct buf req = {0};
-    int ocap = 0, ecap = 0, timed_out = 0, status = 0, exited = 0;
+    int ocap = 0, ecap = 0, scap = 0, timed_out = 0, status = 0, exited = 0;
     put(&req, "", 0);
 
     while (!exited) {
@@ -457,6 +457,10 @@ int fleet_run(const struct fleet_run *r, char **out) {
         if (sock >= 0) {
             drain(&sock, &req, LINE_CAP);
             serve_lines(r, &req, &sout);   /* complete lines first; an incomplete oversized one is never run */
+            if (sout.len - soff > OUT_CAP) {   /* the tool is not reading its replies */
+                scap = 1;
+                break;
+            }
             while (sock >= 0 && soff < sout.len) {
                 ssize_t w = write(sock, sout.p + soff, sout.len - soff);
                 if (w > 0) soff += (size_t)w;
@@ -483,7 +487,11 @@ int fleet_run(const struct fleet_run *r, char **out) {
     close_fd(&win), close_fd(&rout), close_fd(&rerr), close_fd(&sock);
     free(req.p);
 
-    if (timed_out) {
+    if (scap) {
+        char *head = fmt("tool %s was stopped: it left over %d KB of cntctr call replies unread", r->name, OUT_CAP / 1024);
+        *out = error_with(head, &ebuf);
+        free(head);
+    } else if (timed_out) {
         char *head = fmt("tool %s timed out after %d s", r->name, r->timeout);
         *out = error_with(head, &ebuf);
         free(head);
