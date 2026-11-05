@@ -2221,8 +2221,8 @@ static void fifo_register(void) {
     int rd = -1, wr = -1, ok = 0;
     pthread_t th;
     if (mkfifo(tmp, 0600) == 0) {
-        rd = open(tmp, O_RDONLY | O_NONBLOCK);
-        wr = rd >= 0 ? open(tmp, O_WRONLY) : -1;
+        rd = open(tmp, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        wr = rd >= 0 ? open(tmp, O_WRONLY | O_CLOEXEC) : -1;
         ok = wr >= 0 && rename(tmp, fifo_path) == 0 && pthread_create(&th, NULL, fifo_watch, (void *)(intptr_t)rd) == 0;
     }
     if (ok) {
