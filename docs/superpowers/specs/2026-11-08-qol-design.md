@@ -82,7 +82,18 @@ Unchanged except new statuses and fields:
 
 ### Usage limit
 
-A pane is `limited` when its last 15 lines match one of a fixed list of regexes, kept beside `PROMPTS` and built from real screens of Claude Code, Codex and agy (collected during implementation, case-insensitive). Starting candidates: `hit your (usage )?limit`, `usage limit`, `rate limit reached`, `quota exceeded`. `resets` is the matched line, trimmed.
+A pane is `limited` when its last 15 lines match one of these case-insensitive regexes, kept beside `PROMPTS`:
+
+| harness | screen text (observed) | regex |
+|---|---|---|
+| Claude Code | `You've hit your session limit · resets 10:40pm (America/Chicago)`, `You've hit your weekly limit` | `hit your (session\|weekly\|usage) limit` |
+| Claude Code | `Usage limit reached · continuing automatically at 10:40pm · esc to cancel` | `usage limit reached` |
+| Codex | `Usage limit reached` / `Request a limit increase from your owner to continue using codex.` | `usage limit reached` |
+| agy | `⚠ Individual quota reached. ... Resets in 143h57m55s.` | `individual quota reached` |
+
+`resets` is the text after `resets`, `Resets in` or `continuing automatically at` on the matched screen, trimmed; empty if none.
+
+Claude Code can resume on its own after the reset, so a `limited` task may still answer later. Its reply then reaches the caller's pane like any late reply.
 
 Each gather or send task may carry `fallback`: an agent name, a role, or a harness (`claude`, `codex`, `agy`).
 
@@ -115,7 +126,15 @@ agy-1 agy %15 alive limited tasks=9f8e7d6c resets="resets 3:00am"
 claude-4 claude %16 alive idle idle=4m
 ```
 
-- **state**: `busy`, `idle`, `limited`, `permission`, `dead`, or `unknown`. `busy` matches the harness's working marker (`esc to interrupt` for Claude Code and Codex; agy's marker if one exists, else `unknown`). Check order: dead, limited, permission, busy, idle.
+- **state**: `busy`, `idle`, `limited`, `permission`, or `dead`. Check order: dead, limited, permission, busy, idle. `busy` markers, observed live on 2026-11-08:
+
+  | harness | busy when the last lines contain |
+  |---|---|
+  | Claude Code | `esc to interrupt` (status line) |
+  | Codex | `esc to interrupt` (`• Working (40s • esc to interrupt)`) |
+  | agy | `esc to cancel` (model working) or `task(s) · /tasks` (a background shell task is running, e.g. `● sleep 45 running`) |
+
+  Anything else is `idle`.
 - **tasks**: ids from `@cntctr_to_<id>` whose value is this pane.
 - **idle**: now minus `#{window_activity}`.
 - **resets**: only when `limited`.
