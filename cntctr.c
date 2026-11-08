@@ -785,18 +785,32 @@ static void wait_tasks(struct gathered *items, size_t n, time_t deadline) {
     }
 }
 
-/* Settle tasks still pending after wait_tasks. */
+/* Settle tasks still pending after wait_tasks. Clearing the wait flag first means
+ * tool_reply types any later reply into the caller's pane; the claim after it catches
+ * a reply that raced the clear. After a cancel nobody reads our result, so every
+ * answer we hold goes to the caller's pane instead. */
 static void finish_pending(struct gathered *items, size_t n) {
-    for (size_t i = 0; i < n; i++)
-        if (!items[i].status) {
+    int gone = cancelled();
+    for (size_t i = 0; i < n; i++) {
+        struct gathered *it = &items[i];
+        if (!it->status) {
             char buf[40];
-            snprintf(buf, sizeof buf, "cntctr-reply-%s", items[i].id);
-            unwait(items[i].id);
-            if ((items[i].text = buffer_take(buf))) {   /* replied just before the deadline */
-                untrack(items[i].id);
-                items[i].status = "answered";
-            } else items[i].status = "timed_out";
+            snprintf(buf, sizeof buf, "cntctr-reply-%s", it->id);
+            unwait(it->id);
+            if ((it->text = buffer_take(buf))) {
+                untrack(it->id);
+                it->status = "answered";
+            } else {
+                it->status = "timed_out";
+            }
         }
+        if (gone && strcmp(it->status, "answered") == 0) {
+            char *env = fmt("[cntctr reply from=%s id=%s]\n%s", it->agent ? it->agent : "?", it->id, it->text);
+            char *err = inject(caller_pane, "your pane", env);
+            free(env);
+            free(err);   /* ponytail: a failed inject here loses the reply; retry loop if this ever shows up */
+        }
+    }
 }
 
 static char *gather_json(struct gathered *items, size_t n) {
@@ -1125,6 +1139,8 @@ static int tool_gather(json_object *a, char **res) {
     size_t count = json_object_array_length(tasks);
     struct gathered *items = calloc(count, sizeof *items);
     time_t deadline = time(NULL) + targ(a);
+    json_object *flag;
+    int wait = !json_object_object_get_ex(a, "wait", &flag) || json_object_get_boolean(flag);
     for (size_t i = 0; i < count; i++) {
         struct gathered *item = &items[i];
         json_object *task = json_object_array_get_idx(tasks, i), *unused;
@@ -1139,17 +1155,22 @@ static int tool_gather(json_object *a, char **res) {
         } else if (cancelled()) {
             item->text = strdup("gather cancelled before dispatch");
         } else if (item->kind && strcmp(item->kind, "send") == 0) {
-            start_send(task, 1, item->id, &item->pane, &item->text);
+            start_send(task, wait, item->id, &item->pane, &item->text);
         } else if (item->kind && strcmp(item->kind, "spawn") == 0) {
-            start_spawn(task, 1, item->id, &item->pane, NULL, &item->text);
+            start_spawn(task, wait, item->id, &item->pane, NULL, &item->text);
         } else {
             item->text = strdup("gather task kind must be send or spawn");
         }
         if (!item->pane) item->status = "failed";
     }
 
-    wait_tasks(items, count, deadline);
-    finish_pending(items, count);
+    if (!wait) {
+        for (size_t i = 0; i < count; i++)
+            if (!items[i].status) items[i].status = "sent";
+    } else {
+        wait_tasks(items, count, deadline);
+        finish_pending(items, count);
+    }
     char *wire = gather_json(items, count);
     free_items(items, count);
     return ok(res, wire);
@@ -1479,8 +1500,9 @@ static const char TOOLS[] =
     "\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"},"
     "\"timeout\":{\"type\":\"integer\",\"description\":\"Seconds to block when wait=true (default 600)\"}},"
     "\"required\":[\"to\",\"text\"]}},"
-    "{\"name\":\"gather\",\"description\":\"Dispatch delegated send or spawn tasks, then return one JSON result when all answer or the shared deadline expires. Check complete before deciding.\","
+    "{\"name\":\"gather\",\"description\":\"Dispatch delegated send or spawn tasks, then return one JSON result when all answer or the shared deadline expires. Check complete before deciding. Each result has a status: answered, timed_out, dead, limited (with resets), failed, or sent when wait=false. Replies that arrive after a timeout or cancel are typed into your pane.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+    "\"wait\":{\"type\":\"boolean\",\"description\":\"Default true. false: send every task and return their ids at once; replies arrive in your pane as they come\"},"
     "\"tasks\":{\"type\":\"array\",\"minItems\":1,\"items\":{\"type\":\"object\",\"properties\":{"
     "\"kind\":{\"type\":\"string\",\"enum\":[\"send\",\"spawn\"]},"
     "\"to\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},"

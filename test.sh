@@ -51,6 +51,17 @@ expect_screen() {
     for _ in $(seq 50); do screen "$2" | grep -qF -- "$3" && { ok_; return; }; sleep 0.1; done
     bad "$1" "  pane $2 never showed: $3"
 }
+# daemon_start <pane>: a long-lived cntctr as <pane>'s agent; daemon_send <line>; daemon_stop
+daemon_start() {
+    DFIFO=$(mktemp -u "$TMPD/dfifo.XXXXXX"); mkfifo "$DFIFO"
+    DOUT=$(mktemp "$TMPD/dout.XXXXXX")
+    TMUX_PANE=$1 "$BIN" < "$DFIFO" > "$DOUT" & DPID=$!
+    exec 4> "$DFIFO"
+    printf '%s\n' "$INIT" >&4
+}
+daemon_send() { printf '%s\n' "$1" >&4; }
+daemon_stop() { exec 4>&-; wait "$DPID" 2>/dev/null; rm -f "$DFIFO"; }
+
 # lastid <pane>: id of the newest message envelope shown in the pane
 lastid() { screen "$1" | sed -n 's/.*\[cntctr from=[^ ]* id=\([0-9a-f]\{8\}\)\].*/\1/p' | tail -n 1; }
 # newpane <name> [command...]: open a tagged window running cat (or <command>), print its pane id
@@ -300,6 +311,30 @@ same "limited task reset" "$(printf '%s' "$gather" | jq -r '.results[0].resets')
 call "$GL" reply "{\"id\":\"$(printf '%s' "$gather" | jq -r '.results[0].id')\",\"text\":\"after reset\"}" >/dev/null
 expect_screen "limited worker's late reply reaches caller" "$S" "after reset"
 t kill-pane -t "$GL"
+
+# cancel: an answer claimed before the cancel and one arriving after both reach the caller's pane
+daemon_start "$S"
+daemon_send '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"gather","arguments":{"tasks":[{"kind":"send","to":"ga","text":"cancel one"},{"kind":"send","to":"gb","text":"cancel two"}],"timeout":30}}}'
+expect_screen "cancel gather sent to ga" "$GA" "cancel one"
+expect_screen "cancel gather sent to gb" "$GB" "cancel two"
+call "$GA" reply "{\"id\":\"$(lastid "$GA")\",\"text\":\"before cancel\"}" >/dev/null
+sleep 1.5
+daemon_send '{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":5}}'
+sleep 1.5
+call "$GB" reply "{\"id\":\"$(lastid "$GB")\",\"text\":\"after cancel\"}" >/dev/null
+daemon_stop
+expect_screen "answer claimed before cancel reaches pane" "$S" "before cancel"
+expect_screen "answer after cancel reaches pane" "$S" "after cancel"
+
+# wait=false returns ids at once; replies arrive in the pane
+start=$(date +%s)
+gather=$(txt "$(call "$S" gather '{"tasks":[{"kind":"send","to":"ga","text":"async one"}],"wait":false,"timeout":5}')")
+[ $(( $(date +%s) - start )) -lt 3 ] && ok_ || bad "async gather returns at once"
+same "async gather status" "$(printf '%s' "$gather" | jq -r '.results[0].status')" sent
+same "async gather is not complete" "$(printf '%s' "$gather" | jq -r '.complete')" false
+expect_screen "async gather dispatched" "$GA" "async one"
+call "$GA" reply "{\"id\":\"$(lastid "$GA")\",\"text\":\"async answer\"}" >/dev/null
+expect_screen "async gather answer reaches pane" "$S" "async answer"
 
 # a worker that dies ends its task as dead
 GD=$(newpane gd sh -c 'sleep 2')
