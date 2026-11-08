@@ -821,7 +821,10 @@ static int tool_list(json_object *args, char **res) {
         enum pstate st = pane_state(pane, &resets);
         for (const char *l = opts; *l; l += strcspn(l, "\n") + (l[strcspn(l, "\n")] == '\n')) {
             char id[9], val[32];
-            if (sscanf(l, "@cntctr_to_%8[0-9a-f] %31s", id, val) == 2 && strcmp(val, pane) == 0) {
+            if (sscanf(l, "@cntctr_to_%8[0-9a-f] %31s", id, val) != 2) continue;
+            char *q = val + (*val == '"');   /* tmux show quotes values: "%14" */
+            q[strcspn(q, "\"")] = '\0';
+            if (strcmp(q, pane) == 0) {
                 char *t = fmt("%s%s%s", tasks, *tasks ? "," : "", id);
                 free(tasks);
                 tasks = t;

@@ -121,6 +121,15 @@ check "agy quota reset" "$out" 'resets="143h57m55s"'
 check "agy background task is busy" "$out" "st-agyt test $AGYT alive busy"
 check "limit text above the last 15 lines is ignored" "$out" "st-old test $OLD alive idle"
 check "list shows idle time" "$out" "st-idle test $IDLE alive idle idle="
+PERM=$(newpane st-perm sh -c 'printf "%s\n" "Do you want to proceed?"; exec cat')
+PEND=$(newpane st-pend 'stty -echo; cat')
+sleep 0.5
+pid=$(txt "$(call "$IDLE" send '{"to":"st-pend","text":"pending"}')" | sed 's/sent id=//')
+out=$(txt "$(call "$IDLE" list '{}')")
+check "list shows permission" "$out" "st-perm test $PERM alive permission"
+check "list shows open task id" "$out" "st-pend test $PEND alive"
+check "open task listed" "$out" "tasks=$pid"
+t kill-pane -t "$PERM"; t kill-pane -t "$PEND"
 
 # ---- send ----
 out=$(call "$A" send '{"to":"b","text":"hello from a"}')
