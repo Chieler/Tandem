@@ -481,6 +481,18 @@ same "duplicate spawn name" "$(txt "$out")" "agent w1 already exists"
 out=$(call "$L" spawn '{"harness":"vim","name":"w9","task":"x"}')
 same "unknown harness" "$(txt "$out")" "unknown harness vim"
 
+# to: "parent"
+call "$L" spawn '{"harness":"claude","name":"kid","task":"hello"}' >/dev/null
+KID=$(t list-panes -a -F '#{pane_id} #{@cntctr_name}' | awk '$2=="kid"{print $1}')
+same "spawn records parent" "$(t show -pqv -t "$KID" @cntctr_parent)" "$L"
+call "$KID" send '{"to":"parent","text":"to my parent"}' >/dev/null
+expect_screen "to:parent reaches the spawner" "$L" "to my parent"
+out=$(session "" 2 "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send","arguments":{"from":"kid","to":"parent","text":"via shared server"}}}' | tail -n 1)
+expect_screen "to:parent works through from= (Codex)" "$L" "via shared server"
+out=$(call "$S" send '{"to":"parent","text":"orphan"}')
+same "no parent is an error" "$(iserr "$out")" true
+check "no parent message" "$(txt "$out")" "you have no parent"
+
 same "kill worker" "$(txt "$(call "$L" kill '{"name":"w1"}')")" ok
 refute "killed worker gone from list" "$(txt "$(call "$L" list '{}')")" "w1 claude"
 same "kill self refused" "$(txt "$(call "$L" kill '{"name":"lead"}')")" "cannot kill yourself"

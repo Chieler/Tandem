@@ -465,6 +465,8 @@ static char *merge_mem(sqlite3 *db, char *out, const char *table) {
 
 /* ---- agents and delivery ---- */
 
+static int pane_alive(const char *pane);
+
 /* Pane id of the agent called `name` (caller frees), or NULL. */
 static char *find_agent(const char *name) {
     char *out, *pane = NULL, *save;
@@ -478,6 +480,22 @@ static char *find_agent(const char *name) {
             }
         }
     free(out);
+    return pane;
+}
+
+/* Pane for a message target (caller frees): "parent" is whoever spawned the caller,
+ * anything else an agent name. NULL with *err set otherwise. */
+static char *resolve_target(const char *to, char **err) {
+    *err = NULL;
+    if (strcmp(to, "parent") == 0) {
+        char *p;
+        if (TMUX(NULL, &p, "show", "-pqv", "-t", caller_pane, "@cntctr_parent") == 0 && *p && pane_alive(p)) return p;
+        free(p);
+        *err = fmt("you have no parent (only spawned agents have one)");
+        return NULL;
+    }
+    char *pane = find_agent(to);
+    if (!pane) *err = fmt("agent %s not found", to);
     return pane;
 }
 
@@ -507,8 +525,6 @@ static regex_t limit_re[sizeof LIMITS / sizeof *LIMITS], busy_re[sizeof BUSY / s
 
 enum pstate { P_IDLE, P_BUSY, P_PERMISSION, P_LIMITED, P_DEAD };
 static const char *PSTATE[] = {"idle", "busy", "permission", "limited", "dead"};
-
-static int pane_alive(const char *pane);
 
 /* Last 15 lines of `pane` (caller frees), or NULL if the pane is gone. */
 static char *pane_tail(const char *pane) {
@@ -937,8 +953,8 @@ static int tool_list(json_object *args, char **res) {
 static int start_send(json_object *a, int wait, char id[9], char **pane_out, char **res) {
     const char *to = sarg(a, "to"), *text = sarg(a, "text");
     if (!to || !text) return fail(res, fmt("send needs 'to' and 'text'"));
-    char *pane = find_agent(to);
-    if (!pane) return fail(res, fmt("agent %s not found", to));
+    char *rerr, *pane = resolve_target(to, &rerr);
+    if (!pane) return fail(res, rerr);
     char *env, *err;
     new_id(id);
     track(id, wait);
@@ -1111,6 +1127,7 @@ static int start_spawn(json_object *a, int wait, char id[9], char **pane_out,
     track_to(id, pane);
     free(TMUXE(NULL, "set", "-p", "-t", pane, "@cntctr_name", name));
     free(TMUXE(NULL, "set", "-p", "-t", pane, "@cntctr_harness", harness));
+    if (*caller_pane) free(TMUXE(NULL, "set", "-p", "-t", pane, "@cntctr_parent", caller_pane));
     char *title = fmt("task %s %s→%s", id, caller_name, name);
     log_history(caller_pane, title, task);
     free(title);
@@ -1496,7 +1513,7 @@ static const char TOOLS[] =
     "{\"name\":\"send\",\"description\":\"Send a message to another agent's terminal. Returns the message id at once. "
     "With wait=true, blocks until the receiver calls reply; if the timeout passes first, the reply arrives in your terminal later.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
-    "\"to\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},\"wait\":{\"type\":\"boolean\"},"
+    "\"to\":{\"type\":\"string\",\"description\":\"Agent name, or \\\"parent\\\" for the agent that spawned you\"},\"text\":{\"type\":\"string\"},\"wait\":{\"type\":\"boolean\"},"
     "\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"},"
     "\"timeout\":{\"type\":\"integer\",\"description\":\"Seconds to block when wait=true (default 600)\"}},"
     "\"required\":[\"to\",\"text\"]}},"
@@ -1505,7 +1522,7 @@ static const char TOOLS[] =
     "\"wait\":{\"type\":\"boolean\",\"description\":\"Default true. false: send every task and return their ids at once; replies arrive in your pane as they come\"},"
     "\"tasks\":{\"type\":\"array\",\"minItems\":1,\"items\":{\"type\":\"object\",\"properties\":{"
     "\"kind\":{\"type\":\"string\",\"enum\":[\"send\",\"spawn\"]},"
-    "\"to\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},"
+    "\"to\":{\"type\":\"string\",\"description\":\"Agent name, or \\\"parent\\\" for the agent that spawned you\"},\"text\":{\"type\":\"string\"},"
     "\"harness\":{\"type\":\"string\",\"enum\":[\"claude\",\"codex\",\"agy\"]},"
     "\"name\":{\"type\":\"string\"},\"task\":{\"type\":\"string\"},"
     "\"cwd\":{\"type\":\"string\"},\"tier\":{\"type\":\"string\"},"
