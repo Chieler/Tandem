@@ -280,6 +280,40 @@ same "gather failure is incomplete" "$(printf '%s' "$gather" | jq -r '.complete'
 same "gather records dispatch failure" "$(printf '%s' "$gather" | jq -r '.results[0].status')" failed
 same "gather keeps later answer" "$(printf '%s' "$gather" | jq -r '.results[1].text')" "good answer"
 
+# answers arrive out of order; each lands on its own task
+call "$S" gather '{"tasks":[{"kind":"send","to":"ga","text":"order one"},{"kind":"send","to":"gb","text":"order two"}],"timeout":10}' > "$TMPD/gather-order" & gather_pid=$!
+expect_screen "order gather sent to ga" "$GA" "order one"
+expect_screen "order gather sent to gb" "$GB" "order two"
+call "$GB" reply "{\"id\":\"$(lastid "$GB")\",\"text\":\"b first\"}" >/dev/null
+call "$GA" reply "{\"id\":\"$(lastid "$GA")\",\"text\":\"a second\"}" >/dev/null
+wait "$gather_pid"
+gather=$(txt "$(cat "$TMPD/gather-order")")
+same "out-of-order answers map to tasks" "$(printf '%s' "$gather" | jq -r '[.results[].text] | join(",")')" "a second,b first"
+
+# a limited worker ends its task at once; its later reply still reaches the caller
+GL=$(newpane gl sh -c 'printf "%s\n" "Usage limit reached * resets 3:00am"; exec cat')
+start=$(date +%s)
+gather=$(txt "$(call "$S" gather '{"tasks":[{"kind":"send","to":"gl","text":"never"}],"timeout":30}')")
+same "limited task status" "$(printf '%s' "$gather" | jq -r '.results[0].status')" limited
+same "limited task reset" "$(printf '%s' "$gather" | jq -r '.results[0].resets')" "3:00am"
+[ $(( $(date +%s) - start )) -lt 10 ] && ok_ || bad "limited task returned before the timeout"
+call "$GL" reply "{\"id\":\"$(printf '%s' "$gather" | jq -r '.results[0].id')\",\"text\":\"after reset\"}" >/dev/null
+expect_screen "limited worker's late reply reaches caller" "$S" "after reset"
+t kill-pane -t "$GL"
+
+# a worker that dies ends its task as dead
+GD=$(newpane gd sh -c 'sleep 2')
+t set -p -t "$GD" remain-on-exit on
+gather=$(txt "$(call "$S" gather '{"tasks":[{"kind":"send","to":"gd","text":"die"}],"timeout":30}')")
+same "dead task status" "$(printf '%s' "$gather" | jq -r '.results[0].status')" dead
+
+# blocking send to a limited worker says so
+GL=$(newpane gl sh -c 'printf "%s\n" "Usage limit reached * resets 3:00am"; exec cat')
+out=$(txt "$(call "$S" send '{"to":"gl","text":"blocked","wait":true,"timeout":30}')")
+check "blocking send reports limit" "$out" "hit its usage limit (resets 3:00am)"
+t kill-pane -t "$GL"
+t kill-pane -t "$GD"
+
 R=$(newpane r)
 { printf '%s\n' "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send","arguments":{"to":"b","text":"cancel me","wait":true,"timeout":30}}}'
   sleep 1

@@ -693,26 +693,6 @@ static char *sopt_get(const char *name) {
     return NULL;
 }
 
-/* Block until channel `chan` is signalled (1) or `secs` pass (0). */
-static int wait_signal(const char *chan, int secs) {
-    int p[2];
-    pthread_mutex_lock(&fork_mu);
-    if (cloexec_pipe(p) < 0) {
-        pthread_mutex_unlock(&fork_mu);
-        return 0;
-    }
-    pid_t pid = start((const char *[]){"tmux", "wait-for", chan, NULL}, -1, p[1]);
-    pthread_mutex_unlock(&fork_mu);
-    close(p[1]);
-    struct pollfd pfd = {p[0], POLLIN, 0};
-    int ready;
-    while ((ready = poll(&pfd, 1, secs * 1000)) < 0 && errno == EINTR) {}
-    close(p[0]);
-    if (pid < 0) return 0;
-    if (ready == 0) kill(pid, SIGTERM);   /* its pipe closes only when it exits, so silence means still waiting */
-    return reap(pid) == 0 && ready > 0;
-}
-
 static int buffer_exists(const char *buf) {
     char *err = TMUXE(NULL, "show-buffer", "-b", buf);
     free(err);
@@ -736,45 +716,126 @@ static char *buffer_take(const char *buf) {
     return text;
 }
 
-#define WAIT_SLICE 5   /* seconds between checks for a lost signal or a dead worker */
+/* ---- waiting ---- */
 
-/* Block for the reply to message `id`, sent to agent `who` in `pane`. */
-static int await_reply(const char *id, const char *pane, const char *who, int timeout, int *timed_out, char **res) {
-    if (timed_out) *timed_out = 0;
-    char chan[32], buf[40], opt[48];
-    snprintf(chan, sizeof chan, "cntctr-%s", id);
-    snprintf(buf, sizeof buf, "cntctr-reply-%s", id);
+struct gathered {
+    const char *kind, *agent, *status;   /* status: NULL while pending */
+    char id[9], *pane, *text, *resets;
+};
+
+static void unwait(const char *id) {
+    char opt[48];
     snprintf(opt, sizeof opt, "@cntctr_wait_%s", id);
-    int gone = 0;
-    for (time_t end = time(NULL) + timeout;;) {
-        if (cancelled()) break;
-        int left = (int)(end - time(NULL));
-        if (left <= 0) break;
-        /* tmux keeps a killed wait-for queued, and it can swallow a later signal,
-         * so the buffer is checked after every slice as well. */
-        if (wait_signal(chan, left < WAIT_SLICE ? left : WAIT_SLICE) || buffer_exists(buf)) break;
-        if ((gone = !pane_alive(pane)) || cancelled()) break;
+    free(TMUXE(NULL, "set", "-su", opt));
+}
+
+/* One check of a pending task. Claims the reply if one arrived. 1 when it->status got set. */
+static int poll_task(struct gathered *it) {
+    char buf[40];
+    snprintf(buf, sizeof buf, "cntctr-reply-%s", it->id);
+    if (buffer_exists(buf)) {
+        unwait(it->id);   /* stop repliers from signalling us, then claim */
+        if ((it->text = buffer_take(buf))) {
+            untrack(it->id);
+            it->status = "answered";
+            return 1;
+        }
     }
-    free(TMUXE(NULL, "set", "-su", opt));   /* stop repliers from signalling us, then claim */
-    char *text = buffer_take(buf);
-    if (text && cancelled()) {   /* nobody reads our result anymore: type the reply into our pane */
-        char *env = fmt("[cntctr reply from=%s id=%s]\n%s", who, id, text), *err = inject(caller_pane, "your pane", env);
-        free(env);
-        free(text);
-        if (err) return fail(res, err);
-        untrack(id);
-        return ok(res, fmt("cancelled; reply delivered to your pane (id=%s)", id));
+    char *resets = NULL;
+    enum pstate st = pane_state(it->pane, &resets);
+    if (st == P_DEAD) {
+        unwait(it->id);
+        if ((it->text = buffer_take(buf))) {   /* answered just before exiting */
+            untrack(it->id);
+            it->status = "answered";
+            return 1;
+        }
+        untrack(it->id);
+        it->text = fmt("agent %s exited before replying (id=%s)", it->agent, it->id);
+        it->status = "dead";
+        return 1;
     }
-    if (text) {
-        untrack(id);
-        return ok(res, text);
+    if (st == P_LIMITED) {
+        unwait(it->id);   /* a reply after the reset goes to the caller's pane */
+        it->resets = resets;
+        it->status = "limited";
+        return 1;
     }
-    if (gone) {
-        untrack(id);
-        return fail(res, fmt("agent %s exited before replying (id=%s)", who, id));
+    free(resets);
+    return 0;
+}
+
+#define POLL_MS 1000   /* ponytail: polls every pending task each second; tmux wait-for per task if gathers grow large */
+
+/* Wait until every task has a status, the deadline passes, or the call is cancelled. */
+static void wait_tasks(struct gathered *items, size_t n, time_t deadline) {
+    for (;;) {
+        size_t pending = 0;
+        for (size_t i = 0; i < n; i++)
+            if (!items[i].status && !poll_task(&items[i])) pending++;
+        if (!pending || cancelled() || time(NULL) >= deadline) return;
+        struct timespec pause = {POLL_MS / 1000, (POLL_MS % 1000) * 1000000L};
+        nanosleep(&pause, NULL);
     }
-    if (timed_out) *timed_out = 1;
-    return ok(res, fmt("timed out; reply will arrive in your pane (id=%s)", id));
+}
+
+/* Settle tasks still pending after wait_tasks. */
+static void finish_pending(struct gathered *items, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        if (!items[i].status) {
+            unwait(items[i].id);
+            items[i].status = "timed_out";
+        }
+}
+
+static char *gather_json(struct gathered *items, size_t n) {
+    json_object *out = json_object_new_object(), *results = json_object_new_array();
+    int complete = 1;
+    for (size_t i = 0; i < n; i++) {
+        struct gathered *it = &items[i];
+        int answered = strcmp(it->status, "answered") == 0;
+        if (!answered) complete = 0;
+        json_object *e = json_object_new_object();
+        json_object_object_add(e, "kind", json_object_new_string(it->kind ? it->kind : ""));
+        json_object_object_add(e, "agent", json_object_new_string(it->agent ? it->agent : ""));
+        json_object_object_add(e, "status", json_object_new_string(it->status));
+        if (*it->id) json_object_object_add(e, "id", json_object_new_string(it->id));
+        if (it->resets) json_object_object_add(e, "resets", json_object_new_string(it->resets));
+        if (it->text) json_object_object_add(e, answered ? "text" : "error", json_object_new_string(it->text));
+        json_object_array_add(results, e);
+    }
+    json_object_object_add(out, "complete", json_object_new_boolean(complete));
+    json_object_object_add(out, "results", results);
+    char *wire = strdup(json_object_to_json_string_ext(out, JSON_C_TO_STRING_PLAIN));
+    json_object_put(out);
+    return wire;
+}
+
+static void free_items(struct gathered *items, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        free(items[i].pane);
+        free(items[i].text);
+        free(items[i].resets);
+    }
+    free(items);
+}
+
+/* Blocking send or spawn: one task through the same loop as gather. Does not take `pane`. */
+static int wait_one(const char *id, char *pane, const char *who, json_object *a, char **res) {
+    struct gathered it = {.kind = "send", .agent = who, .pane = pane};
+    snprintf(it.id, sizeof it.id, "%s", id);
+    wait_tasks(&it, 1, time(NULL) + targ(a));
+    finish_pending(&it, 1);
+    int r;
+    if (strcmp(it.status, "answered") == 0) r = ok(res, it.text), it.text = NULL;
+    else if (strcmp(it.status, "dead") == 0) r = fail(res, it.text), it.text = NULL;
+    else if (strcmp(it.status, "limited") == 0)
+        r = ok(res, fmt("agent %s hit its usage limit%s%s%s; reply will arrive in your pane (id=%s)", who,
+                        it.resets ? " (resets " : "", it.resets ? it.resets : "", it.resets ? ")" : "", id));
+    else r = ok(res, fmt("timed out; reply will arrive in your pane (id=%s)", id));
+    free(it.text);
+    free(it.resets);
+    return r;
 }
 
 /* ---- model router ---- */
@@ -876,7 +937,7 @@ static int tool_send(json_object *a, char **res) {
     int wait = barg(a, "wait");
     char id[9], *pane;
     if (start_send(a, wait, id, &pane, res)) return 1;
-    int r = wait ? await_reply(id, pane, sarg(a, "to"), targ(a), NULL, res)
+    int r = wait ? wait_one(id, pane, sarg(a, "to"), a, res)
                  : ok(res, fmt("sent id=%s", id));
     free(pane);
     return r;
@@ -925,7 +986,7 @@ static int tool_reply(json_object *a, char **res) {
     to = sopt_get(opt);
     remember_reply(id, to, sender, text, a);
 
-    /* Write the buffer before checking the wait flag; await_reply clears the flag
+    /* Write the buffer before checking the wait flag; wait_tasks clears the flag
      * before claiming. That ordering means no reply is lost. */
     snprintf(buf, sizeof buf, "cntctr-reply-%s", id);
     if ((err = TMUXE(text, "load-buffer", "-b", buf, "-"))) {
@@ -934,7 +995,7 @@ static int tool_reply(json_object *a, char **res) {
         return fail(res, err);
     }
     snprintf(opt, sizeof opt, "@cntctr_wait_%s", id);
-    if ((waiting = sopt_get(opt))) {   /* sender is blocked in await_reply: wake it */
+    if ((waiting = sopt_get(opt))) {   /* sender is blocked in wait_one: wake it */
         free(waiting);
         free(sender);
         free(to);
@@ -1037,16 +1098,11 @@ static int tool_spawn(json_object *a, char **res) {
     int wait = barg(a, "wait");
     char id[9], *pane, *summary = NULL;
     if (start_spawn(a, wait, id, &pane, wait ? NULL : &summary, res)) return 1;
-    int r = wait ? await_reply(id, pane, sarg(a, "name"), targ(a), NULL, res)
+    int r = wait ? wait_one(id, pane, sarg(a, "name"), a, res)
                  : ok(res, summary);
     free(pane);
     return r;
 }
-
-struct gathered {
-    const char *kind, *agent, *status;
-    char id[9], *pane, *text;
-};
 
 static int tool_gather(json_object *a, char **res) {
     json_object *tasks = NULL;
@@ -1081,40 +1137,10 @@ static int tool_gather(json_object *a, char **res) {
         if (!item->pane) item->status = "failed";
     }
 
-    int complete = 1;
-    for (size_t i = 0; i < count; i++) {
-        struct gathered *item = &items[i];
-        if (item->pane) {
-            int left = (int)(deadline - time(NULL)), timed_out = 0;
-            if (left < 0) left = 0;
-            int error = await_reply(item->id, item->pane, item->agent,
-                                    left, &timed_out, &item->text);
-            item->status = error ? "failed" : timed_out ? "timed_out" : "answered";
-            if (timed_out) { free(item->text); item->text = NULL; }
-        }
-        if (strcmp(item->status, "answered") != 0) complete = 0;
-    }
-
-    json_object *out = json_object_new_object(), *results = json_object_new_array();
-    json_object_object_add(out, "complete", json_object_new_boolean(complete));
-    json_object_object_add(out, "results", results);
-    for (size_t i = 0; i < count; i++) {
-        struct gathered *item = &items[i];
-        json_object *entry = json_object_new_object();
-        json_object_object_add(entry, "kind", json_object_new_string(item->kind ? item->kind : ""));
-        json_object_object_add(entry, "agent", json_object_new_string(item->agent ? item->agent : ""));
-        json_object_object_add(entry, "status", json_object_new_string(item->status));
-        if (*item->id) json_object_object_add(entry, "id", json_object_new_string(item->id));
-        if (item->text)
-            json_object_object_add(entry, strcmp(item->status, "answered") == 0 ? "text" : "error",
-                                   json_object_new_string(item->text));
-        json_object_array_add(results, entry);
-        free(item->pane);
-        free(item->text);
-    }
-    free(items);
-    char *wire = strdup(json_object_to_json_string_ext(out, JSON_C_TO_STRING_PLAIN));
-    json_object_put(out);
+    wait_tasks(items, count, deadline);
+    finish_pending(items, count);
+    char *wire = gather_json(items, count);
+    free_items(items, count);
     return ok(res, wire);
 }
 
