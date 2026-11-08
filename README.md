@@ -48,15 +48,21 @@ There is no daemon. tmux carries every message, and SQLite holds the shared know
 
 ## Install
 
-Register the server once for each harness (use the absolute path):
+Copy the build to a versioned path, so rebuilding in the repo never swaps the binary under running agents:
 
-    claude mcp add -s user cntctr -- /path/to/cntctr
-    codex mcp add cntctr -- /path/to/cntctr
-    agy mcp add cntctr /path/to/cntctr
+    cp cntctr ~/.local/bin/cntctr-0.2.0
+
+Register that path once for each harness:
+
+    claude mcp add -s user cntctr -- ~/.local/bin/cntctr-0.2.0
+    codex mcp add cntctr -- ~/.local/bin/cntctr-0.2.0
+    agy mcp add cntctr ~/.local/bin/cntctr-0.2.0
+
+To upgrade or roll back, point the same entries at another version and restart the agents. Release tags (`v0.1.0`, ...) rebuild any old version.
 
 Raise each harness's tool timeout above the longest blocking wait you plan to use:
 
-- Claude Code: `MCP_TOOL_TIMEOUT` in milliseconds, e.g. `export MCP_TOOL_TIMEOUT=3600000`.
+- Claude Code: aborts a tool call that sends nothing for 30 minutes. Add `"timeout": 10800000` (ms) to the cntctr entry in `~/.claude.json`, or set `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` (ms, 0 disables) for every server.
 - Codex: in `~/.codex/config.toml`, under `[mcp_servers.cntctr]`, set `tool_timeout_sec = 3600`.
 - agy: no MCP timeout setting found; keep blocking waits short or use async sends.
 

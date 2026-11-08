@@ -1494,7 +1494,7 @@ static json_object *initialize(json_object *params) {
     json_object *r = json_object_new_object(), *caps = json_object_new_object(), *server = json_object_new_object();
     json_object_object_add(caps, "tools", json_object_new_object());
     json_object_object_add(server, "name", json_object_new_string("cntctr"));
-    json_object_object_add(server, "version", json_object_new_string("0.1.0"));
+    json_object_object_add(server, "version", json_object_new_string("0.2.0"));
     json_object_object_add(r, "protocolVersion", json_object_new_string(version ? version : "2025-06-18"));
     json_object_object_add(r, "capabilities", caps);
     json_object_object_add(r, "serverInfo", server);
