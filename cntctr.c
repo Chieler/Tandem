@@ -492,20 +492,82 @@ static const char *PROMPTS[] = {
 };
 static regex_t prompt_re[sizeof PROMPTS / sizeof *PROMPTS];
 
-static int awaiting_permission(const char *pane) {
+/* Usage-limit screens, observed 2026-11-08: Claude Code ("You've hit your session limit · resets 10:40pm",
+ * "Usage limit reached · continuing automatically at 10:40pm"), Codex ("Usage limit reached"),
+ * agy ("⚠ Individual quota reached. ... Resets in 143h57m55s."). */
+static const char *LIMITS[] = {
+    "hit your (session|weekly|usage) limit",
+    "usage limit reached",
+    "individual quota reached",
+};
+/* Working markers, observed 2026-11-08: Claude Code and Codex status line ("esc to interrupt"),
+ * agy model turn ("esc to cancel"), agy background shell task ("1 task(s) · /tasks"). */
+static const char *BUSY[] = {"esc to interrupt", "esc to cancel", "[0-9]+ task\\(s\\)"};
+static regex_t limit_re[sizeof LIMITS / sizeof *LIMITS], busy_re[sizeof BUSY / sizeof *BUSY], resets_re;
+
+enum pstate { P_IDLE, P_BUSY, P_PERMISSION, P_LIMITED, P_DEAD };
+static const char *PSTATE[] = {"idle", "busy", "permission", "limited", "dead"};
+
+static int pane_alive(const char *pane);
+
+/* Last 15 lines of `pane` (caller frees), or NULL if the pane is gone. */
+static char *pane_tail(const char *pane) {
     char *screen;
     if (TMUX(NULL, &screen, "capture-pane", "-p", "-t", pane) != 0) {
         free(screen);
-        return 0;   /* a missing pane fails later, in paste-buffer */
+        return NULL;
     }
     char *tail = screen + strlen(screen);   /* run() already dropped trailing blank lines */
     for (int lines = 0; tail > screen; tail--)
         if (tail[-1] == '\n' && ++lines == 15) break;
-    int hit = 0;
-    for (size_t i = 0; i < sizeof PROMPTS / sizeof *PROMPTS && !hit; i++)
-        hit = regexec(&prompt_re[i], tail, 0, NULL, 0) == 0;
-    free(screen);
+    memmove(screen, tail, strlen(tail) + 1);
+    return screen;
+}
+
+static int match_any(const regex_t *re, size_t n, const char *s) {
+    for (size_t i = 0; i < n; i++)
+        if (regexec(&re[i], s, 0, NULL, 0) == 0) return 1;
+    return 0;
+}
+
+static int awaiting_permission(const char *pane) {
+    char *tail = pane_tail(pane);   /* a missing pane fails later, in paste-buffer */
+    int hit = tail && match_any(prompt_re, sizeof PROMPTS / sizeof *PROMPTS, tail);
+    free(tail);
     return hit;
+}
+
+/* What `pane` is doing, from its screen. Order matters: a limit screen can also show
+ * "esc to cancel", and permission dialogs can show "Esc to cancel". */
+static enum pstate pane_state(const char *pane, char **resets) {
+    if (resets) *resets = NULL;
+    if (!pane_alive(pane)) return P_DEAD;
+    char *tail = pane_tail(pane);
+    if (!tail) return P_DEAD;
+    enum pstate s = P_IDLE;
+    regmatch_t m[4];
+    if (match_any(limit_re, sizeof LIMITS / sizeof *LIMITS, tail)) {
+        s = P_LIMITED;
+        if (resets && regexec(&resets_re, tail, 4, m, 0) == 0 && m[3].rm_so >= 0) {
+            int n = (int)(m[3].rm_eo - m[3].rm_so);
+            while (n > 0 && tail[m[3].rm_so + n - 1] == ' ') n--;
+            *resets = fmt("%.*s", n, tail + m[3].rm_so);
+        }
+    } else if (match_any(prompt_re, sizeof PROMPTS / sizeof *PROMPTS, tail)) {
+        s = P_PERMISSION;
+    } else if (match_any(busy_re, sizeof BUSY / sizeof *BUSY, tail)) {
+        s = P_BUSY;
+    }
+    free(tail);
+    return s;
+}
+
+/* All server options, one "name value" per line (caller frees). */
+static char *server_opts(void) {
+    char *out;
+    if (TMUX(NULL, &out, "show", "-s") == 0) return out;
+    free(out);
+    return strdup("");
 }
 
 static int enter_delay_ms = 150;   /* CNTCTR_ENTER_DELAY_MS: pause between paste and Enter */
@@ -746,15 +808,35 @@ static int tool_list(json_object *args, char **res) {
     (void)args;
     char *out;
     if (TMUX(NULL, &out, "list-panes", "-a", "-F",
-             "#{@cntctr_name} #{@cntctr_harness} #{pane_id} #{?pane_dead,dead,alive}") != 0)
+             "#{@cntctr_name} #{@cntctr_harness} #{pane_id} #{?pane_dead,dead,alive} #{window_activity}") != 0)
         return fail(res, out);
-    char *list = calloc(1, strlen(out) + 2), *save;
-    for (char *line = strtok_r(out, "\n", &save); line; line = strtok_r(NULL, "\n", &save))
-        if (*line != ' ') {   /* untagged panes have an empty name, so the line starts with a space */
-            strcat(list, line);
-            strcat(list, "\n");
+    char *opts = server_opts(), *list = strdup(""), *save;
+    time_t now = time(NULL);
+    for (char *line = strtok_r(out, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        if (*line == ' ') continue;   /* untagged panes have an empty name, so the line starts with a space */
+        char name[128], harness[64], pane[32], alive[8];
+        long long act = 0;
+        if (sscanf(line, "%127s %63s %31s %7s %lld", name, harness, pane, alive, &act) < 4) continue;
+        char *resets = NULL, *tasks = strdup("");
+        enum pstate st = pane_state(pane, &resets);
+        for (const char *l = opts; *l; l += strcspn(l, "\n") + (l[strcspn(l, "\n")] == '\n')) {
+            char id[9], val[32];
+            if (sscanf(l, "@cntctr_to_%8[0-9a-f] %31s", id, val) == 2 && strcmp(val, pane) == 0) {
+                char *t = fmt("%s%s%s", tasks, *tasks ? "," : "", id);
+                free(tasks);
+                tasks = t;
+            }
         }
+        char *t = fmt("%s%s %s %s %s %s%s%s idle=%llds%s%s%s\n", list, name, harness, pane, alive, PSTATE[st],
+                      *tasks ? " tasks=" : "", tasks, act ? (long long)now - act : 0LL,
+                      resets ? " resets=\"" : "", resets ? resets : "", resets ? "\"" : "");
+        free(list);
+        list = t;
+        free(resets);
+        free(tasks);
+    }
     free(out);
+    free(opts);
     if (!*list) {
         free(list);
         return ok(res, fmt("no agents"));
@@ -1375,7 +1457,7 @@ static const char TOOLS[] =
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},"
     "\"insights\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Durable facts other agents should know; each is stored in the shared knowledge store\"}},"
     "\"required\":[\"id\",\"text\"]}},"
-    "{\"name\":\"list\",\"description\":\"List agents: name, harness, tmux pane, alive or dead.\","
+    "{\"name\":\"list\",\"description\":\"List agents: name, harness, pane, alive or dead, state (idle, busy, permission, limited, dead), open task ids, seconds since the screen last changed, and limit reset time.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
     "{\"name\":\"kill\",\"description\":\"Close an agent's tmux pane.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"}},\"required\":[\"name\"]}}"
@@ -1576,6 +1658,9 @@ int main(void) {
     if (delay) enter_delay_ms = atoi(delay);
     for (size_t i = 0; i < sizeof PROMPTS / sizeof *PROMPTS; i++)
         regcomp(&prompt_re[i], PROMPTS[i], REG_EXTENDED | REG_ICASE | REG_NOSUB);
+    for (size_t i = 0; i < sizeof LIMITS / sizeof *LIMITS; i++) regcomp(&limit_re[i], LIMITS[i], REG_EXTENDED | REG_ICASE | REG_NOSUB);
+    for (size_t i = 0; i < sizeof BUSY / sizeof *BUSY; i++) regcomp(&busy_re[i], BUSY[i], REG_EXTENDED | REG_ICASE | REG_NOSUB);
+    regcomp(&resets_re, "(resets( in)?|continuing automatically at) +([0-9][0-9:hmsapHMSAP ]*(\\([^)]*\\))?)", REG_EXTENDED | REG_ICASE);
     char *line = NULL;
     size_t cap = 0;
     while (getline(&line, &cap, stdin) > 0) handle(line);

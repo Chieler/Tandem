@@ -104,6 +104,24 @@ out=$(printf '%s\n%s\n' "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/call","
     TMUX=/nonexistent/sock,0,0 "$BIN" | tail -n 1)
 same "list without a tmux server is a tool error" "$(iserr "$out")" true
 
+# ---- status ----
+BUSY=$(newpane st-busy sh -c 'printf "%s\n" "* Working (12s * esc to interrupt)"; exec cat')
+LIM=$(newpane st-lim sh -c 'printf "%s\n" "Usage limit reached * continuing automatically at 10:40pm * esc to cancel"; exec cat')
+AGYQ=$(newpane st-agyq sh -c 'printf "%s\n" "Individual quota reached. Resets in 143h57m55s."; exec cat')
+AGYT=$(newpane st-agyt sh -c 'printf "%s\n" "? for shortcuts     Gemini 3.8 Flash * high * 1 task(s) * /tasks"; exec cat')
+OLD=$(newpane st-old sh -c 'printf "%s\n" "Usage limit reached"; seq 1 30; exec cat')
+IDLE=$(newpane st-idle)
+sleep 0.5
+out=$(txt "$(call "$IDLE" list '{}')")
+check "list shows busy" "$out" "st-busy test $BUSY alive busy"
+check "list shows limited" "$out" "st-lim test $LIM alive limited"
+check "list shows reset time" "$out" 'resets="10:40pm"'
+check "agy quota is limited" "$out" "st-agyq test $AGYQ alive limited"
+check "agy quota reset" "$out" 'resets="143h57m55s"'
+check "agy background task is busy" "$out" "st-agyt test $AGYT alive busy"
+check "limit text above the last 15 lines is ignored" "$out" "st-old test $OLD alive idle"
+check "list shows idle time" "$out" "st-idle test $IDLE alive idle idle="
+
 # ---- send ----
 out=$(call "$A" send '{"to":"b","text":"hello from a"}')
 check "send returns an id" "$(txt "$out")" "sent id="
