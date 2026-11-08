@@ -757,6 +757,12 @@ static int poll_task(struct gathered *it) {
     }
     if (st == P_LIMITED) {
         unwait(it->id);   /* a reply after the reset goes to the caller's pane */
+        if ((it->text = buffer_take(buf))) {   /* replied between the last check and unwait */
+            untrack(it->id);
+            it->status = "answered";
+            free(resets);
+            return 1;
+        }
         it->resets = resets;
         it->status = "limited";
         return 1;
@@ -783,8 +789,13 @@ static void wait_tasks(struct gathered *items, size_t n, time_t deadline) {
 static void finish_pending(struct gathered *items, size_t n) {
     for (size_t i = 0; i < n; i++)
         if (!items[i].status) {
+            char buf[40];
+            snprintf(buf, sizeof buf, "cntctr-reply-%s", items[i].id);
             unwait(items[i].id);
-            items[i].status = "timed_out";
+            if ((items[i].text = buffer_take(buf))) {   /* replied just before the deadline */
+                untrack(items[i].id);
+                items[i].status = "answered";
+            } else items[i].status = "timed_out";
         }
 }
 
