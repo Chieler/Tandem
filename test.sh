@@ -487,6 +487,10 @@ KID=$(t list-panes -a -F '#{pane_id} #{@cntctr_name}' | awk '$2=="kid"{print $1}
 same "spawn records parent" "$(t show -pqv -t "$KID" @cntctr_parent)" "$L"
 call "$KID" send '{"to":"parent","text":"to my parent"}' >/dev/null
 expect_screen "to:parent reaches the spawner" "$L" "to my parent"
+expect_screen "to:parent envelope names the spawner's real name" "$L" "Your agent name is lead"
+refute "to:parent envelope never says parent" "$(screen "$L")" "Your agent name is parent"
+gp=$(txt "$(call "$KID" gather '{"tasks":[{"kind":"send","to":"parent","text":"gather to parent"}],"timeout":2}')")
+expect_screen "gather to:parent reaches the spawner" "$L" "gather to parent"
 out=$(session "" 2 "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send","arguments":{"from":"kid","to":"parent","text":"via shared server"}}}' | tail -n 1)
 expect_screen "to:parent works through from= (Codex)" "$L" "via shared server"
 out=$(call "$S" send '{"to":"parent","text":"orphan"}')

@@ -959,17 +959,21 @@ static int start_send(json_object *a, int wait, char id[9], char **pane_out, cha
     new_id(id);
     track(id, wait);
     track_to(id, pane);
-    env = envelope(id, text, to);
-    err = inject(pane, to, env);
+    char *tname = pane_name(pane);   /* the real name, not the alias "parent" */
+    const char *label = tname ? tname : to;
+    env = envelope(id, text, label);
+    err = inject(pane, label, env);
     free(env);
     if (err) {
         untrack(id);
         free(pane);
+        free(tname);
         return fail(res, err);
     }
-    char *title = fmt("task %s %s→%s", id, caller_name, to);
+    char *title = fmt("task %s %s→%s", id, caller_name, label);
     log_history(caller_pane, title, text);
     free(title);
+    free(tname);
     *pane_out = pane;
     return 0;
 }
