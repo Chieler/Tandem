@@ -28,6 +28,7 @@ Source: orchestrator feedback, 2026-11-07, ranked by cost.
 - [ ] Structured reply format set in the send call
 - [ ] Task constraints repeated with every message in a task thread
 - [ ] Errors name the missing field and give an example call
+- [ ] agy spawns skip the folder-trust prompt (`--settings` trustedWorkspaces)
 - [ ] Guide text: `note supersedes=[id]` already hides stale notes from recall
 
 ## 0.3.0

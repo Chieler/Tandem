@@ -180,6 +180,10 @@ Every missing-argument error names the missing field(s) and ends with an example
 `reply needs 'id' (missing). Example: reply {"id":"1a2b3c4d","text":"done"}`.
 All `needs` errors in `cntctr.c` are covered.
 
+### agy folder trust
+
+agy asks "Yes, I trust this folder" in any cwd missing from `trustedWorkspaces` in `~/.gemini/antigravity-cli/settings.json`; the list holds exact paths. `start_spawn` passes agy `--settings '{"trustedWorkspaces":["<realpath of cwd>"]}'`. The flag applies to that session only and is never saved, so cntctr does not write agy's config. Verified 2026-11-08: no prompt in a new folder, settings file unchanged.
+
 ### Stale notes
 
 No code. The `note` and `recall` descriptions and the server instructions say: when a note goes stale, write the replacement with `supersedes=[old id]`, or `forget` it; recall hides both.
@@ -211,5 +215,6 @@ All tests in `test.sh` on real tmux, with fake agent panes printing scripted scr
 - `reply_format`: missing key fails the reply; valid reply reaches gather as `json`.
 - `constraints`: second send to the agent carries the constraint line; `""` clears it.
 - Errors: each tool's missing-field error names the field and has an example.
+- agy trust: the spawn argv for agy carries `--settings` with the cwd's realpath (checked with a fake `agy` on PATH that records its argv).
 
 Then a live run from `~/.local/bin/cntctr-0.2.0` with real Claude, Codex and agy workers before the fleet-tools rebase.
