@@ -472,6 +472,12 @@ out=$(call "$L" spawn '{"harness":"claude","name":"r4","task":"Design the archit
 expect_screen "hard task gets the strongest model" "$(pane_of "$out")" "flags:  --model claude-opus-5-5 --effort high"
 out=$(call "$L" spawn '{"harness":"codex","name":"r5","task":"rename foo to bar in kb.c"}')
 expect_screen "codex light task" "$(pane_of "$out")" "flags:  -m gpt-6-luna -c model_reasoning_effort=\"low\""
+out=$(call "$L" spawn '{"harness":"codex","name":"r5s","task":"Implement the retry loop."}')
+expect_screen "codex standard task" "$(pane_of "$out")" "flags:  -m gpt-6.1-terra -c model_reasoning_effort=\"medium\""
+out=$(call "$L" spawn '{"harness":"codex","name":"r5r","task":"Review the retry loop."}')
+expect_screen "codex review task" "$(pane_of "$out")" "flags:  -m gpt-6.1-sol -c model_reasoning_effort=\"medium\""
+out=$(call "$L" spawn '{"harness":"codex","name":"r5h","task":"Design the architecture for cross-machine sync."}')
+expect_screen "codex hard task" "$(pane_of "$out")" "flags:  -m gpt-6.1-sol -c model_reasoning_effort=\"high\""
 out=$(call "$L" spawn '{"harness":"agy","name":"r6b","task":"rename foo to bar"}')
 expect_screen "agy light task stays on medium" "$(pane_of "$out")" "flags:  --model gemini-3.8-flash-medium --effort medium"
 out=$(call "$L" spawn '{"harness":"agy","name":"r6","task":"Design the architecture for the new sync layer."}')

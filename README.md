@@ -95,9 +95,9 @@ leader doesn't have to (`cntctr.c:route`, tables `RULES` and `ROUTES`):
 | Tier | Task words | claude | codex | agy |
 |---|---|---|---|---|
 | light | smoke test, rename, typo, format, lookup, list, summarize, count | claude-haiku-5-5 medium | gpt-6-luna low | gemini-3.8-flash-medium |
-| standard | anything else | claude-sonnet-5-5 medium | gpt-6-luna medium | gemini-3.8-flash-medium |
-| review | review, audit, verify, merge, critique | claude-opus-4-7 high | gpt-6-sol medium | gemini-3.8-flash-high |
-| hard | architecture, design, race condition, concurrency, root cause, security, migration, rewrite | claude-opus-5-5 high | gpt-6-sol high | gemini-3.8-flash-high |
+| standard | anything else | claude-sonnet-5-5 medium | gpt-6.1-terra medium | gemini-3.8-flash-medium |
+| review | review, audit, verify, merge, critique | claude-opus-4-7 high | gpt-6.1-sol medium | gemini-3.8-flash-high |
+| hard | architecture, design, race condition, concurrency, root cause, security, migration, rewrite | claude-opus-5-5 high | gpt-6.1-sol high | gemini-3.8-flash-high |
 
 Rules are checked in the order hard, review, light; tasks over
 6000 characters count as review. Pass `tier`, `model` or `effort` to override.
