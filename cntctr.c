@@ -86,6 +86,20 @@ static int targ(json_object *o) {
     return t < 1 ? 1 : t > 86400 ? 86400 : t;
 }
 
+/* Fail with "<tool> needs 'a', 'b' (missing: b). Example: <tool> <example>" if a field is absent or empty. */
+static int need(char **res, json_object *a, const char *tool, const char *const *fields, const char *example) {
+    char *all = strdup(""), *missing = strdup(""), *t;
+    for (; *fields; fields++) {
+        const char *v = sarg(a, *fields);
+        t = fmt("%s%s'%s'", all, *all ? ", " : "", *fields), free(all), all = t;
+        if (!v || !*v) t = fmt("%s%s%s", missing, *missing ? ", " : "", *fields), free(missing), missing = t;
+    }
+    int bad = *missing != '\0';
+    if (bad) *res = fmt("%s needs %s (missing: %s). Example: %s %s", tool, all, missing, tool, example);
+    free(all), free(missing);
+    return bad;
+}
+
 /* ---- processes ---- */
 
 /* Close-on-exec pipe, so children forked by other threads don't inherit it and
@@ -951,8 +965,8 @@ static int tool_list(json_object *args, char **res) {
 }
 
 static int start_send(json_object *a, int wait, char id[9], char **pane_out, char **res) {
+    if (need(res, a, "send", (const char *const[]){"to", "text", NULL}, "{\"to\":\"codex-2\",\"text\":\"...\"}")) return 1;
     const char *to = sarg(a, "to"), *text = sarg(a, "text");
-    if (!to || !text) return fail(res, fmt("send needs 'to' and 'text'"));
     char *rerr, *pane = resolve_target(to, &rerr);
     if (!pane) return fail(res, rerr);
     char *env, *err;
@@ -1022,7 +1036,7 @@ static void remember_reply(const char *id, const char *to, const char *sender, c
 
 static int tool_reply(json_object *a, char **res) {
     const char *id = sarg(a, "id"), *text = sarg(a, "text");
-    if (!id || !text) return fail(res, fmt("reply needs 'id' and 'text'"));
+    if (need(res, a, "reply", (const char *const[]){"id", "text", NULL}, "{\"id\":\"1a2b3c4d\",\"text\":\"done\"}")) return 1;
     char opt[48], buf[40], chan[32], *sender = NULL, *to, *waiting, *env, *err;
     snprintf(opt, sizeof opt, "@cntctr_from_%s", id);
     if (strlen(id) != 8 || strspn(id, "0123456789abcdef") != 8 || !(sender = sopt_get(opt)))
@@ -1077,7 +1091,7 @@ static int tool_reply(json_object *a, char **res) {
 static int start_spawn(json_object *a, int wait, char id[9], char **pane_out,
                        char **summary, char **res) {
     const char *harness = sarg(a, "harness"), *name = sarg(a, "name"), *task = sarg(a, "task"), *cwd = sarg(a, "cwd");
-    if (!harness || !name || !*name || !task) return fail(res, fmt("spawn needs 'harness', 'name' and 'task'"));
+    if (need(res, a, "spawn", (const char *const[]){"harness", "name", "task", NULL}, "{\"harness\":\"codex\",\"name\":\"codex-2\",\"task\":\"...\"}")) return 1;
     int agy = strcmp(harness, "agy") == 0;
     if (!agy && strcmp(harness, "claude") != 0 && strcmp(harness, "codex") != 0)
         return fail(res, fmt("unknown harness %s", harness));
@@ -1271,7 +1285,7 @@ static int tool_note(json_object *a, char **res) {
 
 static int tool_read(json_object *a, char **res) {
     const char *id = sarg(a, "id");
-    if (!id) return fail(res, fmt("read needs 'id'"));
+    if (need(res, a, "read", (const char *const[]){"id", NULL}, "{\"id\":\"<entry id from recall>\"}")) return 1;
     sqlite3 *db = kb(res);
     if (!db) return 1;
     char *text = kb_show(db, id);
@@ -1320,7 +1334,7 @@ static int tool_recall(json_object *a, char **res) {
 
 static int tool_forget(json_object *a, char **res) {
     const char *id = sarg(a, "id");
-    if (!id) return fail(res, fmt("forget needs 'id'"));
+    if (need(res, a, "forget", (const char *const[]){"id", NULL}, "{\"id\":\"<entry id from recall>\"}")) return 1;
     sqlite3 *db = kb(res);
     if (!db) return 1;
     char layer[16];
@@ -1416,7 +1430,7 @@ static int unread_count(const char *pane, const char *name) {
 /* Type `text` into every other live agent in the caller's project, and keep it on the project's board. */
 static int tool_post(json_object *a, char **res) {
     const char *text = sarg(a, "text");
-    if (!text || !*text) return fail(res, fmt("post needs 'text'"));
+    if (need(res, a, "post", (const char *const[]){"text", NULL}, "{\"text\":\"...\"}")) return 1;
     struct project p, q;
     sqlite3 *db = kb_for_caller(&p, res);
     if (!db) return 1;

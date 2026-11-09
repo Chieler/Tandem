@@ -456,9 +456,9 @@ if t capture-pane -p -t "$(txt "$(call "$L" list '{}')" | sed -n 's/^m3 agy \(%[
 pane_of() { txt "$1" | sed 's/.* in \(%[0-9]*\) .*/\1/'; }
 out=$(call "$L" spawn '{"harness":"claude","name":"r1","task":"smoke test: run make test, report the count"}')
 check "router names its choice" "$(txt "$out")" "(light: claude-haiku-5-5 medium)"
-expect_screen "light task gets the small model" "$(pane_of "$out")" "flags:  --model claude-haiku-5-5 --effort medium"
+expect_screen "light task gets the small model" "$(pane_of "$out")" "flags:  --model claude-haiku-5-5 --effort medium -i"
 out=$(call "$L" spawn '{"harness":"claude","name":"r2","task":"Implement the retry loop in cntctr.c:inject so a busy pane is retried twice, with a test in test.sh."}')
-expect_screen "ordinary task gets the standard model" "$(pane_of "$out")" "flags:  --model claude-sonnet-5-5 --effort medium"
+expect_screen "ordinary task gets the standard model" "$(pane_of "$out")" "flags:  --model claude-sonnet-5-5 --effort medium -i"
 out=$(call "$L" spawn '{"harness":"claude","name":"r3","task":"Review the diff in /tmp/x.diff against the spec; list issues."}')
 expect_screen "review gets the review model" "$(pane_of "$out")" "flags:  --model claude-opus-4-7 --effort high"
 out=$(call "$L" spawn '{"harness":"claude","name":"r4","task":"Design the architecture for cross-machine sync; find the race conditions."}')
@@ -470,7 +470,7 @@ expect_screen "agy light task stays on medium" "$(pane_of "$out")" "flags:  --mo
 out=$(call "$L" spawn '{"harness":"agy","name":"r6","task":"Design the architecture for the new sync layer."}')
 expect_screen "agy always uses Gemini 3.8" "$(pane_of "$out")" "flags:  --model gemini-3.8-flash-high --effort high -i"
 out=$(call "$L" spawn '{"harness":"claude","name":"r7","task":"Design everything","tier":"light"}')
-expect_screen "tier overrides the router" "$(pane_of "$out")" "flags:  --model claude-haiku-5-5 --effort medium"
+expect_screen "tier overrides the router" "$(pane_of "$out")" "flags:  --model claude-haiku-5-5 --effort medium -i"
 out=$(call "$L" spawn '{"harness":"claude","name":"r8","task":"Design everything","effort":"low"}')
 expect_screen "explicit effort wins, model still routed" "$(pane_of "$out")" "flags:  --model claude-opus-5-5 --effort low"
 same "unknown tier" "$(txt "$(call "$L" spawn '{"harness":"claude","name":"r9","task":"x","tier":"huge"}')")" "bad tier huge"
@@ -650,12 +650,12 @@ check "distill spawns a librarian" "$(txt "$out")" "spawned librarian-1 in %"
 LB=$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')
 expect_screen "librarian gets its task" "$LB" "You are the cntctr librarian for project"
 expect_screen "first librarian reads all history" "$LB" 'since="1970-01-01 00:00:00"'
-expect_screen "librarian is routed as standard" "$LB" "flags:  --model claude-sonnet-5-5 --effort medium"
+expect_screen "librarian is routed as standard" "$LB" "flags:  --model claude-sonnet-5-5 --effort medium -i"
 out=$(call "$KA" distill '{"model":"claude-sonnet-5","effort":"medium"}')
 check "next librarian gets a new name" "$(txt "$out")" "spawned librarian-2 in %"
 LB2=$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')
 expect_screen "next librarian starts at the last distill" "$LB2" 'since="20'
-expect_screen "distill passes model and effort" "$LB2" "flags:  --model claude-sonnet-5 --effort medium"
+expect_screen "distill passes model and effort" "$LB2" "flags:  --model claude-sonnet-5 --effort medium -i"
 for i in $(seq 20); do
     call "$KA" note "{\"layer\":\"insight\",\"title\":\"par $i\",\"summary\":\"parallel note $i\"}" > "$TMPD/par.$i" &
 done
@@ -678,7 +678,18 @@ check "board shows posts" "$out" "ka: heads up: main is broken"
 same "board is oldest first" "$(printf '%s\n' "$out" | tail -n 1 | cut -d' ' -f3-)" "pb: fixed in abc123"
 same "board limit" "$(txt "$(call "$KA" board '{"limit":1}')" | cut -d' ' -f3-)" "pb: fixed in abc123"
 same "board of another project" "$(txt "$(call "$KR" board '{}')")" "no posts"
-same "post needs text" "$(txt "$(call "$KA" post '{}')")" "post needs 'text'"
+check "post needs text" "$(txt "$(call "$KA" post '{}')")" "post needs 'text' (missing: text). Example: post {\"text\":\"...\"}"
+# errors name the missing field and give an example
+out=$(txt "$(call "$KA" reply '{"text":"x"}')")
+check "reply error names id" "$out" "reply needs 'id', 'text' (missing: id)."
+check "reply error has example" "$out" 'Example: reply {"id":"1a2b3c4d","text":"done"}'
+out=$(txt "$(call "$KA" send '{"to":"b"}')")
+check "send error names text" "$out" "(missing: text)"
+check "send error has example" "$out" 'Example: send {"to":"codex-2","text":"..."}'
+out=$(txt "$(call "$KA" spawn '{"harness":"claude"}')")
+check "spawn error names both" "$out" "(missing: name, task)"
+out=$(txt "$(call "$KA" post '{}')")
+check "post error has example" "$out" 'Example: post {"text":"..."}'
 out=$(bash "$(dirname "$BIN")/watch.sh" --once)
 check "dashboard lists agents" "$out" "librarian-1"
 check "dashboard shows the board" "$out" "pb: fixed in abc123"
