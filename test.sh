@@ -449,16 +449,23 @@ expect_screen "claude gets model and effort" "$(txt "$out" | sed 's/.* in \(%[0-
 out=$(call "$L" spawn '{"harness":"codex","name":"m2","task":"x","model":"gpt-6-luna","effort":"high"}')
 expect_screen "codex gets model and effort" "$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')" "flags:  -m gpt-6-luna -c model_reasoning_effort=\"high\""
 out=$(call "$L" spawn '{"harness":"agy","name":"m3","task":"x","model":"gemini-3.8-flash-high","effort":"high"}')
-expect_screen "agy gets model and effort" "$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')" "flags:  --model gemini-3.8-flash-high --effort high -i"
+expect_screen "agy gets model and effort" "$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')" "flags:  --model gemini-3.8-flash-high --effort high --settings"
+# agy gets a session-only trustedWorkspaces for its cwd
+mkdir -p "$TMPD/agywork"
+call "$L" spawn "{\"harness\":\"agy\",\"name\":\"agyt\",\"task\":\"trust\",\"cwd\":\"$TMPD/agywork\"}" >/dev/null
+AGT=$(t list-panes -a -F '#{pane_id} #{@cntctr_name}' | awk '$2=="agyt"{print $1}')
+real=$(cd "$TMPD/agywork" && pwd -P)
+expect_screen "agy gets --settings" "$AGT" "--settings"
+expect_screen "agy trusts its real cwd" "$AGT" "{\"trustedWorkspaces\":[\"$real\"]}"
 expect_screen "claude runs under headroom wrap" "$(txt "$(call "$L" list '{}')" | sed -n 's/^m1 claude \(%[0-9]*\).*/\1/p')" "wrapped:claude"
 expect_screen "codex runs under headroom wrap" "$(txt "$(call "$L" list '{}')" | sed -n 's/^m2 codex \(%[0-9]*\).*/\1/p')" "wrapped:codex"
 if t capture-pane -p -t "$(txt "$(call "$L" list '{}')" | sed -n 's/^m3 agy \(%[0-9]*\).*/\1/p')" | grep -q wrapped; then bad "agy is not wrapped"; else ok_; fi
 pane_of() { txt "$1" | sed 's/.* in \(%[0-9]*\) .*/\1/'; }
 out=$(call "$L" spawn '{"harness":"claude","name":"r1","task":"smoke test: run make test, report the count"}')
 check "router names its choice" "$(txt "$out")" "(light: claude-haiku-5-5 medium)"
-expect_screen "light task gets the small model" "$(pane_of "$out")" "flags:  --model claude-haiku-5-5 --effort medium -i"
+expect_screen "light task gets the small model" "$(pane_of "$out")" "flags:  --model claude-haiku-5-5 --effort medium"
 out=$(call "$L" spawn '{"harness":"claude","name":"r2","task":"Implement the retry loop in cntctr.c:inject so a busy pane is retried twice, with a test in test.sh."}')
-expect_screen "ordinary task gets the standard model" "$(pane_of "$out")" "flags:  --model claude-sonnet-5-5 --effort medium -i"
+expect_screen "ordinary task gets the standard model" "$(pane_of "$out")" "flags:  --model claude-sonnet-5-5 --effort medium"
 out=$(call "$L" spawn '{"harness":"claude","name":"r3","task":"Review the diff in /tmp/x.diff against the spec; list issues."}')
 expect_screen "review gets the review model" "$(pane_of "$out")" "flags:  --model claude-opus-4-7 --effort high"
 out=$(call "$L" spawn '{"harness":"claude","name":"r4","task":"Design the architecture for cross-machine sync; find the race conditions."}')
@@ -466,11 +473,11 @@ expect_screen "hard task gets the strongest model" "$(pane_of "$out")" "flags:  
 out=$(call "$L" spawn '{"harness":"codex","name":"r5","task":"rename foo to bar in kb.c"}')
 expect_screen "codex light task" "$(pane_of "$out")" "flags:  -m gpt-6-luna -c model_reasoning_effort=\"low\""
 out=$(call "$L" spawn '{"harness":"agy","name":"r6b","task":"rename foo to bar"}')
-expect_screen "agy light task stays on medium" "$(pane_of "$out")" "flags:  --model gemini-3.8-flash-medium --effort medium -i"
+expect_screen "agy light task stays on medium" "$(pane_of "$out")" "flags:  --model gemini-3.8-flash-medium --effort medium"
 out=$(call "$L" spawn '{"harness":"agy","name":"r6","task":"Design the architecture for the new sync layer."}')
-expect_screen "agy always uses Gemini 3.8" "$(pane_of "$out")" "flags:  --model gemini-3.8-flash-high --effort high -i"
+expect_screen "agy always uses Gemini 3.8" "$(pane_of "$out")" "flags:  --model gemini-3.8-flash-high --effort high --settings"
 out=$(call "$L" spawn '{"harness":"claude","name":"r7","task":"Design everything","tier":"light"}')
-expect_screen "tier overrides the router" "$(pane_of "$out")" "flags:  --model claude-haiku-5-5 --effort medium -i"
+expect_screen "tier overrides the router" "$(pane_of "$out")" "flags:  --model claude-haiku-5-5 --effort medium"
 out=$(call "$L" spawn '{"harness":"claude","name":"r8","task":"Design everything","effort":"low"}')
 expect_screen "explicit effort wins, model still routed" "$(pane_of "$out")" "flags:  --model claude-opus-5-5 --effort low"
 same "unknown tier" "$(txt "$(call "$L" spawn '{"harness":"claude","name":"r9","task":"x","tier":"huge"}')")" "bad tier huge"
@@ -650,12 +657,12 @@ check "distill spawns a librarian" "$(txt "$out")" "spawned librarian-1 in %"
 LB=$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')
 expect_screen "librarian gets its task" "$LB" "You are the cntctr librarian for project"
 expect_screen "first librarian reads all history" "$LB" 'since="1970-01-01 00:00:00"'
-expect_screen "librarian is routed as standard" "$LB" "flags:  --model claude-sonnet-5-5 --effort medium -i"
+expect_screen "librarian is routed as standard" "$LB" "flags:  --model claude-sonnet-5-5 --effort medium"
 out=$(call "$KA" distill '{"model":"claude-sonnet-5","effort":"medium"}')
 check "next librarian gets a new name" "$(txt "$out")" "spawned librarian-2 in %"
 LB2=$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')
 expect_screen "next librarian starts at the last distill" "$LB2" 'since="20'
-expect_screen "distill passes model and effort" "$LB2" "flags:  --model claude-sonnet-5 --effort medium -i"
+expect_screen "distill passes model and effort" "$LB2" "flags:  --model claude-sonnet-5 --effort medium"
 for i in $(seq 20); do
     call "$KA" note "{\"layer\":\"insight\",\"title\":\"par $i\",\"summary\":\"parallel note $i\"}" > "$TMPD/par.$i" &
 done

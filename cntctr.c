@@ -20,6 +20,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <limits.h>
 #include <json-c/json.h>
 #include "kb.h"
 
@@ -1124,6 +1125,15 @@ static int start_spawn(json_object *a, int wait, char id[9], char **pane_out,
      * Codex has no --effort flag; it takes the effort as a config override. */
     int codex = strcmp(harness, "codex") == 0, n = 0;
     char *ceffort = effort && codex ? fmt("model_reasoning_effort=\"%s\"", effort) : NULL;
+    char *trust = NULL;
+    if (agy) {   /* agy asks to trust any new folder; --settings applies to this session only, never saved */
+        char real[PATH_MAX];
+        json_object *st = json_object_new_object(), *list = json_object_new_array();
+        json_object_array_add(list, json_object_new_string(realpath(cwd, real) ? real : cwd));
+        json_object_object_add(st, "trustedWorkspaces", list);
+        trust = strdup(json_object_to_json_string_ext(st, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE));
+        json_object_put(st);
+    }
     const char *argv[24] = {"tmux", "new-window", "-d", "-n", name, "-c", cwd, "-P", "-F", "#{pane_id}"};
     n = 10;
     if (!agy) argv[n++] = "headroom", argv[n++] = "wrap";   /* route claude and codex API calls through headroom */
@@ -1131,10 +1141,12 @@ static int start_spawn(json_object *a, int wait, char id[9], char **pane_out,
     if (!agy) argv[n++] = "--";
     if (model) argv[n++] = codex ? "-m" : "--model", argv[n++] = model;
     if (effort) argv[n++] = codex ? "-c" : "--effort", argv[n++] = codex ? ceffort : effort;
+    if (agy) argv[n++] = "--settings", argv[n++] = trust;
     if (agy) argv[n++] = "-i";
     argv[n++] = env;
     int rc = run(NULL, &pane, argv);
     free(ceffort);
+    free(trust);
     free(env);
     if (rc != 0) {
         untrack(id);
