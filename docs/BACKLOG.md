@@ -25,6 +25,8 @@ Source: orchestrator feedback, 2026-11-07, ranked by cost.
 - Roles: no observed failure
 - `reply_format` validation: put the format in the task text
 - `constraints`: put limits in the task text
+- False `limited` when a worker's own output quotes limit text (e.g. editing cntctr.c); anchor LIMITS regexes once real screen samples exist
+- kb_unread builds a text list nobody reads; replace with one SELECT max(rowid), sum(sender != me)
 
 ## 0.3.0
 - [ ] Rebase feat/fleet-tools onto 0.2.0

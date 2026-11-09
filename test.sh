@@ -148,7 +148,7 @@ check "send returns an id" "$(txt "$out")" "sent id="
 id=$(txt "$out" | sed 's/sent id=//')
 expect_screen "envelope header" "$B" "[cntctr from=a id=$id]"
 expect_screen "message text" "$B" "hello from a"
-expect_screen "reply hint" "$B" "[when done: call the reply tool of the cntctr MCP server with id=$id and your answer, plus insights=[...] with durable facts other agents should know; it is an MCP tool, not a shell command. Your agent name is b: pass from=b when you call send, spawn or kill]"
+expect_screen "reply hint" "$B" "[when done: call the reply tool of the cntctr MCP server with id=$id and your answer, plus insights=[...] with durable facts other agents should know; it is an MCP tool, not a shell command. Your agent name is b: pass from=b on every cntctr call]"
 call "$A" send '{"to":"b","text":"line one\nline two ünï"}' >/dev/null
 expect_screen "multiline unicode text arrives" "$B" "line two ünï"
 call "$A" send "$(jq -nc --arg t "\$(touch $TMPD/pwned) \`touch $TMPD/pwned\`" '{to:"b",text:$t}')" >/dev/null

@@ -702,7 +702,7 @@ static char *envelope(const char *id, const char *text, const char *you) {
     char *hints = knowledge_hints(text);
     char *env = fmt("[cntctr from=%s id=%s]\n%s\n%s[when done: call the reply tool of the cntctr MCP server with id=%s and your answer, "
                     "plus insights=[...] with durable facts other agents should know; it is an MCP tool, not a shell command. "
-                    "Your agent name is %s: pass from=%s when you call send, spawn or kill]",
+                    "Your agent name is %s: pass from=%s on every cntctr call]",
                     caller_name, id, text, hints, id, you, you);
     free(hints);
     return env;
@@ -765,7 +765,7 @@ static int poll_task(struct gathered *it) {
     char buf[40];
     snprintf(buf, sizeof buf, "cntctr-reply-%s", it->id);
     if (buffer_exists(buf)) {
-        unwait(it->id);   /* stop repliers from signalling us, then claim */
+        /* wait flag stays set so tool_reply never claims the buffer; untrack clears it */
         if ((it->text = buffer_take(buf))) {
             untrack(it->id);
             it->status = "answered";
@@ -1038,7 +1038,7 @@ static void remember_reply(const char *id, const char *to, const char *sender, c
 static int tool_reply(json_object *a, char **res) {
     const char *id = sarg(a, "id"), *text = sarg(a, "text");
     if (need(res, a, "reply", (const char *const[]){"id", "text", NULL}, "{\"id\":\"1a2b3c4d\",\"text\":\"done\"}")) return 1;
-    char opt[48], buf[40], chan[32], *sender = NULL, *to, *waiting, *env, *err;
+    char opt[48], buf[40], *sender = NULL, *to, *waiting, *env, *err;
     snprintf(opt, sizeof opt, "@cntctr_from_%s", id);
     if (strlen(id) != 8 || strspn(id, "0123456789abcdef") != 8 || !(sender = sopt_get(opt)))
         return fail(res, fmt("unknown id %s", id));
@@ -1059,8 +1059,6 @@ static int tool_reply(json_object *a, char **res) {
         free(waiting);
         free(sender);
         free(to);
-        snprintf(chan, sizeof chan, "cntctr-%s", id);
-        free(TMUXE(NULL, "wait-for", "-S", chan));
         return ok(res, fmt("ok"));
     }
     /* Nobody waiting: type the reply into the sender's pane, unless a timed-out
@@ -1496,7 +1494,7 @@ static int tool_board(json_object *a, char **res) {
     long long newest = 0;
     int unseen = 0;
     free(kb_unread(db, p.key, caller_name, seen_of(caller_name), &newest, &unseen));
-    set_seen(caller_name, newest);
+    if (*caller_name) set_seen(caller_name, newest);
     sqlite3_close(db);
     if (*out) return ok(res, out);
     free(out);
@@ -1604,7 +1602,8 @@ static const char TOOLS[] =
     "{\"name\":\"reply\",\"description\":\"Answer a message you received. Use the id from its [cntctr from=... id=...] header. "
     "Always reply when you finish a task another agent gave you.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},"
-    "\"insights\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Durable facts other agents should know; each is stored in the shared knowledge store\"}},"
+    "\"insights\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Durable facts other agents should know; each is stored in the shared knowledge store\"},"
+    KFROM "},"
     "\"required\":[\"id\",\"text\"]}},"
     "{\"name\":\"list\",\"description\":\"List agents: name, harness, pane, alive or dead, state (idle, busy, permission, limited, dead), open task ids, seconds since the screen last changed, and limit reset time.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
@@ -1690,7 +1689,7 @@ static const char GUIDE[] =
     "When you learn something durable (a fact, decision, gotcha, procedure, or the summary of a long analysis), store it with note: "
     "layer insight (1-5 lines), skill (a how-to) or doc (long text); point at code as file:symbol instead of copying it. "
     "When you reply to a task, add insights=[...]. "
-    "To tell every agent in this project something now, use post; board shows recent posts. "
+    "To tell every agent in this project something, use post; board shows recent posts. "
     "When a note goes stale, write the replacement with note supersedes=[old id], or forget it; recall hides both. "
     "Workers reach the agent that spawned them with to=\"parent\". Board posts are read with board; tool results show an unread count. "
     "Pass urgent=true only when every agent must see a post now.";
