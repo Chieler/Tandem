@@ -8,15 +8,15 @@ Source: orchestrator feedback, 2026-11-07, ranked by cost.
 
 ## 0.2.0
 
-- [ ] Gather waits on all tasks at once; dead and usage-limited workers reported at once (`limited` with reset time)
-- [ ] No lost replies: on timeout or cancel, late replies reach the caller's pane
-- [ ] `gather wait=false`
-- [ ] `list` reports idle, busy, permission, limited or dead, open task ids, idle time
-- [ ] Board posts pull-only (unread count on tool results); `urgent` still interrupts
-- [ ] `to: "parent"`
-- [ ] Errors name the missing field and give an example call
-- [ ] agy spawns skip the folder-trust prompt (`--settings` trustedWorkspaces)
-- [ ] Guide text: `note supersedes=[id]` already hides stale notes from recall
+- [x] Gather waits on all tasks at once; dead and usage-limited workers reported at once (`limited` with reset time)
+- [x] No lost replies: on timeout or cancel, late replies reach the caller's pane
+- [x] `gather wait=false`
+- [x] `list` reports idle, busy, permission, limited or dead, open task ids, idle time
+- [x] Board posts pull-only (unread count on tool results); `urgent` still interrupts
+- [x] `to: "parent"`
+- [x] Errors name the missing field and give an example call
+- [x] agy spawns skip the folder-trust prompt (`--settings` trustedWorkspaces)
+- [x] Guide text: `note supersedes=[id]` already hides stale notes from recall
 
 ### Deferred (build only if the problem comes back)
 - Progress heartbeat: 3 h client timeout covers it; Claude Code's log shows progress resets its timer, but `progressToken` support is unverified

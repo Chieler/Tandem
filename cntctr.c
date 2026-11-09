@@ -1611,7 +1611,7 @@ static const char TOOLS[] =
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"}},\"required\":[\"name\"]}}"
     ",{\"name\":\"note\",\"description\":\"Store durable knowledge for all agents: insight (a 1-5 line fact or decision), "
     "skill (a reusable how-to) or doc (long text). Point at code as file:symbol instead of copying it. "
-    "To replace or merge entries, pass their ids in supersedes.\","
+    "To replace or merge entries, pass their ids in supersedes. When an entry goes stale, write its replacement with supersedes=[old id]; recall hides superseded and forgotten entries.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
     "\"layer\":{\"type\":\"string\",\"enum\":[\"insight\",\"skill\",\"doc\"]},"
     "\"title\":{\"type\":\"string\"},"
@@ -1689,7 +1689,10 @@ static const char GUIDE[] =
     "When you learn something durable (a fact, decision, gotcha, procedure, or the summary of a long analysis), store it with note: "
     "layer insight (1-5 lines), skill (a how-to) or doc (long text); point at code as file:symbol instead of copying it. "
     "When you reply to a task, add insights=[...]. "
-    "To tell every agent in this project something now, use post; board shows recent posts.";
+    "To tell every agent in this project something now, use post; board shows recent posts. "
+    "When a note goes stale, write the replacement with note supersedes=[old id], or forget it; recall hides both. "
+    "Workers reach the agent that spawned them with to=\"parent\". Board posts are read with board; tool results show an unread count. "
+    "Pass urgent=true only when every agent must see a post now.";
 
 /* Usage guide plus the knowledge index: our project's and global entries, or only
  * global ones for a server outside any pane (Codex), capped at 40 lines and 4 KB. */

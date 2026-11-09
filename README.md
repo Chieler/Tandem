@@ -114,6 +114,22 @@ its own separate prompt instead of colliding.
 Delivery tuning: `CNTCTR_ENTER_DELAY_MS` (default 150) is the pause between
 pasting a message and pressing Enter.
 
+### Long and parallel work
+
+`gather` reports one `status` per task: `answered`, `timed_out`, `dead` (the worker's pane is gone), `limited` (the worker hit a usage limit; the result gives the reset time, so re-send the task yourself or to another agent), `failed`, or `sent` with `wait=false`. A reply that arrives after a timeout or cancel is typed into your pane with its id, so nothing is lost.
+
+```json
+{"tasks":[{"kind":"send","to":"tests","text":"Run the suite"}],"timeout":300,"wait":false}
+```
+
+With `wait=false` gather sends everything and returns at once (status `sent`); replies land in your pane.
+
+`list` shows each agent's state: `idle`, `busy`, `permission`, `limited` or `dead`, plus open task ids (`tasks=`), idle time (`idle=`) and the reset time (`resets=`) when limited.
+
+A worker answers the agent that spawned it with `to: "parent"`.
+
+Board posts are pull-only: tool results end with `(N unread board post(s); call board)` and you read them with `board`. `post` with `urgent=true` types into every pane instead; use it only when everyone must see the post now.
+
 ## Knowledge
 
 cntctr keeps a knowledge store that every agent shares across sessions. It lives in

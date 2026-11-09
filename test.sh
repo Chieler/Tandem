@@ -697,6 +697,12 @@ out=$(txt "$(call "$KA" spawn '{"harness":"claude"}')")
 check "spawn error names both" "$out" "(missing: name, task)"
 out=$(txt "$(call "$KA" post '{}')")
 check "post error has example" "$out" 'Example: post {"text":"..."}'
+out=$(rpc "$INIT")
+check "instructions explain supersedes" "$out" "supersedes=[old id]"
+check "instructions explain parent" "$out" 'to=\"parent\"'
+check "instructions explain urgent" "$out" "urgent=true"
+out=$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')
+check "note description explains stale notes" "$out" "recall hides"
 out=$(bash "$(dirname "$BIN")/watch.sh" --once)
 check "dashboard lists agents" "$out" "librarian-1"
 check "dashboard shows the board" "$out" "pb: fixed in abc123"
