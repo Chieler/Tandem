@@ -2,7 +2,7 @@
 
 Releases:
 - `v0.1.0`: tag on main, before fleet tools.
-- `0.2.0`: branch feat/qol, off main. The items below, tested on their own.
+- `0.2.0`: on main, tag `v0.2.0` (2026-11-08); live in all harnesses as `~/.local/bin/cntctr-0.2.0`.
 - `0.3.0`: branch feat/fleet-tools, rebased onto 0.2.0 after it ships.
 Source: orchestrator feedback, 2026-11-07, ranked by cost.
 
