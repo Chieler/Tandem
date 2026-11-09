@@ -337,7 +337,7 @@ call "$GA" reply "{\"id\":\"$(lastid "$GA")\",\"text\":\"async answer\"}" >/dev/
 expect_screen "async gather answer reaches pane" "$S" "async answer"
 
 # a worker that dies ends its task as dead
-GD=$(newpane gd sh -c 'sleep 2')
+GD=$(newpane gd sh -c 'sleep 6')
 t set -p -t "$GD" remain-on-exit on
 gather=$(txt "$(call "$S" gather '{"tasks":[{"kind":"send","to":"gd","text":"die"}],"timeout":30}')")
 same "dead task status" "$(printf '%s' "$gather" | jq -r '.results[0].status')" dead
@@ -524,8 +524,8 @@ check "read shows the agent" "$out" "(agent ka)"
 check "read shows visibility" "$out" "visibility: shared"
 check "read shows body" "$out" "Seen with Claude 2.1.287."
 same "read unknown id" "$(txt "$(call "$KA" read '{"id":"nope"}')")" "entry nope not found"
-same "note without summary" "$(txt "$(call "$KA" note '{"layer":"insight","title":"x"}')")" "note needs layer (insight, skill or doc), title and summary"
-same "note cannot write history" "$(txt "$(call "$KA" note '{"layer":"history","title":"x","summary":"y"}')")" "note needs layer (insight, skill or doc), title and summary"
+check "note without summary" "$(txt "$(call "$KA" note '{"layer":"insight","title":"x"}')")" "note needs 'layer', 'title', 'summary' (missing: summary)."
+check "note cannot write history" "$(txt "$(call "$KA" note '{"layer":"history","title":"x","summary":"y"}')")" "note layer must be insight, skill or doc"
 
 mkdir "$TMPD/repo" "$TMPD/plain"
 git -C "$TMPD/repo" init -q
@@ -697,6 +697,12 @@ out=$(txt "$(call "$KA" spawn '{"harness":"claude"}')")
 check "spawn error names both" "$out" "(missing: name, task)"
 out=$(txt "$(call "$KA" post '{}')")
 check "post error has example" "$out" 'Example: post {"text":"..."}'
+out=$(txt "$(call "$KA" note '{"layer":"insight"}')")
+check "note error names fields" "$out" "(missing: title, summary). Example: note {"
+out=$(txt "$(call "$KA" gather '{}')")
+check "gather error has example" "$out" 'Example: gather {"tasks":[{"kind":"send"'
+out=$(txt "$(call "$KA" kill '{}')")
+check "kill error names name" "$out" "kill needs 'name' (missing: name). Example: kill {"
 out=$(rpc "$INIT")
 check "instructions explain supersedes" "$out" "supersedes=[old id]"
 check "instructions explain parent" "$out" 'to=\"parent\"'

@@ -1181,7 +1181,7 @@ static int tool_gather(json_object *a, char **res) {
     if (!json_object_object_get_ex(a, "tasks", &tasks) ||
         !json_object_is_type(tasks, json_type_array) ||
         json_object_array_length(tasks) == 0)
-        return fail(res, fmt("gather needs a nonempty tasks array"));
+        return fail(res, fmt("gather needs 'tasks' (missing or empty: tasks). Example: gather {\"tasks\":[{\"kind\":\"send\",\"to\":\"codex-2\",\"text\":\"...\"}]}"));
 
     size_t count = json_object_array_length(tasks);
     struct gathered *items = calloc(count, sizeof *items);
@@ -1224,8 +1224,9 @@ static int tool_gather(json_object *a, char **res) {
 }
 
 static int tool_kill(json_object *a, char **res) {
+    if (need(res, a, "kill", (const char *const[]){"name", NULL}, "{\"name\":\"codex-2\"}")) return 1;
     const char *name = sarg(a, "name");
-    char *pane = name ? find_agent(name) : NULL, *err;
+    char *pane = find_agent(name), *err;
     if (!pane) return fail(res, fmt("agent %s not found", name ? name : "(none)"));
     if (strcmp(pane, caller_pane) == 0) {
         free(pane);
@@ -1251,8 +1252,8 @@ static int is_layer(const char *l) {
 static int tool_note(json_object *a, char **res) {
     const char *layer = sarg(a, "layer"), *title = sarg(a, "title"), *summary = sarg(a, "summary");
     const char *body = sarg(a, "body"), *scope = sarg(a, "scope");
-    if (!is_layer(layer) || !title || !*title || !summary || !*summary)
-        return fail(res, fmt("note needs layer (insight, skill or doc), title and summary"));
+    if (need(res, a, "note", (const char *const[]){"layer", "title", "summary", NULL}, "{\"layer\":\"insight\",\"title\":\"...\",\"summary\":\"...\"}")) return 1;
+    if (!is_layer(layer)) return fail(res, fmt("note layer must be insight, skill or doc"));
     json_object *sup = NULL;
     json_object_object_get_ex(a, "supersedes", &sup);
     size_t nsup = json_object_is_type(sup, json_type_array) ? json_object_array_length(sup) : 0;
