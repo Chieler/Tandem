@@ -664,7 +664,7 @@ same "20 parallel notes all succeed" "$(cat "$TMPD"/par.* | jq -r '.result.conte
 
 # ---- board ----
 PB=$(newpane pb)
-out=$(call "$KA" post '{"text":"heads up: main is broken"}')
+out=$(call "$KA" post '{"text":"heads up: main is broken","urgent":true}')
 check "post reaches agents in the project" "$(txt "$out")" "posted to "
 check "post names who it reached" "$(txt "$out")" "pb"
 check "post reports agents it could not reach" "$(txt "$out")" "skipped g (g awaiting permission prompt"
@@ -672,7 +672,7 @@ expect_screen "post arrives in another agent's pane" "$PB" "[cntctr board from=k
 refute "post never reaches another project" "$(screen "$KR")" "heads up"
 sleep 0.3
 refute "post is not echoed to the poster" "$(screen "$KA")" "heads up"
-call "$PB" post '{"text":"fixed in abc123"}' >/dev/null
+call "$PB" post '{"text":"fixed in abc123","urgent":true}' >/dev/null
 out=$(txt "$(call "$KA" board '{}')")
 check "board shows posts" "$out" "ka: heads up: main is broken"
 same "board is oldest first" "$(printf '%s\n' "$out" | tail -n 1 | cut -d' ' -f3-)" "pb: fixed in abc123"
@@ -685,6 +685,28 @@ check "dashboard shows the board" "$out" "pb: fixed in abc123"
 check "dashboard shows knowledge" "$out" " — parallel note "
 check "dashboard shows history" "$out" "reply $(lastid "$LB2") librarian-2→ka"
 check "dashboard shows the distill cursor" "$out" "last distill"
+
+# quiet posts: stored, not typed; counted on tool results
+QW=$(newpane qw)
+call "$S" board '{}' >/dev/null   # earlier posts in this project count as seen
+call "$QW" board '{}' >/dev/null
+out=$(txt "$(call "$S" post '{"text":"quiet news"}')")
+check "quiet post is stored" "$out" "posted to the board"
+sleep 0.5
+refute "quiet post is not typed" "$(screen "$QW")" "quiet news"
+out=$(txt "$(call "$QW" list '{}')")
+check "tool results count unread posts" "$out" "(1 unread board post; call board)"
+out=$(txt "$(call "$S" list '{}')")
+refute "own posts are not unread" "$out" "unread board post"
+out=$(txt "$(call "$QW" gather '{"tasks":[{"kind":"send","to":"missing-x","text":"y"}],"timeout":1}')")
+printf '%s' "$out" | jq -e . >/dev/null && ok_ || bad "JSON results get no unread line"
+out=$(txt "$(call "$QW" board '{}')")
+check "board shows the post" "$out" "quiet news"
+refute "board result has no unread line" "$out" "unread board post"
+out=$(txt "$(call "$QW" list '{}')")
+refute "board marks posts seen" "$out" "unread board post"
+call "$S" post '{"text":"urgent news","urgent":true}' >/dev/null
+expect_screen "urgent post is typed at once" "$QW" "urgent news"
 
 # ---- summary ----
 printf '%d passed, %d failed\n' "$pass" "$fail"

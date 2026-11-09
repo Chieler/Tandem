@@ -258,3 +258,23 @@ char *kb_board(sqlite3 *db, const char *scope, int limit) {
     sqlite3_bind_int(st, 2, limit);
     return lines(st);
 }
+
+char *kb_unread(sqlite3 *db, const char *scope, const char *me, long long after, long long *newest, int *count) {
+    sqlite3_stmt *st = prep(db, "SELECT rowid, sender, text FROM posts WHERE scope = ?1 AND rowid > ?2 ORDER BY rowid");
+    sqlite3_bind_text(st, 1, scope, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, after);
+    char *out = strdup("");
+    *newest = after;
+    *count = 0;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        *newest = sqlite3_column_int64(st, 0);
+        if (strcmp(col(st, 1), me) == 0) continue;   /* our own posts count as seen */
+        char *t;
+        if (asprintf(&t, "%s- %s: %s\n", out, col(st, 1), col(st, 2)) < 0) break;
+        free(out);
+        out = t;
+        (*count)++;
+    }
+    sqlite3_finalize(st);
+    return out;
+}

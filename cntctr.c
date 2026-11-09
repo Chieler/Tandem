@@ -1382,6 +1382,37 @@ static int tool_distill(json_object *a, char **res) {
     return r;
 }
 
+static long long seen_of(const char *name) {
+    char opt[160], *v;
+    snprintf(opt, sizeof opt, "@cntctr_seen_%s", name);
+    long long n = (v = sopt_get(opt)) ? atoll(v) : 0;
+    free(v);
+    return n;
+}
+
+static void set_seen(const char *name, long long n) {
+    char opt[160], val[24];
+    snprintf(opt, sizeof opt, "@cntctr_seen_%s", name);
+    snprintf(val, sizeof val, "%lld", n);
+    free(TMUXE(NULL, "set", "-s", opt, val));
+}
+
+/* Posts the agent `name` in `pane` has not seen, not counting its own (0 on any error). */
+static int unread_count(const char *pane, const char *name) {
+    char *err = NULL;
+    sqlite3 *db = kb(&err);
+    free(err);
+    if (!db) return 0;
+    struct project p;
+    resolve_project(db, pane, &p);
+    long long after = seen_of(name), newest = after;
+    int count = 0;
+    free(kb_unread(db, p.key, name, after, &newest, &count));
+    sqlite3_close(db);
+    if (!count && newest > after) set_seen(name, newest);   /* only our own posts were new */
+    return count;
+}
+
 /* Type `text` into every other live agent in the caller's project, and keep it on the project's board. */
 static int tool_post(json_object *a, char **res) {
     const char *text = sarg(a, "text");
@@ -1394,6 +1425,10 @@ static int tool_post(json_object *a, char **res) {
         char *err = fmt("post failed: %s", sqlite3_errmsg(db));
         sqlite3_close(db);
         return fail(res, err);
+    }
+    if (!barg(a, "urgent")) {
+        sqlite3_close(db);
+        return ok(res, fmt("posted to the board; agents see an unread count on their next cntctr call"));
     }
     if (TMUX(NULL, &panes, "list-panes", "-a", "-F", "#{pane_id}\t#{pane_dead}\t#{@cntctr_name}") != 0) {
         sqlite3_close(db);
@@ -1431,6 +1466,10 @@ static int tool_board(json_object *a, char **res) {
     sqlite3 *db = kb_for_caller(&p, res);
     if (!db) return 1;
     char *out = kb_board(db, p.key, limit);
+    long long newest = 0;
+    int unseen = 0;
+    free(kb_unread(db, p.key, caller_name, seen_of(caller_name), &newest, &unseen));
+    set_seen(caller_name, newest);
     sqlite3_close(db);
     if (*out) return ok(res, out);
     free(out);
@@ -1577,9 +1616,9 @@ static const char TOOLS[] =
     "\"model\":{\"type\":\"string\"},\"effort\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\",\"xhigh\",\"max\"]},"
     "\"wait\":{\"type\":\"boolean\"},\"timeout\":{\"type\":\"integer\"},"
     "\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"}}}}"
-    ",{\"name\":\"post\",\"description\":\"Tell every other agent working in this project something now (a broken build, a changed plan, a claimed file). "
-    "It is typed into their terminals and kept on the project's board. No reply is expected.\","
-    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"},"
+    ",{\"name\":\"post\",\"description\":\"Keep text on the project's board. Other agents see an unread count on their next cntctr call and read it with board. "
+    "urgent=true also types it into every agent's pane now.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"},\"urgent\":{\"type\":\"boolean\"},"
     "\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"}},\"required\":[\"text\"]}},"
     "{\"name\":\"board\",\"description\":\"Read the latest posts on this project's board, oldest first.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"limit\":{\"type\":\"integer\",\"description\":\"Default 20, at most 200\"}," KFROM "}}}"
@@ -1676,6 +1715,15 @@ static void *call_thread(void *arg) {
 
     char *text = NULL;
     int is_error = dispatch(sarg(params, "name"), args, &text);
+    const char *tool = sarg(params, "name");
+    if (*caller_pane && *caller_name && text && *text != '{' && !(tool && strcmp(tool, "board") == 0)) {
+        int unread = unread_count(caller_pane, caller_name);
+        if (unread) {
+            char *t = fmt("%s\n(%d unread board post%s; call board)", text, unread, unread == 1 ? "" : "s");
+            free(text);
+            text = t;
+        }
+    }
 
     json_object *item = json_object_new_object(), *content = json_object_new_array(), *result = json_object_new_object();
     json_object_object_add(item, "type", json_object_new_string("text"));
