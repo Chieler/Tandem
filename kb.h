@@ -69,4 +69,5 @@ char *kb_tool_show(sqlite3 *db, const char *project, const char *name);   /* eve
 int kb_tool_resolve_human(sqlite3 *db, const char *project, const char *name, int approve, int *version, char **reviews);
 /* Copy the project's active version *from to global as a new active *version, revoking the previous one. 0, or -1 (no active version). */
 int kb_tool_promote(sqlite3 *db, const char *project, const char *name, int *from, int *version);
+char *kb_unread(sqlite3 *db, const char *scope, const char *me, long long after, long long *newest, int *count);
 #endif

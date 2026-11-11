@@ -9,11 +9,12 @@ export HOME="$TMPD/home"   # fleet tools keep their cache under ~/.cache
 export BIN INIT CNTCTR_ENTER_DELAY_MS=50 LC_ALL=en_US.UTF-8 PATH="$TMPD/bin:$PATH" CNTCTR_DB="$TMPD/kb.db" CNTCTR_MEM_URL=
 unset TMUX_PANE
 
-t() { tmux -L cntctr-test -f /dev/null "$@"; }
+SOCKET="cntctr-test-$$"
+t() { tmux -L "$SOCKET" -f /dev/null "$@"; }
 t kill-server 2>/dev/null
 t new-session -d -s test -x 200 -y 50 cat
 export TMUX="$(t display -p '#{socket_path}'),0,0"
-trap 't kill-server 2>/dev/null; sqlite3 "$CNTCTR_DB" "select review_root from tools where review_root > \"\"" 2>/dev/null | xargs rm -rf; rm -rf "$TMPD"' EXIT
+trap 't kill-server 2>/dev/null; sq "$CNTCTR_DB" "select review_root from tools where review_root > \"\"" 2>/dev/null | xargs rm -rf; rm -rf "$TMPD"' EXIT
 
 pass=0 fail=0
 ok_() { pass=$((pass + 1)); }
@@ -46,7 +47,8 @@ session() {
 call() {
     SKIP=1 session "$1" 2 "$INIT" "$(printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"%s","arguments":%s}}' "$2" "$3")" | tail -n 1
 }
-txt() { printf '%s' "$1" | jq -r '.result.content[0].text'; }
+rawtxt() { printf '%s' "$1" | jq -r '.result.content[0].text'; }
+txt() { printf '%s' "$1" | jq -r '.result.content[0].text | sub("\n\\([0-9]+ unread board posts?; call board\\)$"; "")'; }
 iserr() { printf '%s' "$1" | jq -r '.result.isError'; }
 
 screen() { t capture-pane -p -J -t "$1"; }
@@ -55,6 +57,17 @@ expect_screen() {
     for _ in $(seq 50); do screen "$2" | grep -qF -- "$3" && { ok_; return; }; sleep 0.1; done
     bad "$1" "  pane $2 never showed: $3"
 }
+# daemon_start <pane>: a long-lived cntctr as <pane>'s agent; daemon_send <line>; daemon_stop
+daemon_start() {
+    DFIFO=$(mktemp -u "$TMPD/dfifo.XXXXXX"); mkfifo "$DFIFO"
+    DOUT=$(mktemp "$TMPD/dout.XXXXXX")
+    TMUX_PANE=$1 "$BIN" < "$DFIFO" > "$DOUT" & DPID=$!
+    exec 4> "$DFIFO"
+    printf '%s\n' "$INIT" >&4
+}
+daemon_send() { printf '%s\n' "$1" >&4; }
+daemon_stop() { exec 4>&-; wait "$DPID" 2>/dev/null; rm -f "$DFIFO"; }
+
 # lastid <pane>: id of the newest message envelope shown in the pane
 lastid() { screen "$1" | sed -n 's/.*\[cntctr from=[^ ]* id=\([0-9a-f]\{8\}\)\].*/\1/p' | tail -n 1; }
 # newpane <name> [command...]: open a tagged window running cat (or <command>), print its pane id
@@ -108,13 +121,40 @@ out=$(printf '%s\n%s\n' "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/call","
     TMUX=/nonexistent/sock,0,0 "$BIN" | tail -n 1)
 same "list without a tmux server is a tool error" "$(iserr "$out")" true
 
+# ---- status ----
+BUSY=$(newpane st-busy sh -c 'printf "%s\n" "* Working (12s * esc to interrupt)"; exec cat')
+LIM=$(newpane st-lim sh -c 'printf "%s\n" "Usage limit reached * continuing automatically at 10:40pm * esc to cancel"; exec cat')
+AGYQ=$(newpane st-agyq sh -c 'printf "%s\n" "Individual quota reached. Resets in 143h57m55s."; exec cat')
+AGYT=$(newpane st-agyt sh -c 'printf "%s\n" "? for shortcuts     Gemini 3.8 Flash * high * 1 task(s) * /tasks"; exec cat')
+OLD=$(newpane st-old sh -c 'printf "%s\n" "Usage limit reached"; seq 1 30; exec cat')
+IDLE=$(newpane st-idle)
+sleep 0.5
+out=$(txt "$(call "$IDLE" list '{}')")
+check "list shows busy" "$out" "st-busy test $BUSY alive busy"
+check "list shows limited" "$out" "st-lim test $LIM alive limited"
+check "list shows reset time" "$out" 'resets="10:40pm"'
+check "agy quota is limited" "$out" "st-agyq test $AGYQ alive limited"
+check "agy quota reset" "$out" 'resets="143h57m55s"'
+check "agy background task is busy" "$out" "st-agyt test $AGYT alive busy"
+check "limit text above the last 15 lines is ignored" "$out" "st-old test $OLD alive idle"
+check "list shows idle time" "$out" "st-idle test $IDLE alive idle idle="
+PERM=$(newpane st-perm sh -c 'printf "%s\n" "Do you want to proceed?"; exec cat')
+PEND=$(newpane st-pend 'stty -echo; cat')
+sleep 0.5
+pid=$(txt "$(call "$IDLE" send '{"to":"st-pend","text":"pending"}')" | sed 's/sent id=//')
+out=$(txt "$(call "$IDLE" list '{}')")
+check "list shows permission" "$out" "st-perm test $PERM alive permission"
+check "list shows open task id" "$out" "st-pend test $PEND alive"
+check "open task listed" "$out" "tasks=$pid"
+t kill-pane -t "$PERM"; t kill-pane -t "$PEND"
+
 # ---- send ----
 out=$(call "$A" send '{"to":"b","text":"hello from a"}')
 check "send returns an id" "$(txt "$out")" "sent id="
 id=$(txt "$out" | sed 's/sent id=//')
 expect_screen "envelope header" "$B" "[cntctr from=a id=$id]"
 expect_screen "message text" "$B" "hello from a"
-expect_screen "reply hint" "$B" "[when done: call the reply tool of the cntctr MCP server with id=$id and your answer, plus insights=[...] with durable facts other agents should know; it is an MCP tool, not a shell command. Your agent name is b: pass from=b when you call send, spawn or kill]"
+expect_screen "reply hint" "$B" "[when done: call the reply tool of the cntctr MCP server with id=$id and your answer, plus insights=[...] with durable facts other agents should know; it is an MCP tool, not a shell command. Your agent name is b: pass from=b on every cntctr call]"
 call "$A" send '{"to":"b","text":"line one\nline two ünï"}' >/dev/null
 expect_screen "multiline unicode text arrives" "$B" "line two ünï"
 call "$A" send "$(jq -nc --arg t "\$(touch $TMPD/pwned) \`touch $TMPD/pwned\`" '{to:"b",text:$t}')" >/dev/null
@@ -257,6 +297,64 @@ same "gather failure is incomplete" "$(printf '%s' "$gather" | jq -r '.complete'
 same "gather records dispatch failure" "$(printf '%s' "$gather" | jq -r '.results[0].status')" failed
 same "gather keeps later answer" "$(printf '%s' "$gather" | jq -r '.results[1].text')" "good answer"
 
+# answers arrive out of order; each lands on its own task
+call "$S" gather '{"tasks":[{"kind":"send","to":"ga","text":"order one"},{"kind":"send","to":"gb","text":"order two"}],"timeout":10}' > "$TMPD/gather-order" & gather_pid=$!
+expect_screen "order gather sent to ga" "$GA" "order one"
+expect_screen "order gather sent to gb" "$GB" "order two"
+call "$GB" reply "{\"id\":\"$(lastid "$GB")\",\"text\":\"b first\"}" >/dev/null
+call "$GA" reply "{\"id\":\"$(lastid "$GA")\",\"text\":\"a second\"}" >/dev/null
+wait "$gather_pid"
+gather=$(txt "$(cat "$TMPD/gather-order")")
+same "out-of-order answers map to tasks" "$(printf '%s' "$gather" | jq -r '[.results[].text] | join(",")')" "a second,b first"
+
+# a limited worker ends its task at once; its later reply still reaches the caller
+GL=$(newpane gl sh -c 'printf "%s\n" "Usage limit reached * resets 3:00am"; exec cat')
+start=$(date +%s)
+gather=$(txt "$(call "$S" gather '{"tasks":[{"kind":"send","to":"gl","text":"never"}],"timeout":30}')")
+same "limited task status" "$(printf '%s' "$gather" | jq -r '.results[0].status')" limited
+same "limited task reset" "$(printf '%s' "$gather" | jq -r '.results[0].resets')" "3:00am"
+[ $(( $(date +%s) - start )) -lt 10 ] && ok_ || bad "limited task returned before the timeout"
+call "$GL" reply "{\"id\":\"$(printf '%s' "$gather" | jq -r '.results[0].id')\",\"text\":\"after reset\"}" >/dev/null
+expect_screen "limited worker's late reply reaches caller" "$S" "after reset"
+t kill-pane -t "$GL"
+
+# cancel: an answer claimed before the cancel and one arriving after both reach the caller's pane
+daemon_start "$S"
+daemon_send '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"gather","arguments":{"tasks":[{"kind":"send","to":"ga","text":"cancel one"},{"kind":"send","to":"gb","text":"cancel two"}],"timeout":30}}}'
+expect_screen "cancel gather sent to ga" "$GA" "cancel one"
+expect_screen "cancel gather sent to gb" "$GB" "cancel two"
+call "$GA" reply "{\"id\":\"$(lastid "$GA")\",\"text\":\"before cancel\"}" >/dev/null
+sleep 1.5
+daemon_send '{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":5}}'
+sleep 1.5
+call "$GB" reply "{\"id\":\"$(lastid "$GB")\",\"text\":\"after cancel\"}" >/dev/null
+daemon_stop
+expect_screen "answer claimed before cancel reaches pane" "$S" "before cancel"
+expect_screen "answer after cancel reaches pane" "$S" "after cancel"
+
+# wait=false returns ids at once; replies arrive in the pane
+start=$(date +%s)
+gather=$(txt "$(call "$S" gather '{"tasks":[{"kind":"send","to":"ga","text":"async one"}],"wait":false,"timeout":5}')")
+[ $(( $(date +%s) - start )) -lt 3 ] && ok_ || bad "async gather returns at once"
+same "async gather status" "$(printf '%s' "$gather" | jq -r '.results[0].status')" sent
+same "async gather is not complete" "$(printf '%s' "$gather" | jq -r '.complete')" false
+expect_screen "async gather dispatched" "$GA" "async one"
+call "$GA" reply "{\"id\":\"$(lastid "$GA")\",\"text\":\"async answer\"}" >/dev/null
+expect_screen "async gather answer reaches pane" "$S" "async answer"
+
+# a worker that dies ends its task as dead
+GD=$(newpane gd sh -c 'sleep 6')
+t set -p -t "$GD" remain-on-exit on
+gather=$(txt "$(call "$S" gather '{"tasks":[{"kind":"send","to":"gd","text":"die"}],"timeout":30}')")
+same "dead task status" "$(printf '%s' "$gather" | jq -r '.results[0].status')" dead
+
+# blocking send to a limited worker says so
+GL=$(newpane gl sh -c 'printf "%s\n" "Usage limit reached * resets 3:00am"; exec cat')
+out=$(txt "$(call "$S" send '{"to":"gl","text":"blocked","wait":true,"timeout":30}')")
+check "blocking send reports limit" "$out" "hit its usage limit (resets 3:00am)"
+t kill-pane -t "$GL"
+t kill-pane -t "$GD"
+
 R=$(newpane r)
 { printf '%s\n' "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send","arguments":{"to":"b","text":"cancel me","wait":true,"timeout":30}}}'
   sleep 1
@@ -330,7 +428,7 @@ case $task in *toolcheck*)
         exec 4> "$f"
         printf '%s\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"%s","arguments":%s}}\n' "$INIT" "$1" "$2" >&4
         for _ in $(seq 100); do [ "$(wc -l < "$f.out")" -ge 2 ] && break; sleep 0.1; done
-        R=$(sed -n 2p "$f.out" | jq -r '.result.content[0].text')
+        R=$(sed -n 2p "$f.out" | jq -r '.result.content[0].text | sub("\n\\([0-9]+ unread board posts?; call board\\)$"; "")')
     }
     [ -n "${CNTCTR_TEST_FAST-}" ] || sleep 0.5
     [ "$mode" = none ] && exec cat
@@ -392,7 +490,14 @@ expect_screen "claude gets model and effort" "$(txt "$out" | sed 's/.* in \(%[0-
 out=$(call "$L" spawn '{"harness":"codex","name":"m2","task":"x","model":"gpt-6-luna","effort":"high"}')
 expect_screen "codex gets model and effort" "$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')" "flags:  -m gpt-6-luna -c model_reasoning_effort=\"high\""
 out=$(call "$L" spawn '{"harness":"agy","name":"m3","task":"x","model":"gemini-3.8-flash-high","effort":"high"}')
-expect_screen "agy gets model and effort" "$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')" "flags:  --model gemini-3.8-flash-high --effort high -i"
+expect_screen "agy gets model and effort" "$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')" "flags:  --model gemini-3.8-flash-high --effort high --settings"
+# agy gets a session-only trustedWorkspaces for its cwd
+mkdir -p "$TMPD/agywork"
+call "$L" spawn "{\"harness\":\"agy\",\"name\":\"agyt\",\"task\":\"trust\",\"cwd\":\"$TMPD/agywork\"}" >/dev/null
+AGT=$(t list-panes -a -F '#{pane_id} #{@cntctr_name}' | awk '$2=="agyt"{print $1}')
+real=$(cd "$TMPD/agywork" && pwd -P)
+expect_screen "agy gets --settings" "$AGT" "--settings"
+expect_screen "agy trusts its real cwd" "$AGT" "{\"trustedWorkspaces\":[\"$real\"]}"
 expect_screen "claude runs under headroom wrap" "$(txt "$(call "$L" list '{}')" | sed -n 's/^m1 claude \(%[0-9]*\).*/\1/p')" "wrapped:claude"
 expect_screen "codex runs under headroom wrap" "$(txt "$(call "$L" list '{}')" | sed -n 's/^m2 codex \(%[0-9]*\).*/\1/p')" "wrapped:codex"
 if t capture-pane -p -t "$(txt "$(call "$L" list '{}')" | sed -n 's/^m3 agy \(%[0-9]*\).*/\1/p')" | grep -q wrapped; then bad "agy is not wrapped"; else ok_; fi
@@ -408,10 +513,16 @@ out=$(call "$L" spawn '{"harness":"claude","name":"r4","task":"Design the archit
 expect_screen "hard task gets the strongest model" "$(pane_of "$out")" "flags:  --model claude-opus-5-5 --effort high"
 out=$(call "$L" spawn '{"harness":"codex","name":"r5","task":"rename foo to bar in kb.c"}')
 expect_screen "codex light task" "$(pane_of "$out")" "flags:  -m gpt-6-luna -c model_reasoning_effort=\"low\""
+out=$(call "$L" spawn '{"harness":"codex","name":"r5s","task":"Implement the retry loop."}')
+expect_screen "codex standard task" "$(pane_of "$out")" "flags:  -m gpt-6.1-terra -c model_reasoning_effort=\"medium\""
+out=$(call "$L" spawn '{"harness":"codex","name":"r5r","task":"Review the retry loop."}')
+expect_screen "codex review task" "$(pane_of "$out")" "flags:  -m gpt-6.1-sol -c model_reasoning_effort=\"medium\""
+out=$(call "$L" spawn '{"harness":"codex","name":"r5h","task":"Design the architecture for cross-machine sync."}')
+expect_screen "codex hard task" "$(pane_of "$out")" "flags:  -m gpt-6.1-sol -c model_reasoning_effort=\"high\""
 out=$(call "$L" spawn '{"harness":"agy","name":"r6b","task":"rename foo to bar"}')
-expect_screen "agy light task stays on medium" "$(pane_of "$out")" "flags:  --model gemini-3.8-flash-medium --effort medium -i"
+expect_screen "agy light task stays on medium" "$(pane_of "$out")" "flags:  --model gemini-3.8-flash-medium --effort medium"
 out=$(call "$L" spawn '{"harness":"agy","name":"r6","task":"Design the architecture for the new sync layer."}')
-expect_screen "agy always uses Gemini 3.8" "$(pane_of "$out")" "flags:  --model gemini-3.8-flash-high --effort high -i"
+expect_screen "agy always uses Gemini 3.8" "$(pane_of "$out")" "flags:  --model gemini-3.8-flash-high --effort high --settings"
 out=$(call "$L" spawn '{"harness":"claude","name":"r7","task":"Design everything","tier":"light"}')
 expect_screen "tier overrides the router" "$(pane_of "$out")" "flags:  --model claude-haiku-5-5 --effort medium"
 out=$(call "$L" spawn '{"harness":"claude","name":"r8","task":"Design everything","effort":"low"}')
@@ -423,6 +534,22 @@ out=$(call "$L" spawn '{"harness":"claude","name":"w1","task":"x"}')
 same "duplicate spawn name" "$(txt "$out")" "agent w1 already exists"
 out=$(call "$L" spawn '{"harness":"vim","name":"w9","task":"x"}')
 same "unknown harness" "$(txt "$out")" "unknown harness vim"
+
+# to: "parent"
+call "$L" spawn '{"harness":"claude","name":"kid","task":"hello"}' >/dev/null
+KID=$(t list-panes -a -F '#{pane_id} #{@cntctr_name}' | awk '$2=="kid"{print $1}')
+same "spawn records parent" "$(t show -pqv -t "$KID" @cntctr_parent)" "$L"
+call "$KID" send '{"to":"parent","text":"to my parent"}' >/dev/null
+expect_screen "to:parent reaches the spawner" "$L" "to my parent"
+expect_screen "to:parent envelope names the spawner's real name" "$L" "Your agent name is lead"
+refute "to:parent envelope never says parent" "$(screen "$L")" "Your agent name is parent"
+gp=$(txt "$(call "$KID" gather '{"tasks":[{"kind":"send","to":"parent","text":"gather to parent"}],"timeout":2}')")
+expect_screen "gather to:parent reaches the spawner" "$L" "gather to parent"
+out=$(session "" 2 "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send","arguments":{"from":"kid","to":"parent","text":"via shared server"}}}' | tail -n 1)
+expect_screen "to:parent works through from= (Codex)" "$L" "via shared server"
+out=$(call "$S" send '{"to":"parent","text":"orphan"}')
+same "no parent is an error" "$(iserr "$out")" true
+check "no parent message" "$(txt "$out")" "you have no parent"
 
 same "kill worker" "$(txt "$(call "$L" kill '{"name":"w1"}')")" ok
 refute "killed worker gone from list" "$(txt "$(call "$L" list '{}')")" "w1 claude"
@@ -444,8 +571,8 @@ check "read shows the agent" "$out" "(agent ka)"
 check "read shows visibility" "$out" "visibility: shared"
 check "read shows body" "$out" "Seen with Claude 2.1.287."
 same "read unknown id" "$(txt "$(call "$KA" read '{"id":"nope"}')")" "entry nope not found"
-same "note without summary" "$(txt "$(call "$KA" note '{"layer":"insight","title":"x"}')")" "note needs layer (insight, skill or doc), title and summary"
-same "note cannot write history" "$(txt "$(call "$KA" note '{"layer":"history","title":"x","summary":"y"}')")" "note needs layer (insight, skill or doc), title and summary"
+check "note without summary" "$(txt "$(call "$KA" note '{"layer":"insight","title":"x"}')")" "note needs 'layer', 'title', 'summary' (missing: summary)."
+check "note cannot write history" "$(txt "$(call "$KA" note '{"layer":"history","title":"x","summary":"y"}')")" "note layer must be insight, skill or doc"
 
 mkdir "$TMPD/repo" "$TMPD/plain"
 git -C "$TMPD/repo" init -q
@@ -591,7 +718,7 @@ same "20 parallel notes all succeed" "$(cat "$TMPD"/par.* | jq -r '.result.conte
 
 # ---- board ----
 PB=$(newpane pb)
-out=$(call "$KA" post '{"text":"heads up: main is broken"}')
+out=$(call "$KA" post '{"text":"heads up: main is broken","urgent":true}')
 check "post reaches agents in the project" "$(txt "$out")" "posted to "
 check "post names who it reached" "$(txt "$out")" "pb"
 check "post reports agents it could not reach" "$(txt "$out")" "skipped g (g awaiting permission prompt"
@@ -599,13 +726,37 @@ expect_screen "post arrives in another agent's pane" "$PB" "[cntctr board from=k
 refute "post never reaches another project" "$(screen "$KR")" "heads up"
 sleep 0.3
 refute "post is not echoed to the poster" "$(screen "$KA")" "heads up"
-call "$PB" post '{"text":"fixed in abc123"}' >/dev/null
+call "$PB" post '{"text":"fixed in abc123","urgent":true}' >/dev/null
 out=$(txt "$(call "$KA" board '{}')")
 check "board shows posts" "$out" "ka: heads up: main is broken"
 same "board is oldest first" "$(printf '%s\n' "$out" | tail -n 1 | cut -d' ' -f3-)" "pb: fixed in abc123"
 same "board limit" "$(txt "$(call "$KA" board '{"limit":1}')" | cut -d' ' -f3-)" "pb: fixed in abc123"
 refute "board of another project" "$(txt "$(call "$KR" board '{}')")" "heads up"
-same "post needs text" "$(txt "$(call "$KA" post '{}')")" "post needs 'text'"
+same "board of another project is empty" "$(txt "$(call "$KR" board '{}')")" "no posts"
+check "post needs text" "$(txt "$(call "$KA" post '{}')")" "post needs 'text' (missing: text). Example: post {\"text\":\"...\"}"
+# errors name the missing field and give an example
+out=$(txt "$(call "$KA" reply '{"text":"x"}')")
+check "reply error names id" "$out" "reply needs 'id', 'text' (missing: id)."
+check "reply error has example" "$out" 'Example: reply {"id":"1a2b3c4d","text":"done"}'
+out=$(txt "$(call "$KA" send '{"to":"b"}')")
+check "send error names text" "$out" "(missing: text)"
+check "send error has example" "$out" 'Example: send {"to":"codex-2","text":"..."}'
+out=$(txt "$(call "$KA" spawn '{"harness":"claude"}')")
+check "spawn error names both" "$out" "(missing: name, task)"
+out=$(txt "$(call "$KA" post '{}')")
+check "post error has example" "$out" 'Example: post {"text":"..."}'
+out=$(txt "$(call "$KA" note '{"layer":"insight"}')")
+check "note error names fields" "$out" "(missing: title, summary). Example: note {"
+out=$(txt "$(call "$KA" gather '{}')")
+check "gather error has example" "$out" 'Example: gather {"tasks":[{"kind":"send"'
+out=$(txt "$(call "$KA" kill '{}')")
+check "kill error names name" "$out" "kill needs 'name' (missing: name). Example: kill {"
+out=$(rpc "$INIT")
+check "instructions explain supersedes" "$out" "supersedes=[old id]"
+check "instructions explain parent" "$out" 'to=\"parent\"'
+check "instructions explain urgent" "$out" "urgent=true"
+out=$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')
+check "note description explains stale notes" "$out" "recall hides"
 out=$(bash "$(dirname "$BIN")/watch.sh" --once)
 check "dashboard lists agents" "$out" "librarian-1"
 check "dashboard shows the board" "$out" "pb: fixed in abc123"
@@ -1233,6 +1384,27 @@ refute "a revoked project tool masks the global one" "$out" "rcm"
 check "recall matches by name" "$(txt "$(call "$SK" recall '{"query":"rcl"}')")" "[tool] rcl:"
 check "initialize teaches fleet tools" "$(rpc "$INIT")" "make it a fleet tool with tool_define"
 fi
+# quiet posts: stored, not typed; counted on tool results
+QW=$(newpane qw)
+call "$S" board '{}' >/dev/null   # earlier posts in this project count as seen
+call "$QW" board '{}' >/dev/null
+out=$(txt "$(call "$S" post '{"text":"quiet news"}')")
+check "quiet post is stored" "$out" "posted to the board"
+sleep 0.5
+refute "quiet post is not typed" "$(screen "$QW")" "quiet news"
+out=$(rawtxt "$(call "$QW" list '{}')")
+check "tool results count unread posts" "$out" "(1 unread board post; call board)"
+out=$(rawtxt "$(call "$S" list '{}')")
+refute "own posts are not unread" "$out" "unread board post"
+out=$(txt "$(call "$QW" gather '{"tasks":[{"kind":"send","to":"missing-x","text":"y"}],"timeout":1}')")
+printf '%s' "$out" | jq -e . >/dev/null && ok_ || bad "JSON results get no unread line"
+out=$(txt "$(call "$QW" board '{}')")
+check "board shows the post" "$out" "quiet news"
+refute "board result has no unread line" "$out" "unread board post"
+out=$(txt "$(call "$QW" list '{}')")
+refute "board marks posts seen" "$out" "unread board post"
+call "$S" post '{"text":"urgent news","urgent":true}' >/dev/null
+expect_screen "urgent post is typed at once" "$QW" "urgent news"
 
 # ---- summary ----
 printf '%d passed, %d failed\n' "$pass" "$fail"

@@ -17,7 +17,7 @@ There is no daemon. tmux carries every message, and SQLite holds the shared know
  │  └ cntctr    │            │  └ cntctr    │             │  └ cntctr    │
  └──────┬───────┘            └──────┬───────┘             └──────┬───────┘
         └─────────────► tmux server ◄────────────────────────────┘
-                 pane options, paste buffers, wait-for channels
+                 pane options, paste buffers (reply buffer, polled)
                               │
                      SQLite + FTS5 knowledge store
 ```
@@ -48,15 +48,21 @@ There is no daemon. tmux carries every message, and SQLite holds the shared know
 
 ## Install
 
-Register the server once for each harness (use the absolute path):
+Copy the build to a versioned path, so rebuilding in the repo never swaps the binary under running agents:
 
-    claude mcp add -s user cntctr -- /path/to/cntctr
-    codex mcp add cntctr -- /path/to/cntctr
-    agy mcp add cntctr /path/to/cntctr
+    cp cntctr ~/.local/bin/cntctr-0.2.0
+
+Register that path once for each harness:
+
+    claude mcp add -s user cntctr -- ~/.local/bin/cntctr-0.2.0
+    codex mcp add cntctr -- ~/.local/bin/cntctr-0.2.0
+    agy mcp add cntctr ~/.local/bin/cntctr-0.2.0
+
+To upgrade or roll back, point the same entries at another version and restart the agents. Release tags (`v0.1.0`, ...) rebuild any old version.
 
 Raise each harness's tool timeout above the longest blocking wait you plan to use:
 
-- Claude Code: `MCP_TOOL_TIMEOUT` in milliseconds, e.g. `export MCP_TOOL_TIMEOUT=3600000`.
+- Claude Code: aborts a tool call that sends nothing for 30 minutes. Add `"timeout": 10800000` (ms) to the cntctr entry in `~/.claude.json`, or set `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` (ms, 0 disables) for every server.
 - Codex: in `~/.codex/config.toml`, under `[mcp_servers.cntctr]`, set `tool_timeout_sec = 3600`.
 - agy: no MCP timeout setting found; keep blocking waits short or use async sends.
 
@@ -89,9 +95,9 @@ leader doesn't have to (`cntctr.c:route`, tables `RULES` and `ROUTES`):
 | Tier | Task words | claude | codex | agy |
 |---|---|---|---|---|
 | light | smoke test, rename, typo, format, lookup, list, summarize, count | claude-haiku-5-5 medium | gpt-6-luna low | gemini-3.8-flash-medium |
-| standard | anything else | claude-sonnet-5-5 medium | gpt-6-luna medium | gemini-3.8-flash-medium |
-| review | review, audit, verify, merge, critique | claude-opus-4-7 high | gpt-6-sol medium | gemini-3.8-flash-high |
-| hard | architecture, design, race condition, concurrency, root cause, security, migration, rewrite | claude-opus-5-5 high | gpt-6-sol high | gemini-3.8-flash-high |
+| standard | anything else | claude-sonnet-5-5 medium | gpt-6.1-terra medium | gemini-3.8-flash-medium |
+| review | review, audit, verify, merge, critique | claude-opus-4-7 high | gpt-6.1-sol medium | gemini-3.8-flash-high |
+| hard | architecture, design, race condition, concurrency, root cause, security, migration, rewrite | claude-opus-5-5 high | gpt-6.1-sol high | gemini-3.8-flash-high |
 
 Rules are checked in the order hard, review, light; tasks over
 6000 characters count as review. Pass `tier`, `model` or `effort` to override.
@@ -108,6 +114,22 @@ its own separate prompt instead of colliding.
 Delivery tuning: `CNTCTR_ENTER_DELAY_MS` (default 150) is the pause between
 pasting a message and pressing Enter.
 
+### Long and parallel work
+
+`gather` reports one `status` per task: `answered`, `timed_out`, `dead` (the worker's pane is gone), `limited` (the worker hit a usage limit; the result gives the reset time, so re-send the task yourself or to another agent), `failed`, or `sent` with `wait=false`. A reply that arrives after a timeout or cancel is typed into your pane with its id, so nothing is lost.
+
+```json
+{"tasks":[{"kind":"send","to":"tests","text":"Run the suite"}],"timeout":300,"wait":false}
+```
+
+With `wait=false` gather sends everything and returns at once (status `sent`); replies land in your pane.
+
+`list` shows each agent's state: `idle`, `busy`, `permission`, `limited` or `dead`, plus open task ids (`tasks=`), idle time (`idle=`) and the reset time (`resets=`) when limited.
+
+A worker answers the agent that spawned it with `to: "parent"`.
+
+Board posts are pull-only: tool results end with `(N unread board post(s); call board)` and you read them with `board`. `post` with `urgent=true` types into every pane instead; use it only when everyone must see the post now.
+
 ## Knowledge
 
 cntctr keeps a knowledge store that every agent shares across sessions. It lives in
@@ -121,7 +143,7 @@ SQLite at `~/.local/share/cntctr/kb.db`, or at `$CNTCTR_DB` if that is set.
 | `forget` | Retire a stale entry. History entries can't be forgotten. |
 | `project` | Show the project key, which is the normalized `origin` remote, or override it for this repo. |
 | `distill` | Spawn a librarian worker that turns recent history into insights and skills and merges duplicates. |
-| `post` | Type a note into every other live agent working in the same project, and keep it on the project's board. |
+| `post` | Keep a note on the project's board; other agents see an unread count. `urgent=true` also types it into their panes. |
 | `board` | Show the project's latest posts, oldest first. |
 
 Every `send`, `spawn` and `reply` is logged as private history. Replies can add
@@ -183,7 +205,7 @@ each feature with real agents, ask your leader to:
 2. Spawn a worker with a task that mentions the insight's words. The task and reply appear
    under history, and the worker's window shows a `[cntctr knowledge: ...]` block.
 3. Have the worker reply with `insights=[...]`. They appear under knowledge.
-4. `post` something. It shows up in every other agent's window in the project and on the board.
+4. `post` something. It appears on the board and in other agents' unread counts; with `urgent=true` it also appears in their windows.
 5. `distill`. A `librarian-N` agent appears, `last distill` updates, and new or merged
    entries appear as it works; merged ones turn `x`.
 

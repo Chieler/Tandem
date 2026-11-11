@@ -26,9 +26,12 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <limits.h>
 #include <json-c/json.h>
 #include "kb.h"
 #include "fleet.h"
+
+#define CNTCTR_VERSION "0.3.0"
 
 static pthread_mutex_t out_mu = PTHREAD_MUTEX_INITIALIZER;   /* one JSON line at a time on stdout */
 static pthread_mutex_t live_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -93,6 +96,20 @@ static int targ(json_object *o) {
     json_object *v;
     int t = json_object_object_get_ex(o, "timeout", &v) ? json_object_get_int(v) : 600;
     return t < 1 ? 1 : t > 86400 ? 86400 : t;
+}
+
+/* Fail with "<tool> needs 'a', 'b' (missing: b). Example: <tool> <example>" if a field is absent or empty. */
+static int need(char **res, json_object *a, const char *tool, const char *const *fields, const char *example) {
+    char *all = strdup(""), *missing = strdup(""), *t;
+    for (; *fields; fields++) {
+        const char *v = sarg(a, *fields);
+        t = fmt("%s%s'%s'", all, *all ? ", " : "", *fields), free(all), all = t;
+        if (!v || !*v) t = fmt("%s%s%s", missing, *missing ? ", " : "", *fields), free(missing), missing = t;
+    }
+    int bad = *missing != '\0';
+    if (bad) *res = fmt("%s needs %s (missing: %s). Example: %s %s", tool, all, missing, tool, example);
+    free(all), free(missing);
+    return bad;
 }
 
 /* ---- processes ---- */
@@ -487,6 +504,8 @@ static char *merge_mem(sqlite3 *db, char *out, const char *table) {
 
 /* ---- agents and delivery ---- */
 
+static int pane_alive(const char *pane);
+
 /* Pane id of the agent called `name` (caller frees), or NULL. */
 static char *find_agent(const char *name) {
     char *out, *pane = NULL, *save;
@@ -503,6 +522,22 @@ static char *find_agent(const char *name) {
     return pane;
 }
 
+/* Pane for a message target (caller frees): "parent" is whoever spawned the caller,
+ * anything else an agent name. NULL with *err set otherwise. */
+static char *resolve_target(const char *to, char **err) {
+    *err = NULL;
+    if (strcmp(to, "parent") == 0) {
+        char *p;
+        if (TMUX(NULL, &p, "show", "-pqv", "-t", caller_pane, "@cntctr_parent") == 0 && *p && pane_alive(p)) return p;
+        free(p);
+        *err = fmt("you have no parent (only spawned agents have one)");
+        return NULL;
+    }
+    char *pane = find_agent(to);
+    if (!pane) *err = fmt("agent %s not found", to);
+    return pane;
+}
+
 /* Text of harness permission dialogs. Enter on one of these accepts its default
  * choice, so nothing may be pasted while one is showing. Matched case-insensitively
  * against the last 15 lines of the pane. */
@@ -514,20 +549,80 @@ static const char *PROMPTS[] = {
 };
 static regex_t prompt_re[sizeof PROMPTS / sizeof *PROMPTS];
 
-static int awaiting_permission(const char *pane) {
+/* Usage-limit screens, observed 2026-11-08: Claude Code ("You've hit your session limit · resets 10:40pm",
+ * "Usage limit reached · continuing automatically at 10:40pm"), Codex ("Usage limit reached"),
+ * agy ("⚠ Individual quota reached. ... Resets in 143h57m55s."). */
+static const char *LIMITS[] = {
+    "hit your (session|weekly|usage) limit",
+    "usage limit reached",
+    "individual quota reached",
+};
+/* Working markers, observed 2026-11-08: Claude Code and Codex status line ("esc to interrupt"),
+ * agy model turn ("esc to cancel"), agy background shell task ("1 task(s) · /tasks"). */
+static const char *BUSY[] = {"esc to interrupt", "esc to cancel", "[0-9]+ task\\(s\\)"};
+static regex_t limit_re[sizeof LIMITS / sizeof *LIMITS], busy_re[sizeof BUSY / sizeof *BUSY], resets_re;
+
+enum pstate { P_IDLE, P_BUSY, P_PERMISSION, P_LIMITED, P_DEAD };
+static const char *PSTATE[] = {"idle", "busy", "permission", "limited", "dead"};
+
+/* Last 15 lines of `pane` (caller frees), or NULL if the pane is gone. */
+static char *pane_tail(const char *pane) {
     char *screen;
     if (TMUX(NULL, &screen, "capture-pane", "-p", "-t", pane) != 0) {
         free(screen);
-        return 0;   /* a missing pane fails later, in paste-buffer */
+        return NULL;
     }
     char *tail = screen + strlen(screen);   /* run() already dropped trailing blank lines */
     for (int lines = 0; tail > screen; tail--)
         if (tail[-1] == '\n' && ++lines == 15) break;
-    int hit = 0;
-    for (size_t i = 0; i < sizeof PROMPTS / sizeof *PROMPTS && !hit; i++)
-        hit = regexec(&prompt_re[i], tail, 0, NULL, 0) == 0;
-    free(screen);
+    memmove(screen, tail, strlen(tail) + 1);
+    return screen;
+}
+
+static int match_any(const regex_t *re, size_t n, const char *s) {
+    for (size_t i = 0; i < n; i++)
+        if (regexec(&re[i], s, 0, NULL, 0) == 0) return 1;
+    return 0;
+}
+
+static int awaiting_permission(const char *pane) {
+    char *tail = pane_tail(pane);   /* a missing pane fails later, in paste-buffer */
+    int hit = tail && match_any(prompt_re, sizeof PROMPTS / sizeof *PROMPTS, tail);
+    free(tail);
     return hit;
+}
+
+/* What `pane` is doing, from its screen. Order matters: a limit screen can also show
+ * "esc to cancel", and permission dialogs can show "Esc to cancel". */
+static enum pstate pane_state(const char *pane, char **resets) {
+    if (resets) *resets = NULL;
+    if (!pane_alive(pane)) return P_DEAD;
+    char *tail = pane_tail(pane);
+    if (!tail) return P_DEAD;
+    enum pstate s = P_IDLE;
+    regmatch_t m[4];
+    if (match_any(limit_re, sizeof LIMITS / sizeof *LIMITS, tail)) {
+        s = P_LIMITED;
+        if (resets && regexec(&resets_re, tail, 4, m, 0) == 0 && m[3].rm_so >= 0) {
+            int n = (int)(m[3].rm_eo - m[3].rm_so);
+            while (n > 0 && tail[m[3].rm_so + n - 1] == ' ') n--;
+            *resets = fmt("%.*s", n, tail + m[3].rm_so);
+        }
+    } else if (match_any(prompt_re, sizeof PROMPTS / sizeof *PROMPTS, tail)) {
+        s = P_PERMISSION;
+    } else if (match_any(busy_re, sizeof BUSY / sizeof *BUSY, tail)) {
+        s = P_BUSY;
+    }
+    free(tail);
+    return s;
+}
+
+/* All server options, one "name value" per line (caller frees). */
+static char *server_opts(void) {
+    char *out;
+    if (TMUX(NULL, &out, "show", "-s") == 0) return out;
+    free(out);
+    return strdup("");
 }
 
 static int enter_delay_ms = 150;   /* CNTCTR_ENTER_DELAY_MS: pause between paste and Enter */
@@ -631,7 +726,7 @@ static char *envelope(const char *id, const char *text, const char *you) {
     char *hints = knowledge_hints(text);
     char *env = fmt("[cntctr from=%s id=%s]\n%s\n%s[when done: call the reply tool of the cntctr MCP server with id=%s and your answer, "
                     "plus insights=[...] with durable facts other agents should know; it is an MCP tool, not a shell command. "
-                    "Your agent name is %s: pass from=%s when you call send, spawn or kill]",
+                    "Your agent name is %s: pass from=%s on every cntctr call]",
                     caller_name, id, text, hints, id, you, you);
     free(hints);
     return env;
@@ -651,26 +746,6 @@ static char *sopt_get(const char *name) {
     if (TMUX(NULL, &out, "show", "-sv", name) == 0) return out;
     free(out);
     return NULL;
-}
-
-/* Block until channel `chan` is signalled (1) or `secs` pass (0). */
-static int wait_signal(const char *chan, int secs) {
-    int p[2];
-    pthread_mutex_lock(&fork_mu);
-    if (cloexec_pipe(p) < 0) {
-        pthread_mutex_unlock(&fork_mu);
-        return 0;
-    }
-    pid_t pid = start((const char *[]){"tmux", "wait-for", chan, NULL}, -1, p[1]);
-    pthread_mutex_unlock(&fork_mu);
-    close(p[1]);
-    struct pollfd pfd = {p[0], POLLIN, 0};
-    int ready;
-    while ((ready = poll(&pfd, 1, secs * 1000)) < 0 && errno == EINTR) {}
-    close(p[0]);
-    if (pid < 0) return 0;
-    if (ready == 0) kill(pid, SIGTERM);   /* its pipe closes only when it exits, so silence means still waiting */
-    return reap(pid) == 0 && ready > 0;
 }
 
 static int buffer_exists(const char *buf) {
@@ -696,45 +771,151 @@ static char *buffer_take(const char *buf) {
     return text;
 }
 
-#define WAIT_SLICE 5   /* seconds between checks for a lost signal or a dead worker */
+/* ---- waiting ---- */
 
-/* Block for the reply to message `id`, sent to agent `who` in `pane`. */
-static int await_reply(const char *id, const char *pane, const char *who, int timeout, int *timed_out, char **res) {
-    if (timed_out) *timed_out = 0;
-    char chan[32], buf[40], opt[48];
-    snprintf(chan, sizeof chan, "cntctr-%s", id);
-    snprintf(buf, sizeof buf, "cntctr-reply-%s", id);
+struct gathered {
+    const char *kind, *agent, *status;   /* status: NULL while pending */
+    char id[9], *pane, *text, *resets;
+};
+
+static void unwait(const char *id) {
+    char opt[48];
     snprintf(opt, sizeof opt, "@cntctr_wait_%s", id);
-    int gone = 0;
-    for (time_t end = time(NULL) + timeout;;) {
-        if (cancelled()) break;
-        int left = (int)(end - time(NULL));
-        if (left <= 0) break;
-        /* tmux keeps a killed wait-for queued, and it can swallow a later signal,
-         * so the buffer is checked after every slice as well. */
-        if (wait_signal(chan, left < WAIT_SLICE ? left : WAIT_SLICE) || buffer_exists(buf)) break;
-        if ((gone = !pane_alive(pane)) || cancelled()) break;
+    free(TMUXE(NULL, "set", "-su", opt));
+}
+
+/* One check of a pending task. Claims the reply if one arrived. 1 when it->status got set. */
+static int poll_task(struct gathered *it) {
+    char buf[40];
+    snprintf(buf, sizeof buf, "cntctr-reply-%s", it->id);
+    if (buffer_exists(buf)) {
+        /* wait flag stays set so tool_reply never claims the buffer; untrack clears it */
+        if ((it->text = buffer_take(buf))) {
+            untrack(it->id);
+            it->status = "answered";
+            return 1;
+        }
     }
-    free(TMUXE(NULL, "set", "-su", opt));   /* stop repliers from signalling us, then claim */
-    char *text = buffer_take(buf);
-    if (text && cancelled()) {   /* nobody reads our result anymore: type the reply into our pane */
-        char *env = fmt("[cntctr reply from=%s id=%s]\n%s", who, id, text), *err = inject(caller_pane, "your pane", env);
-        free(env);
-        free(text);
-        if (err) return fail(res, err);
-        untrack(id);
-        return ok(res, fmt("cancelled; reply delivered to your pane (id=%s)", id));
+    char *resets = NULL;
+    enum pstate st = pane_state(it->pane, &resets);
+    if (st == P_DEAD) {
+        unwait(it->id);
+        if ((it->text = buffer_take(buf))) {   /* answered just before exiting */
+            untrack(it->id);
+            it->status = "answered";
+            return 1;
+        }
+        untrack(it->id);
+        it->text = fmt("agent %s exited before replying (id=%s)", it->agent, it->id);
+        it->status = "dead";
+        return 1;
     }
-    if (text) {
-        untrack(id);
-        return ok(res, text);
+    if (st == P_LIMITED) {
+        unwait(it->id);   /* a reply after the reset goes to the caller's pane */
+        if ((it->text = buffer_take(buf))) {   /* replied between the last check and unwait */
+            untrack(it->id);
+            it->status = "answered";
+            free(resets);
+            return 1;
+        }
+        it->resets = resets;
+        it->status = "limited";
+        return 1;
     }
-    if (gone) {
-        untrack(id);
-        return fail(res, fmt("agent %s exited before replying (id=%s)", who, id));
+    free(resets);
+    return 0;
+}
+
+#define POLL_MS 1000   /* ponytail: polls every pending task each second; tmux wait-for per task if gathers grow large */
+
+/* Wait until every task has a status, the deadline passes, or the call is cancelled. */
+static void wait_tasks(struct gathered *items, size_t n, time_t deadline) {
+    for (;;) {
+        size_t pending = 0;
+        for (size_t i = 0; i < n; i++)
+            if (!items[i].status && !poll_task(&items[i])) pending++;
+        if (!pending || cancelled() || time(NULL) >= deadline) return;
+        struct timespec pause = {POLL_MS / 1000, (POLL_MS % 1000) * 1000000L};
+        nanosleep(&pause, NULL);
     }
-    if (timed_out) *timed_out = 1;
-    return ok(res, fmt("timed out; reply will arrive in your pane (id=%s)", id));
+}
+
+/* Settle tasks still pending after wait_tasks. Clearing the wait flag first means
+ * tool_reply types any later reply into the caller's pane; the claim after it catches
+ * a reply that raced the clear. After a cancel nobody reads our result, so every
+ * answer we hold goes to the caller's pane instead. */
+static void finish_pending(struct gathered *items, size_t n) {
+    int gone = cancelled();
+    for (size_t i = 0; i < n; i++) {
+        struct gathered *it = &items[i];
+        if (!it->status) {
+            char buf[40];
+            snprintf(buf, sizeof buf, "cntctr-reply-%s", it->id);
+            unwait(it->id);
+            if ((it->text = buffer_take(buf))) {
+                untrack(it->id);
+                it->status = "answered";
+            } else {
+                it->status = "timed_out";
+            }
+        }
+        if (gone && strcmp(it->status, "answered") == 0) {
+            char *env = fmt("[cntctr reply from=%s id=%s]\n%s", it->agent ? it->agent : "?", it->id, it->text);
+            char *err = inject(caller_pane, "your pane", env);
+            free(env);
+            free(err);   /* ponytail: a failed inject here loses the reply; retry loop if this ever shows up */
+        }
+    }
+}
+
+static char *gather_json(struct gathered *items, size_t n) {
+    json_object *out = json_object_new_object(), *results = json_object_new_array();
+    int complete = 1;
+    for (size_t i = 0; i < n; i++) {
+        struct gathered *it = &items[i];
+        int answered = strcmp(it->status, "answered") == 0;
+        if (!answered) complete = 0;
+        json_object *e = json_object_new_object();
+        json_object_object_add(e, "kind", json_object_new_string(it->kind ? it->kind : ""));
+        json_object_object_add(e, "agent", json_object_new_string(it->agent ? it->agent : ""));
+        json_object_object_add(e, "status", json_object_new_string(it->status));
+        if (*it->id) json_object_object_add(e, "id", json_object_new_string(it->id));
+        if (it->resets) json_object_object_add(e, "resets", json_object_new_string(it->resets));
+        if (it->text) json_object_object_add(e, answered ? "text" : "error", json_object_new_string(it->text));
+        json_object_array_add(results, e);
+    }
+    json_object_object_add(out, "complete", json_object_new_boolean(complete));
+    json_object_object_add(out, "results", results);
+    char *wire = strdup(json_object_to_json_string_ext(out, JSON_C_TO_STRING_PLAIN));
+    json_object_put(out);
+    return wire;
+}
+
+static void free_items(struct gathered *items, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        free(items[i].pane);
+        free(items[i].text);
+        free(items[i].resets);
+    }
+    free(items);
+}
+
+/* Blocking send or spawn: one task through the same loop as gather. Does not take `pane`. */
+static int wait_one(const char *id, char *pane, const char *who, json_object *a, char **res) {
+    struct gathered it = {.kind = "send", .agent = who, .pane = pane};
+    snprintf(it.id, sizeof it.id, "%s", id);
+    wait_tasks(&it, 1, time(NULL) + targ(a));
+    finish_pending(&it, 1);
+    int r;
+    if (strcmp(it.status, "answered") == 0) r = ok(res, it.text), it.text = NULL;
+    else if (strcmp(it.status, "dead") == 0) r = fail(res, it.text), it.text = NULL;
+    else if (strcmp(it.status, "limited") == 0)
+        r = ok(res, fmt("agent %s hit its usage limit%s%s%s; reply will arrive in your pane (id=%s)", who,
+                        it.resets ? " (resets " : "", it.resets ? it.resets : "", it.resets ? ")" : "", id));
+    else r = ok(res, fmt("timed out; reply will arrive in your pane (id=%s)", id));
+    free(it.text);
+    free(it.resets);
+    return r;
 }
 
 /* ---- model router ---- */
@@ -751,7 +932,7 @@ static const struct { int tier; const char *words[12]; } RULES[] = {
 /* model, effort for each tier, per harness: claude, codex, agy */
 static const char *ROUTES[3][4][2] = {
     {{"claude-haiku-5-5", "medium"}, {"claude-sonnet-5-5", "medium"}, {"claude-opus-4-7", "high"}, {"claude-opus-5-5", "high"}},
-    {{"gpt-6-luna", "low"}, {"gpt-6-luna", "medium"}, {"gpt-6-sol", "medium"}, {"gpt-6-sol", "high"}},
+    {{"gpt-6-luna", "low"}, {"gpt-6.1-terra", "medium"}, {"gpt-6.1-sol", "medium"}, {"gpt-6.1-sol", "high"}},
     {{"gemini-3.8-flash-medium", "medium"}, {"gemini-3.8-flash-medium", "medium"}, {"gemini-3.8-flash-high", "high"}, {"gemini-3.8-flash-high", "high"}},
 };
 
@@ -768,15 +949,38 @@ static int tool_list(json_object *args, char **res) {
     (void)args;
     char *out;
     if (TMUX(NULL, &out, "list-panes", "-a", "-F",
-             "#{@cntctr_name} #{@cntctr_harness} #{pane_id} #{?pane_dead,dead,alive}") != 0)
+             "#{@cntctr_name} #{@cntctr_harness} #{pane_id} #{?pane_dead,dead,alive} #{window_activity}") != 0)
         return fail(res, out);
-    char *list = calloc(1, strlen(out) + 2), *save;
-    for (char *line = strtok_r(out, "\n", &save); line; line = strtok_r(NULL, "\n", &save))
-        if (*line != ' ') {   /* untagged panes have an empty name, so the line starts with a space */
-            strcat(list, line);
-            strcat(list, "\n");
+    char *opts = server_opts(), *list = strdup(""), *save;
+    time_t now = time(NULL);
+    for (char *line = strtok_r(out, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        if (*line == ' ') continue;   /* untagged panes have an empty name, so the line starts with a space */
+        char name[128], harness[64], pane[32], alive[8];
+        long long act = 0;
+        if (sscanf(line, "%127s %63s %31s %7s %lld", name, harness, pane, alive, &act) < 4) continue;
+        char *resets = NULL, *tasks = strdup("");
+        enum pstate st = pane_state(pane, &resets);
+        for (const char *l = opts; *l; l += strcspn(l, "\n") + (l[strcspn(l, "\n")] == '\n')) {
+            char id[9], val[32];
+            if (sscanf(l, "@cntctr_to_%8[0-9a-f] %31s", id, val) != 2) continue;
+            char *q = val + (*val == '"');   /* tmux show quotes values: "%14" */
+            q[strcspn(q, "\"")] = '\0';
+            if (strcmp(q, pane) == 0) {
+                char *t = fmt("%s%s%s", tasks, *tasks ? "," : "", id);
+                free(tasks);
+                tasks = t;
+            }
         }
+        char *t = fmt("%s%s %s %s %s %s%s%s idle=%llds%s%s%s\n", list, name, harness, pane, alive, PSTATE[st],
+                      *tasks ? " tasks=" : "", tasks, act ? (long long)now - act : 0LL,
+                      resets ? " resets=\"" : "", resets ? resets : "", resets ? "\"" : "");
+        free(list);
+        list = t;
+        free(resets);
+        free(tasks);
+    }
     free(out);
+    free(opts);
     if (!*list) {
         free(list);
         return ok(res, fmt("no agents"));
@@ -786,25 +990,29 @@ static int tool_list(json_object *args, char **res) {
 }
 
 static int start_send(json_object *a, int wait, char id[9], char **pane_out, char **res) {
+    if (need(res, a, "send", (const char *const[]){"to", "text", NULL}, "{\"to\":\"codex-2\",\"text\":\"...\"}")) return 1;
     const char *to = sarg(a, "to"), *text = sarg(a, "text");
-    if (!to || !text) return fail(res, fmt("send needs 'to' and 'text'"));
-    char *pane = find_agent(to);
-    if (!pane) return fail(res, fmt("agent %s not found", to));
+    char *rerr, *pane = resolve_target(to, &rerr);
+    if (!pane) return fail(res, rerr);
     char *env, *err;
     new_id(id);
     track(id, wait);
     track_to(id, pane);
-    env = envelope(id, text, to);
-    err = inject(pane, to, env);
+    char *tname = pane_name(pane);   /* the real name, not the alias "parent" */
+    const char *label = tname ? tname : to;
+    env = envelope(id, text, label);
+    err = inject(pane, label, env);
     free(env);
     if (err) {
         untrack(id);
         free(pane);
+        free(tname);
         return fail(res, err);
     }
-    char *title = fmt("task %s %s→%s", id, caller_name, to);
+    char *title = fmt("task %s %s→%s", id, caller_name, label);
     log_history(caller_pane, title, text);
     free(title);
+    free(tname);
     *pane_out = pane;
     return 0;
 }
@@ -813,7 +1021,7 @@ static int tool_send(json_object *a, char **res) {
     int wait = barg(a, "wait");
     char id[9], *pane;
     if (start_send(a, wait, id, &pane, res)) return 1;
-    int r = wait ? await_reply(id, pane, sarg(a, "to"), targ(a), NULL, res)
+    int r = wait ? wait_one(id, pane, sarg(a, "to"), a, res)
                  : ok(res, fmt("sent id=%s", id));
     free(pane);
     return r;
@@ -853,8 +1061,8 @@ static void remember_reply(const char *id, const char *to, const char *sender, c
 
 static int tool_reply(json_object *a, char **res) {
     const char *id = sarg(a, "id"), *text = sarg(a, "text");
-    if (!id || !text) return fail(res, fmt("reply needs 'id' and 'text'"));
-    char opt[48], buf[40], chan[32], *sender = NULL, *to, *waiting, *env, *err;
+    if (need(res, a, "reply", (const char *const[]){"id", "text", NULL}, "{\"id\":\"1a2b3c4d\",\"text\":\"done\"}")) return 1;
+    char opt[48], buf[40], *sender = NULL, *to, *waiting, *env, *err;
     snprintf(opt, sizeof opt, "@cntctr_from_%s", id);
     if (strlen(id) != 8 || strspn(id, "0123456789abcdef") != 8 || !(sender = sopt_get(opt)))
         return fail(res, fmt("unknown id %s", id));
@@ -862,7 +1070,7 @@ static int tool_reply(json_object *a, char **res) {
     to = sopt_get(opt);
     remember_reply(id, to, sender, text, a);
 
-    /* Write the buffer before checking the wait flag; await_reply clears the flag
+    /* Write the buffer before checking the wait flag; wait_tasks clears the flag
      * before claiming. That ordering means no reply is lost. */
     snprintf(buf, sizeof buf, "cntctr-reply-%s", id);
     if ((err = TMUXE(text, "load-buffer", "-b", buf, "-"))) {
@@ -871,12 +1079,10 @@ static int tool_reply(json_object *a, char **res) {
         return fail(res, err);
     }
     snprintf(opt, sizeof opt, "@cntctr_wait_%s", id);
-    if ((waiting = sopt_get(opt))) {   /* sender is blocked in await_reply: wake it */
+    if ((waiting = sopt_get(opt))) {   /* sender is blocked in wait_one: wake it */
         free(waiting);
         free(sender);
         free(to);
-        snprintf(chan, sizeof chan, "cntctr-%s", id);
-        free(TMUXE(NULL, "wait-for", "-S", chan));
         return ok(res, fmt("ok"));
     }
     /* Nobody waiting: type the reply into the sender's pane, unless a timed-out
@@ -908,7 +1114,7 @@ static int tool_reply(json_object *a, char **res) {
 static int start_spawn(json_object *a, int wait, char id[9], char **pane_out,
                        char **summary, char **res) {
     const char *harness = sarg(a, "harness"), *name = sarg(a, "name"), *task = sarg(a, "task"), *cwd = sarg(a, "cwd");
-    if (!harness || !name || !*name || !task) return fail(res, fmt("spawn needs 'harness', 'name' and 'task'"));
+    if (need(res, a, "spawn", (const char *const[]){"harness", "name", "task", NULL}, "{\"harness\":\"codex\",\"name\":\"codex-2\",\"task\":\"...\"}")) return 1;
     int agy = strcmp(harness, "agy") == 0;
     if (!agy && strcmp(harness, "claude") != 0 && strcmp(harness, "codex") != 0)
         return fail(res, fmt("unknown harness %s", harness));
@@ -941,6 +1147,15 @@ static int start_spawn(json_object *a, int wait, char id[9], char **pane_out,
      * Codex has no --effort flag; it takes the effort as a config override. */
     int codex = strcmp(harness, "codex") == 0, n = 0;
     char *ceffort = effort && codex ? fmt("model_reasoning_effort=\"%s\"", effort) : NULL;
+    char *trust = NULL;
+    if (agy) {   /* agy asks to trust any new folder; --settings applies to this session only, never saved */
+        char real[PATH_MAX];
+        json_object *st = json_object_new_object(), *list = json_object_new_array();
+        json_object_array_add(list, json_object_new_string(realpath(cwd, real) ? real : cwd));
+        json_object_object_add(st, "trustedWorkspaces", list);
+        trust = strdup(json_object_to_json_string_ext(st, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE));
+        json_object_put(st);
+    }
     const char *argv[24] = {"tmux", "new-window", "-d", "-n", name, "-c", cwd, "-P", "-F", "#{pane_id}"};
     n = 10;
     if (!agy) argv[n++] = "headroom", argv[n++] = "wrap";   /* route claude and codex API calls through headroom */
@@ -948,10 +1163,12 @@ static int start_spawn(json_object *a, int wait, char id[9], char **pane_out,
     if (!agy) argv[n++] = "--";
     if (model) argv[n++] = codex ? "-m" : "--model", argv[n++] = model;
     if (effort) argv[n++] = codex ? "-c" : "--effort", argv[n++] = codex ? ceffort : effort;
+    if (agy) argv[n++] = "--settings", argv[n++] = trust;
     if (agy) argv[n++] = "-i";
     argv[n++] = env;
     int rc = run(NULL, &pane, argv);
     free(ceffort);
+    free(trust);
     free(env);
     if (rc != 0) {
         untrack(id);
@@ -963,6 +1180,7 @@ static int start_spawn(json_object *a, int wait, char id[9], char **pane_out,
     free(TMUXE(NULL, "set", "-p", "-t", pane, "@cntctr_name", name));
     free(TMUXE(NULL, "set", "-p", "-t", pane, "@cntctr_harness", harness));
     free(TMUXE(NULL, "set", "-p", "-t", pane, "@cntctr_model", model));
+    if (*caller_pane) free(TMUXE(NULL, "set", "-p", "-t", pane, "@cntctr_parent", caller_pane));
     char *title = fmt("task %s %s→%s", id, caller_name, name);
     log_history(caller_pane, title, task);
     free(title);
@@ -975,27 +1193,24 @@ static int tool_spawn(json_object *a, char **res) {
     int wait = barg(a, "wait");
     char id[9], *pane, *summary = NULL;
     if (start_spawn(a, wait, id, &pane, wait ? NULL : &summary, res)) return 1;
-    int r = wait ? await_reply(id, pane, sarg(a, "name"), targ(a), NULL, res)
+    int r = wait ? wait_one(id, pane, sarg(a, "name"), a, res)
                  : ok(res, summary);
     free(pane);
     return r;
 }
-
-struct gathered {
-    const char *kind, *agent, *status;
-    char id[9], *pane, *text;
-};
 
 static int tool_gather(json_object *a, char **res) {
     json_object *tasks = NULL;
     if (!json_object_object_get_ex(a, "tasks", &tasks) ||
         !json_object_is_type(tasks, json_type_array) ||
         json_object_array_length(tasks) == 0)
-        return fail(res, fmt("gather needs a nonempty tasks array"));
+        return fail(res, fmt("gather needs 'tasks' (missing or empty: tasks). Example: gather {\"tasks\":[{\"kind\":\"send\",\"to\":\"codex-2\",\"text\":\"...\"}]}"));
 
     size_t count = json_object_array_length(tasks);
     struct gathered *items = calloc(count, sizeof *items);
     time_t deadline = time(NULL) + targ(a);
+    json_object *flag;
+    int wait = !json_object_object_get_ex(a, "wait", &flag) || json_object_get_boolean(flag);
     for (size_t i = 0; i < count; i++) {
         struct gathered *item = &items[i];
         json_object *task = json_object_array_get_idx(tasks, i), *unused;
@@ -1010,55 +1225,31 @@ static int tool_gather(json_object *a, char **res) {
         } else if (cancelled()) {
             item->text = strdup("gather cancelled before dispatch");
         } else if (item->kind && strcmp(item->kind, "send") == 0) {
-            start_send(task, 1, item->id, &item->pane, &item->text);
+            start_send(task, wait, item->id, &item->pane, &item->text);
         } else if (item->kind && strcmp(item->kind, "spawn") == 0) {
-            start_spawn(task, 1, item->id, &item->pane, NULL, &item->text);
+            start_spawn(task, wait, item->id, &item->pane, NULL, &item->text);
         } else {
             item->text = strdup("gather task kind must be send or spawn");
         }
         if (!item->pane) item->status = "failed";
     }
 
-    int complete = 1;
-    for (size_t i = 0; i < count; i++) {
-        struct gathered *item = &items[i];
-        if (item->pane) {
-            int left = (int)(deadline - time(NULL)), timed_out = 0;
-            if (left < 0) left = 0;
-            int error = await_reply(item->id, item->pane, item->agent,
-                                    left, &timed_out, &item->text);
-            item->status = error ? "failed" : timed_out ? "timed_out" : "answered";
-            if (timed_out) { free(item->text); item->text = NULL; }
-        }
-        if (strcmp(item->status, "answered") != 0) complete = 0;
+    if (!wait) {
+        for (size_t i = 0; i < count; i++)
+            if (!items[i].status) items[i].status = "sent";
+    } else {
+        wait_tasks(items, count, deadline);
+        finish_pending(items, count);
     }
-
-    json_object *out = json_object_new_object(), *results = json_object_new_array();
-    json_object_object_add(out, "complete", json_object_new_boolean(complete));
-    json_object_object_add(out, "results", results);
-    for (size_t i = 0; i < count; i++) {
-        struct gathered *item = &items[i];
-        json_object *entry = json_object_new_object();
-        json_object_object_add(entry, "kind", json_object_new_string(item->kind ? item->kind : ""));
-        json_object_object_add(entry, "agent", json_object_new_string(item->agent ? item->agent : ""));
-        json_object_object_add(entry, "status", json_object_new_string(item->status));
-        if (*item->id) json_object_object_add(entry, "id", json_object_new_string(item->id));
-        if (item->text)
-            json_object_object_add(entry, strcmp(item->status, "answered") == 0 ? "text" : "error",
-                                   json_object_new_string(item->text));
-        json_object_array_add(results, entry);
-        free(item->pane);
-        free(item->text);
-    }
-    free(items);
-    char *wire = strdup(json_object_to_json_string_ext(out, JSON_C_TO_STRING_PLAIN));
-    json_object_put(out);
+    char *wire = gather_json(items, count);
+    free_items(items, count);
     return ok(res, wire);
 }
 
 static int tool_kill(json_object *a, char **res) {
+    if (need(res, a, "kill", (const char *const[]){"name", NULL}, "{\"name\":\"codex-2\"}")) return 1;
     const char *name = sarg(a, "name");
-    char *pane = name ? find_agent(name) : NULL, *err;
+    char *pane = find_agent(name), *err;
     if (!pane) return fail(res, fmt("agent %s not found", name ? name : "(none)"));
     if (strcmp(pane, caller_pane) == 0) {
         free(pane);
@@ -1086,8 +1277,8 @@ static char *announce(sqlite3 *db, const char *scope, const char *sender, const 
 static int tool_note(json_object *a, char **res) {
     const char *layer = sarg(a, "layer"), *title = sarg(a, "title"), *summary = sarg(a, "summary");
     const char *body = sarg(a, "body"), *scope = sarg(a, "scope");
-    if (!is_layer(layer) || !title || !*title || !summary || !*summary)
-        return fail(res, fmt("note needs layer (insight, skill or doc), title and summary"));
+    if (need(res, a, "note", (const char *const[]){"layer", "title", "summary", NULL}, "{\"layer\":\"insight\",\"title\":\"...\",\"summary\":\"...\"}")) return 1;
+    if (!is_layer(layer)) return fail(res, fmt("note layer must be insight, skill or doc"));
     json_object *sup = NULL;
     json_object_object_get_ex(a, "supersedes", &sup);
     size_t nsup = json_object_is_type(sup, json_type_array) ? json_object_array_length(sup) : 0;
@@ -1137,7 +1328,7 @@ static int tool_note(json_object *a, char **res) {
 
 static int tool_read(json_object *a, char **res) {
     const char *id = sarg(a, "id");
-    if (!id) return fail(res, fmt("read needs 'id'"));
+    if (need(res, a, "read", (const char *const[]){"id", NULL}, "{\"id\":\"<entry id from recall>\"}")) return 1;
     sqlite3 *db = kb(res);
     if (!db) return 1;
     char *text = kb_show(db, id);
@@ -1200,7 +1391,7 @@ static int tool_recall(json_object *a, char **res) {
 
 static int tool_forget(json_object *a, char **res) {
     const char *id = sarg(a, "id");
-    if (!id) return fail(res, fmt("forget needs 'id'"));
+    if (need(res, a, "forget", (const char *const[]){"id", NULL}, "{\"id\":\"<entry id from recall>\"}")) return 1;
     sqlite3 *db = kb(res);
     if (!db) return 1;
     char layer[16];
@@ -1260,6 +1451,37 @@ static int tool_distill(json_object *a, char **res) {
     free(err);
     free(mk);
     return r;
+}
+
+static long long seen_of(const char *name) {
+    char opt[160], *v;
+    snprintf(opt, sizeof opt, "@cntctr_seen_%s", name);
+    long long n = (v = sopt_get(opt)) ? atoll(v) : 0;
+    free(v);
+    return n;
+}
+
+static void set_seen(const char *name, long long n) {
+    char opt[160], val[24];
+    snprintf(opt, sizeof opt, "@cntctr_seen_%s", name);
+    snprintf(val, sizeof val, "%lld", n);
+    free(TMUXE(NULL, "set", "-s", opt, val));
+}
+
+/* Posts the agent `name` in `pane` has not seen, not counting its own (0 on any error). */
+static int unread_count(const char *pane, const char *name) {
+    char *err = NULL;
+    sqlite3 *db = kb(&err);
+    free(err);
+    if (!db) return 0;
+    struct project p;
+    resolve_project(db, pane, &p);
+    long long after = seen_of(name), newest = after;
+    int count = 0;
+    free(kb_unread(db, p.key, name, after, &newest, &count));
+    sqlite3_close(db);
+    if (!count && newest > after) set_seen(name, newest);   /* only our own posts were new */
+    return count;
 }
 
 /* Keep `text` on the board of `scope` (NULL: every project) and type it into every live agent there except `skip_pane`
@@ -1331,10 +1553,15 @@ static char *announce(sqlite3 *db, const char *scope, const char *sender, const 
 /* Type `text` into every other live agent in the caller's project, and keep it on the project's board. */
 static int tool_post(json_object *a, char **res) {
     const char *text = sarg(a, "text");
-    if (!text || !*text) return fail(res, fmt("post needs 'text'"));
+    if (need(res, a, "post", (const char *const[]){"text", NULL}, "{\"text\":\"...\"}")) return 1;
     struct project p;
     sqlite3 *db = kb_for_caller(&p, res);
     if (!db) return 1;
+    if (!barg(a, "urgent")) {
+        int rc = kb_post(db, p.key, caller_name, text);
+        sqlite3_close(db);
+        return rc ? fail(res, fmt("post failed")) : ok(res, fmt("posted to the board; agents see an unread count on their next cntctr call"));
+    }
     char *r = announce(db, p.key, caller_name, text, caller_pane);
     sqlite3_close(db);
     return strncmp(r, "posted to", 9) ? fail(res, r) : ok(res, r);
@@ -1348,6 +1575,10 @@ static int tool_board(json_object *a, char **res) {
     sqlite3 *db = kb_for_caller(&p, res);
     if (!db) return 1;
     char *out = kb_board(db, p.key, limit);
+    long long newest = 0;
+    int unseen = 0;
+    free(kb_unread(db, p.key, caller_name, seen_of(caller_name), &newest, &unseen));
+    if (*caller_name) set_seen(caller_name, newest);
     sqlite3_close(db);
     if (*out) return ok(res, out);
     free(out);
@@ -2016,15 +2247,16 @@ static const char TOOLS[] =
     "{\"name\":\"send\",\"description\":\"Send a message to another agent's terminal. Returns the message id at once. "
     "With wait=true, blocks until the receiver calls reply; if the timeout passes first, the reply arrives in your terminal later.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
-    "\"to\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},\"wait\":{\"type\":\"boolean\"},"
+    "\"to\":{\"type\":\"string\",\"description\":\"Agent name, or \\\"parent\\\" for the agent that spawned you\"},\"text\":{\"type\":\"string\"},\"wait\":{\"type\":\"boolean\"},"
     "\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"},"
     "\"timeout\":{\"type\":\"integer\",\"description\":\"Seconds to block when wait=true (default 600)\"}},"
     "\"required\":[\"to\",\"text\"]}},"
-    "{\"name\":\"gather\",\"description\":\"Dispatch delegated send or spawn tasks, then return one JSON result when all answer or the shared deadline expires. Check complete before deciding.\","
+    "{\"name\":\"gather\",\"description\":\"Dispatch delegated send or spawn tasks, then return one JSON result when all answer or the shared deadline expires. Check complete before deciding. Each result has a status: answered, timed_out, dead, limited (with resets), failed, or sent when wait=false. Replies that arrive after a timeout or cancel are typed into your pane.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
+    "\"wait\":{\"type\":\"boolean\",\"description\":\"Default true. false: send every task and return their ids at once; replies arrive in your pane as they come\"},"
     "\"tasks\":{\"type\":\"array\",\"minItems\":1,\"items\":{\"type\":\"object\",\"properties\":{"
     "\"kind\":{\"type\":\"string\",\"enum\":[\"send\",\"spawn\"]},"
-    "\"to\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},"
+    "\"to\":{\"type\":\"string\",\"description\":\"Agent name, or \\\"parent\\\" for the agent that spawned you\"},\"text\":{\"type\":\"string\"},"
     "\"harness\":{\"type\":\"string\",\"enum\":[\"claude\",\"codex\",\"agy\"]},"
     "\"name\":{\"type\":\"string\"},\"task\":{\"type\":\"string\"},"
     "\"cwd\":{\"type\":\"string\"},\"tier\":{\"type\":\"string\"},"
@@ -2036,15 +2268,16 @@ static const char TOOLS[] =
     "{\"name\":\"reply\",\"description\":\"Answer a message you received. Use the id from its [cntctr from=... id=...] header. "
     "Always reply when you finish a task another agent gave you.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"text\":{\"type\":\"string\"},"
-    "\"insights\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Durable facts other agents should know; each is stored in the shared knowledge store\"}},"
+    "\"insights\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Durable facts other agents should know; each is stored in the shared knowledge store\"},"
+    KFROM "},"
     "\"required\":[\"id\",\"text\"]}},"
-    "{\"name\":\"list\",\"description\":\"List agents: name, harness, tmux pane, alive or dead.\","
+    "{\"name\":\"list\",\"description\":\"List agents: name, harness, pane, alive or dead, state (idle, busy, permission, limited, dead), open task ids, seconds since the screen last changed, and limit reset time.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{}}},"
     "{\"name\":\"kill\",\"description\":\"Close an agent's tmux pane.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"}},\"required\":[\"name\"]}}"
     ",{\"name\":\"note\",\"description\":\"Store durable knowledge for all agents: insight (a 1-5 line fact or decision), "
     "skill (a reusable how-to) or doc (long text). Point at code as file:symbol instead of copying it. "
-    "To replace or merge entries, pass their ids in supersedes.\","
+    "To replace or merge entries, pass their ids in supersedes. When an entry goes stale, write its replacement with supersedes=[old id]; recall hides superseded and forgotten entries.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
     "\"layer\":{\"type\":\"string\",\"enum\":[\"insight\",\"skill\",\"doc\"]},"
     "\"title\":{\"type\":\"string\"},"
@@ -2075,9 +2308,9 @@ static const char TOOLS[] =
     "\"model\":{\"type\":\"string\"},\"effort\":{\"type\":\"string\",\"enum\":[\"low\",\"medium\",\"high\",\"xhigh\",\"max\"]},"
     "\"wait\":{\"type\":\"boolean\"},\"timeout\":{\"type\":\"integer\"},"
     "\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"}}}}"
-    ",{\"name\":\"post\",\"description\":\"Tell every other agent working in this project something now (a broken build, a changed plan, a claimed file). "
-    "It is typed into their terminals and kept on the project's board. No reply is expected.\","
-    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"},"
+    ",{\"name\":\"post\",\"description\":\"Keep text on the project's board. Other agents see an unread count on their next cntctr call and read it with board. "
+    "urgent=true also types it into every agent's pane now.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"},\"urgent\":{\"type\":\"boolean\"},"
     "\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"}},\"required\":[\"text\"]}},"
     "{\"name\":\"board\",\"description\":\"Read the latest posts on this project's board, oldest first.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"limit\":{\"type\":\"integer\",\"description\":\"Default 20, at most 200\"}," KFROM "}}}"
@@ -2261,9 +2494,12 @@ static const char GUIDE[] =
     "When you learn something durable (a fact, decision, gotcha, procedure, or the summary of a long analysis), store it with note: "
     "layer insight (1-5 lines), skill (a how-to) or doc (long text); point at code as file:symbol instead of copying it. "
     "When you reply to a task, add insights=[...]. "
-    "To tell every agent in this project something now, use post; board shows recent posts. "
+    "To tell every agent in this project something, use post; board shows recent posts. "
     "When you finish multi-step work that another agent would likely repeat, make it a fleet tool with tool_define (for a script) "
-    "or a skill with note (for a procedure). Before starting such work, check tools/list and recall.";
+    "or a skill with note (for a procedure). Before starting such work, check tools/list and recall. "
+    "When a note goes stale, write the replacement with note supersedes=[old id], or forget it; recall hides both. "
+    "Workers reach the agent that spawned them with to=\"parent\". Board posts are read with board; tool results show an unread count. "
+    "Pass urgent=true only when every agent must see a post now.";
 
 /* Usage guide plus the knowledge index: our project's and global entries, or only
  * global ones for a server outside any pane (Codex), capped at 40 lines and 4 KB. */
@@ -2300,7 +2536,7 @@ static json_object *initialize(json_object *params) {
     json_object_object_add(tcap, "listChanged", json_object_new_boolean(1));
     json_object_object_add(caps, "tools", tcap);
     json_object_object_add(server, "name", json_object_new_string("cntctr"));
-    json_object_object_add(server, "version", json_object_new_string("0.1.0"));
+    json_object_object_add(server, "version", json_object_new_string(CNTCTR_VERSION));
     json_object_object_add(r, "protocolVersion", json_object_new_string(version ? version : "2025-06-18"));
     json_object_object_add(r, "capabilities", caps);
     json_object_object_add(r, "serverInfo", server);
@@ -2317,6 +2553,15 @@ static void *call_thread(void *arg) {
 
     char *text = NULL;
     int is_error = dispatch(sarg(params, "name"), args, &text);
+    const char *tool = sarg(params, "name");
+    if (*caller_pane && *caller_name && text && *text != '{' && !(tool && strcmp(tool, "board") == 0)) {
+        int unread = unread_count(caller_pane, caller_name);
+        if (unread) {
+            char *t = fmt("%s\n(%d unread board post%s; call board)", text, unread, unread == 1 ? "" : "s");
+            free(text);
+            text = t;
+        }
+    }
 
     json_object *item = json_object_new_object(), *content = json_object_new_array(), *result = json_object_new_object();
     json_object_object_add(item, "type", json_object_new_string("text"));
@@ -2502,6 +2747,10 @@ static int tools_cmd(int argc, char **argv) {
 }
 
 int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "--version") == 0) {
+        printf("cntctr %s\n", CNTCTR_VERSION);
+        return 0;
+    }
     if (argc > 1 && strcmp(argv[1], "call") == 0) {
         if (argc == 4) return call_cmd(argv[2], argv[3]);
         fprintf(stderr, "usage: cntctr call <tool> '<json args>'\n");
@@ -2513,6 +2762,9 @@ int main(int argc, char **argv) {
     regcomp(&name_re, "^[a-z][a-z0-9_]{1,40}$", REG_EXTENDED | REG_NOSUB);
     for (size_t i = 0; i < sizeof PROMPTS / sizeof *PROMPTS; i++)
         regcomp(&prompt_re[i], PROMPTS[i], REG_EXTENDED | REG_ICASE | REG_NOSUB);
+    for (size_t i = 0; i < sizeof LIMITS / sizeof *LIMITS; i++) regcomp(&limit_re[i], LIMITS[i], REG_EXTENDED | REG_ICASE | REG_NOSUB);
+    for (size_t i = 0; i < sizeof BUSY / sizeof *BUSY; i++) regcomp(&busy_re[i], BUSY[i], REG_EXTENDED | REG_ICASE | REG_NOSUB);
+    regcomp(&resets_re, "(resets( in)?|continuing automatically at) +([0-9][0-9:hmsapHMSAP ]*(\\([^)]*\\))?)", REG_EXTENDED | REG_ICASE);
     if (argc > 1 && strcmp(argv[1], "tools") == 0) return tools_cmd(argc, argv);
     char *line = NULL;
     size_t cap = 0;
