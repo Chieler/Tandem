@@ -80,6 +80,8 @@ newpane() {
     echo "$pane"
 }
 
+if [ "${ONLY:-}" != "m3" ]; then
+
 # ---- MCP protocol ----
 out=$(rpc "$INIT")
 check "initialize echoes protocol version" "$out" '"protocolVersion":"2025-06-18"'
@@ -732,7 +734,7 @@ check "board shows posts" "$out" "ka: heads up: main is broken"
 same "board is oldest first" "$(printf '%s\n' "$out" | tail -n 1 | cut -d' ' -f3-)" "pb: fixed in abc123"
 same "board limit" "$(txt "$(call "$KA" board '{"limit":1}')" | cut -d' ' -f3-)" "pb: fixed in abc123"
 refute "board of another project" "$(txt "$(call "$KR" board '{}')")" "heads up"
-same "board of another project is empty" "$(txt "$(call "$KR" board '{}')")" "no posts"
+refute "board of another project does not contain first project post" "$(txt "$(call "$KR" board '{}')")" "fixed in abc123"
 check "post needs text" "$(txt "$(call "$KA" post '{}')")" "post needs 'text' (missing: text). Example: post {\"text\":\"...\"}"
 # errors name the missing field and give an example
 out=$(txt "$(call "$KA" reply '{"text":"x"}')")
@@ -1313,6 +1315,7 @@ refute "a project revoke masks the global tool" "$(lst "$FG")" '"name":"hp"'
 tenv CNTCTR_TEST_VERDICT escalate
 publish "$FR" he 'echo e' >/dev/null
 waitfor "he escalated" '[ "$(st he)" = escalated ]'
+touch "$TMPD/lc3"
 session "$KA" 4 "$INIT" "$LIST" | while read -r l; do echo "$l" >> "$TMPD/lc3"; done & lc3=$!
 waitfor "the listener registered" '[ "$(grep -c . "$TMPD/lc3")" = 2 ]'
 same "approve resolves an escalated version" "$(cli approve he)" "approved he v1"
@@ -1406,6 +1409,510 @@ refute "board marks posts seen" "$out" "unread board post"
 call "$S" post '{"text":"urgent news","urgent":true}' >/dev/null
 expect_screen "urgent post is typed at once" "$QW" "urgent news"
 
-# ---- summary ----
+fi
+
+# ---- 0.3.0 merge ----
+if [ ! -x "$TMPD/bin/claude" ]; then
+    cat > "$TMPD/bin/claude" <<'EOF'
+#!/bin/sh
+for a; do flags="${flags-} ${task-}"; task=$a; done
+[ "$(basename "$0")" = codex ] && unset TMUX_PANE
+printf 'flags:%s\n%s\n' "$flags" "$task"
+case $task in *toolcheck*)
+    D=$(dirname "$CNTCTR_DB")
+    tn=$(printf '%s\n' "$task" | sed -n 's/^Tool: \([a-z0-9_]*\) version \([0-9]*\)$/\1/p')
+    tv=$(printf '%s\n' "$task" | sed -n 's/^Tool: \([a-z0-9_]*\) version \([0-9]*\)$/\2/p')
+    mode=${CNTCTR_TEST_VERDICT-approve}
+    ask() {
+        exec 4>&-
+        f=$(mktemp -u "$D/rv.XXXXXX"); mkfifo "$f"
+        "$BIN" < "$f" > "$f.out" &
+        exec 4> "$f"
+        printf '%s\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"%s","arguments":%s}}\n' "$INIT" "$1" "$2" >&4
+        for _ in $(seq 100); do [ "$(wc -l < "$f.out")" -ge 2 ] && break; sleep 0.1; done
+        R=$(sed -n 2p "$f.out" | jq -r '.result.content[0].text | sub("\n\\([0-9]+ unread board posts?; call board\\)$"; "")')
+    }
+    [ -n "${CNTCTR_TEST_FAST-}" ] || sleep 0.5
+    [ "$mode" = none ] && exec cat
+    vargs="{\"name\":\"$tn\",\"version\":$tv,\"verdict\":\"$mode\",\"reason\":\"reviewer says $mode\"}"
+    if [ -n "${CNTCTR_TEST_FAST-}" ]; then
+        ask tool_verdict "$vargs"; printf '%s\n' "$R" > "$D/rev-$tn.first"
+    fi
+    for _ in $(seq 30); do
+        ask use "{\"tool\":\"$tn\",\"args\":{}}"
+        case $R in *"not bound yet"*) sleep 1 ;; *) break ;; esac
+    done
+    printf '%s\n' "$R" > "$D/rev-$tn.use"
+    for _ in $(seq 30); do
+        ask tool_verdict "$vargs"
+        case $R in *"not bound yet"*) sleep 1 ;; *) break ;; esac
+    done
+    printf '%s\n' "$R" > "$D/rev-$tn.last"
+    exec cat ;;
+esac
+id=$(printf '%s\n' "$task" | sed -n 's/^\[cntctr from=[^ ]* id=\([0-9a-f]\{8\}\)\]$/\1/p')
+sleep 0.5
+printf '%s\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"reply","arguments":{"id":"%s","text":"done %s"}}}\n' \
+    "$INIT" "$id" "$id" | "$BIN" >/dev/null
+exec cat
+EOF
+    chmod +x "$TMPD/bin/claude"
+    ln -s claude "$TMPD/bin/codex"
+    ln -s claude "$TMPD/bin/agy"
+    cat > "$TMPD/bin/headroom" <<'EOF'
+#!/bin/sh
+echo "wrapped:$2"
+tool=$2; shift 2; [ "$1" = -- ] && shift
+exec "$tool" "$@"
+EOF
+    chmod +x "$TMPD/bin/headroom"
+fi
+
+type tenv >/dev/null 2>&1 || tenv() { t set-environment -g "$1" "$2"; }
+type tunset >/dev/null 2>&1 || tunset() { t set-environment -gu "$1"; }
+txt() { printf '%s' "$1" | jq -r '(.result.content[0].text // "") | sub("\n\\([0-9]+ unread board posts?; call board\\)$"; "")'; }
+
+M3_DIR="$(realpath "$TMPD")/m3_repo"
+mkdir -p "$M3_DIR"
+ln -sf "$BIN" "$TMPD/bin/cntctr"
+m3_newpane() {
+    local name=$1; shift
+    [ $# -gt 0 ] || set -- sh
+    local p; p=$(newpane "$name" -c "$M3_DIR" "$@")
+    t set -p -t "$p" @cntctr_harness claude
+    echo "$p"
+}
+M3_P=$(m3_newpane m3_leader)
+
+# T1: tools/list has use, tool_define, tool_revoke and properties post.urgent, gather.wait
+out=$(rpc "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | tail -n 1)
+for t in use tool_define tool_revoke; do
+    check "T1 tools/list has $t" "$out" "\"name\":\"$t\""
+done
+check "T1 tools/list has post.urgent" "$out" '"urgent":{"type":"boolean"}'
+check "T1 tools/list has gather.wait" "$out" '"wait":{"type":"boolean"'
+
+# T2: initialize reports serverInfo.version 0.3.0; --version prints the same
+out=$(rpc "$INIT" | tail -n 1)
+check "T2 initialize reports serverInfo.version 0.3.0" "$out" '"serverInfo":{"name":"cntctr","version":"0.3.0"}'
+ver=$("$BIN" --version 2>&1)
+check "T2 --version prints 0.3.0" "$ver" "cntctr 0.3.0"
+
+# T3: two test.sh runs use different tmux socket names
+s1=$(bash -c 'SOCKET="cntctr-test-$$"; echo "$SOCKET"')
+s2=$(bash -c 'SOCKET="cntctr-test-$$"; echo "$SOCKET"')
+[ -n "$s1" ] && [ -n "$s2" ] && [ "$s1" != "$s2" ] && ok_ || bad "T3 two test.sh runs use different tmux socket names"
+
+# T4: approve a tool: an unrelated agent's screen is unchanged; its unread count rises
+M3_TA4=$(m3_newpane m3_ta4)
+M3_UNR4=$(m3_newpane m3_unr4)
+call "$M3_UNR4" board '{}' >/dev/null
+call "$M3_TA4" tool_define '{"name":"m3_t4","description":"t4 desc","input_schema":{"type":"object"},"interpreter":"sh","script":"true"}' >/dev/null
+sq "$CNTCTR_DB" "UPDATE tools SET version=1, status='escalated' WHERE name='m3_t4' AND project='$M3_DIR'"
+(cd "$M3_DIR" && "$BIN" tools approve m3_t4 >/dev/null 2>&1)
+sleep 0.5
+refute "T4 unrelated agent screen unchanged after approve" "$(screen "$M3_UNR4")" "m3_t4"
+unr_res=$(rawtxt "$(call "$M3_UNR4" list '{}')")
+check "T4 approve raises unread count" "$unr_res" "unread board post"
+
+# T5: revoke a tool: no pane gets text; the board has the notice
+M3_TA5=$(m3_newpane m3_ta5)
+M3_P5=$(m3_newpane m3_p5)
+call "$M3_TA5" tool_define '{"name":"m3_t5","description":"t5 desc","input_schema":{"type":"object"},"interpreter":"sh","script":"true"}' >/dev/null
+sq "$CNTCTR_DB" "UPDATE tools SET version=1, status='escalated' WHERE name='m3_t5' AND project='$M3_DIR'"
+(cd "$M3_DIR" && "$BIN" tools approve m3_t5 >/dev/null 2>&1)
+sleep 0.3
+call "$M3_TA5" tool_revoke '{"name":"m3_t5","reason":"obsolete"}' >/dev/null
+sleep 0.5
+refute "T5 revoke does not type into author pane" "$(screen "$M3_TA5")" "revoked fleet tool m3_t5"
+refute "T5 revoke does not type into peer pane" "$(screen "$M3_P5")" "revoked fleet tool m3_t5"
+b5=$(txt "$(call "$M3_P5" board '{}')")
+check "T5 board has revoke notice" "$b5" "revoked fleet tool m3_t5"
+
+# T6: note layer=skill: a peer's screen is unchanged; the board has the notice
+M3_NOTER=$(m3_newpane m3_noter)
+M3_PEER6=$(m3_newpane m3_peer6)
+call "$M3_PEER6" board '{}' >/dev/null
+call "$M3_NOTER" note '{"layer":"skill","title":"M3 Skill","summary":"m3 howto"}' >/dev/null
+sleep 0.5
+refute "T6 skill note does not type into peer pane" "$(screen "$M3_PEER6")" "new skill M3 Skill"
+b6=$(txt "$(call "$M3_PEER6" board '{}')")
+check "T6 board has skill notice" "$b6" "new skill M3 Skill"
+
+# T7: reject verdict: the author's screen shows it; a third agent's screen does not
+M3_AUTH7=$(m3_newpane m3_auth7)
+M3_THIRD7=$(m3_newpane m3_third7)
+tenv CNTCTR_TEST_VERDICT reject
+call "$M3_AUTH7" tool_define '{"name":"m3_t7","description":"t7 desc","input_schema":{"type":"object"},"interpreter":"sh","script":"true","publish":true}' >/dev/null
+expect_screen "T7 reject verdict reaches author" "$M3_AUTH7" "fleet tool m3_t7 v1 was rejected: reviewer says reject"
+for _ in $(seq 100); do [ -f "$TMPD/rev-m3_t7.last" ] && break; sleep 0.1; done
+refute "T7 third agent does not get reject verdict" "$(screen "$M3_THIRD7")" "was rejected"
+tunset CNTCTR_TEST_VERDICT
+
+# T8: cntctr tools promote: no pane gets text; each project board has the notice
+M3_DIR8_2="$(realpath "$TMPD")/m3_repo8_2"; mkdir -p "$M3_DIR8_2"
+M3_P8_1=$(m3_newpane m3_p8_1)
+M3_P8_2=$(newpane m3_p8_2 -c "$M3_DIR8_2" sh)
+call "$M3_P8_1" tool_define '{"name":"m3_t8","description":"t8","input_schema":{"type":"object"},"interpreter":"sh","script":"true"}' >/dev/null
+sq "$CNTCTR_DB" "UPDATE tools SET version=1, status='escalated' WHERE name='m3_t8' AND project='$M3_DIR'"
+(cd "$M3_DIR" && "$BIN" tools approve m3_t8 >/dev/null 2>&1)
+call "$M3_P8_1" board '{}' >/dev/null
+call "$M3_P8_2" board '{}' >/dev/null
+(cd "$M3_DIR" && "$BIN" tools promote m3_t8 >/dev/null 2>&1)
+sleep 0.5
+refute "T8 promote does not type into project 1 pane" "$(screen "$M3_P8_1")" "promoted fleet tool m3_t8"
+refute "T8 promote does not type into project 2 pane" "$(screen "$M3_P8_2")" "promoted fleet tool m3_t8"
+b8_1=$(txt "$(call "$M3_P8_1" board '{}')")
+b8_2=$(txt "$(call "$M3_P8_2" board '{}')")
+check "T8 project 1 board has promote notice" "$b8_1" "promoted fleet tool m3_t8"
+check "T8 project 2 board has promote notice" "$b8_2" "promoted fleet tool m3_t8"
+
+# T9: post urgent=true still types into every pane of the project
+M3_POST9=$(m3_newpane m3_post9)
+M3_PEER9=$(m3_newpane m3_peer9)
+call "$M3_POST9" post '{"text":"m3 urgent test 9","urgent":true}' >/dev/null
+expect_screen "T9 urgent post types into peer pane" "$M3_PEER9" "m3 urgent test 9"
+
+# T10: post, then gather: content[0] parses as JSON and content[1] holds unread notice
+M3_G10_A=$(m3_newpane m3_g10_a)
+M3_G10_B=$(m3_newpane m3_g10_b)
+call "$M3_G10_A" board '{}' >/dev/null
+call "$M3_G10_B" board '{}' >/dev/null
+call "$M3_G10_A" post '{"text":"post for t10"}' >/dev/null
+raw_g10=$(call "$M3_G10_B" gather '{"tasks":[{"kind":"send","to":"m3_g10_a","text":"t10 ping"}],"timeout":1}')
+c0_10=$(printf '%s' "$raw_g10" | jq -r '.result.content[0].text')
+c1_10=$(printf '%s' "$raw_g10" | jq -r '.result.content[1].text // empty')
+printf '%s' "$c0_10" | jq -e . >/dev/null && ok_ || bad "T10 gather content[0] is valid JSON"
+check "T10 gather content[1] holds unread notice" "$c1_10" "unread board post"
+
+# T11: two calls with no new post: the second result has no unread notice; list still has it
+M3_P11_A=$(m3_newpane m3_p11_a)
+M3_P11_B=$(m3_newpane m3_p11_b)
+call "$M3_P11_A" board '{}' >/dev/null
+call "$M3_P11_B" board '{}' >/dev/null
+call "$M3_P11_A" post '{"text":"post for t11"}' >/dev/null
+res11_1=$(call "$M3_P11_B" project '{}')
+c1_11_1=$(printf '%s' "$res11_1" | jq -r '.result.content[1].text // empty')
+check "T11 first call gets unread notice" "$c1_11_1" "unread board post"
+res11_2=$(call "$M3_P11_B" project '{}')
+c1_11_2=$(printf '%s' "$res11_2" | jq -r '.result.content[1].text // empty')
+refute "T11 second call has no unread notice" "$c1_11_2" "unread board post"
+res11_3=$(call "$M3_P11_B" list '{}')
+c1_11_3=$(printf '%s' "$res11_3" | jq -r '.result.content[1].text // empty')
+check "T11 list still has unread notice" "$c1_11_3" "unread board post"
+
+# T12: a fleet tool that calls cntctr call board: fd 3 reply has no notice; outer use result has it
+M3_P12_A=$(m3_newpane m3_p12_a)
+M3_P12_B=$(m3_newpane m3_p12_b)
+call "$M3_P12_A" board '{}' >/dev/null
+call "$M3_P12_B" board '{}' >/dev/null
+m3_def12='{"name":"m3_t12","description":"calls board","input_schema":{"type":"object"},"interpreter":"sh","script":"cntctr call board \"{}\""}'
+call "$M3_P12_B" tool_define "$m3_def12" >/dev/null
+call "$M3_P12_A" post '{"text":"post for t12"}' >/dev/null
+raw_u12=$(call "$M3_P12_B" use '{"tool":"m3_t12"}')
+c0_12=$(printf '%s' "$raw_u12" | jq -r '.result.content[0].text // empty')
+c1_12=$(printf '%s' "$raw_u12" | jq -r '.result.content[1].text // empty')
+refute "T12 fd 3 reply has no notice" "$c0_12" "unread board post"
+check "T12 outer use result has unread notice" "$c1_12" "unread board post"
+
+# T13: reply while sender shows permission prompt falls back to board
+M3_S13=$(m3_newpane m3_s13)
+M3_W13=$(m3_newpane m3_w13)
+tid13=$(txt "$(call "$M3_S13" send '{"to":"m3_w13","text":"task 13"}')" | sed 's/sent id=//')
+t send-keys -t "$M3_S13" "printf 'Do you want to proceed?'" Enter
+expect_screen "T13 sender prompt visible" "$M3_S13" "Do you want to proceed?"
+rep13=$(txt "$(call "$M3_W13" reply "{\"id\":\"$tid13\",\"text\":\"done 13\"}")")
+check "T13 reply result says on the board" "$rep13" "on the board"
+b13=$(txt "$(call "$M3_W13" board '{}')")
+check "T13 sender project board has fallback" "$b13" "for m3_s13 (reply id=$tid13):"
+t send-keys -t "$M3_S13" C-c Enter
+s13_next=$(call "$M3_S13" project '{}')
+check "T13 sender next result says reply waiting" "$s13_next" "reply is waiting"
+
+# T14: kill sender pane, then reply from another project: board post and history in sender project
+M3_DIR14_1="$(realpath "$TMPD")/m3_repo14_1"; mkdir -p "$M3_DIR14_1"
+M3_DIR14_2="$(realpath "$TMPD")/m3_repo14_2"; mkdir -p "$M3_DIR14_2"
+M3_S14=$(newpane m3_s14 -c "$M3_DIR14_1" sh)
+M3_W14=$(newpane m3_w14 -c "$M3_DIR14_2" sh)
+tid14=$(txt "$(call "$M3_S14" send '{"to":"m3_w14","text":"task 14"}')" | sed 's/sent id=//')
+t kill-pane -t "$M3_S14"
+call "$M3_W14" reply "{\"id\":\"$tid14\",\"text\":\"done 14\"}" >/dev/null
+b14=$(sq "$CNTCTR_DB" "SELECT text FROM posts WHERE scope='$M3_DIR14_1' AND text LIKE '%reply id=$tid14%'")
+check "T14 board post is in sender project" "$b14" "for m3_s14 (reply id=$tid14):"
+h14=$(sq "$CNTCTR_DB" "SELECT body FROM entries WHERE scope='$M3_DIR14_1' AND layer='history' AND body LIKE '%done 14%'")
+check "T14 history entry is in sender project" "$h14" "done 14"
+
+# T15: gather times out, caller at permission prompt, worker replies late: text on board
+M3_C15=$(m3_newpane m3_c15)
+M3_W15=$(m3_newpane m3_w15)
+call "$M3_C15" gather '{"tasks":[{"kind":"send","to":"m3_w15","text":"slow task 15"}],"timeout":1}' >/dev/null
+tid15=$(lastid "$M3_W15")
+t send-keys -t "$M3_C15" "printf 'Do you want to proceed?'" Enter
+expect_screen "T15 caller in prompt" "$M3_C15" "Do you want to proceed?"
+call "$M3_W15" reply "{\"id\":\"$tid15\",\"text\":\"late answer 15\"}" >/dev/null
+b15=$(txt "$(call "$M3_W15" board '{}')")
+check "T15 late gather reply is on the board" "$b15" "late answer 15"
+t send-keys -t "$M3_C15" C-c Enter
+
+# T16: author pane dead at verdict: verdict is on board with for <author>
+M3_A16=$(m3_newpane m3_a16)
+call "$M3_A16" tool_define '{"name":"m3_t16","description":"t16 desc","input_schema":{"type":"object"},"interpreter":"sh","script":"true"}' >/dev/null
+sq "$CNTCTR_DB" "UPDATE tools SET version=1, status='escalated' WHERE name='m3_t16' AND project='$M3_DIR'"
+t kill-pane -t "$M3_A16"
+(cd "$M3_DIR" && "$BIN" tools reject m3_t16 >/dev/null 2>&1)
+b16=$(sq "$CNTCTR_DB" "SELECT text FROM posts WHERE scope='$M3_DIR' AND text LIKE '%for m3_a16%'")
+check "T16 verdict on board for author" "$b16" "for m3_a16"
+
+# T17: injected send ends with [cntctr end id=<id>]
+M3_S17=$(m3_newpane m3_s17)
+M3_R17=$(m3_newpane m3_r17)
+tid17=$(txt "$(call "$M3_S17" send '{"to":"m3_r17","text":"t17 msg"}')" | sed 's/sent id=//')
+expect_screen "T17 header received" "$M3_R17" "[cntctr from=m3_s17 id=$tid17]"
+expect_screen "T17 envelope ends with end tag" "$M3_R17" "[cntctr end id=$tid17]"
+
+# T18: send re=<open id> adds to task
+M3_S18=$(m3_newpane m3_s18)
+M3_W18=$(m3_newpane m3_w18)
+tid18=$(txt "$(call "$M3_S18" send '{"to":"m3_w18","text":"t18 initial"}')" | sed 's/sent id=//')
+call "$M3_S18" send "{\"to\":\"m3_w18\",\"text\":\"t18 follow up\",\"re\":\"$tid18\"}" >/dev/null
+tasks18=$(txt "$(call "$M3_S18" list '{}')" | grep "m3_w18" | grep -o 'tasks=[^ ]*' | tr ',' '\n' | wc -l | tr -d ' ')
+same "T18a list shows one open task for worker" "$tasks18" "1"
+expect_screen "T18b envelope has original id and addendum" "$M3_W18" "[cntctr from=m3_s18 id=$tid18 addendum]"
+
+# T19: send re=<unknown id> errors
+M3_S19=$(m3_newpane m3_s19)
+M3_W19=$(m3_newpane m3_w19)
+err19=$(txt "$(call "$M3_S19" send '{"to":"m3_w19","text":"hello","re":"deadbeef"}')")
+check "T19 error names id" "$err19" "deadbeef"
+check "T19 error says to omit re" "$err19" "omit 're'"
+
+# T20: tool prints 20 KB ending FINAL
+M3_P20=$(m3_newpane m3_p20)
+m3_def20='{"name":"m3_t20","description":"prints 20k","input_schema":{"type":"object"},"interpreter":"sh","script":"python3 -c \"print(\\\"A\\\"*20000 + \\\"FINAL\\\")\""}'
+call "$M3_P20" tool_define "$m3_def20" >/dev/null
+res20_raw=$(call "$M3_P20" use '{"tool":"m3_t20"}')
+res20=$(txt "$res20_raw")
+len20=${#res20}
+[ "$len20" -lt 16384 ] && ok_ || bad "T20 result under 16 KB" "got $len20 bytes"
+check "T20 result contains FINAL" "$res20" "FINAL"
+fpath20=$(printf '%s\n' "$res20" | grep -o '/[^ "]*cntctr[^ "]*/[^ "]*')
+[ -n "$fpath20" ] && [ -f "$fpath20" ] && [ "$(wc -c < "$fpath20")" -ge 20005 ] && ok_ || bad "T20 file holds all 20 KB"
+
+# T21: tool prints 300 KB: error names file holding output
+M3_P21=$(m3_newpane m3_p21)
+m3_def21='{"name":"m3_t21","description":"prints 300k","input_schema":{"type":"object"},"interpreter":"sh","script":"python3 -c \"print(\\\"B\\\"*300000)\""}'
+call "$M3_P21" tool_define "$m3_def21" >/dev/null
+res21_raw=$(call "$M3_P21" use '{"tool":"m3_t21"}')
+err21=$(txt "$res21_raw")
+fpath21=$(printf '%s\n' "$err21" | grep -o '/[^ "]*cntctr[^ "]*/[^ "]*')
+[ -n "$fpath21" ] && [ -f "$fpath21" ] && [ "$(wc -c < "$fpath21")" -ge 262144 ] && ok_ || bad "T21 captured file holds 300 KB output"
+
+# T22: tool writes 20 KB then FINAL ERROR to stderr and exits 1
+M3_P22=$(m3_newpane m3_p22)
+m3_def22='{"name":"m3_t22","description":"stderr 20k","input_schema":{"type":"object"},"interpreter":"sh","script":"python3 -c \"import sys; sys.stderr.write(\\\"E\\\"*20000 + \\\"FINAL ERROR\\\"); sys.exit(1)\""}'
+call "$M3_P22" tool_define "$m3_def22" >/dev/null
+res22_raw=$(call "$M3_P22" use '{"tool":"m3_t22"}')
+err22=$(txt "$res22_raw")
+check "T22 error contains FINAL ERROR" "$err22" "FINAL ERROR"
+
+# T23: a tool calling a 20 KB tool over fd 3 receives all 20 KB
+M3_P23=$(m3_newpane m3_p23)
+m3_def23_sub='{"name":"m3_t23_sub","description":"sub 20k","input_schema":{"type":"object"},"interpreter":"sh","script":"python3 -c \"print(\\\"C\\\"*20000 + \\\"CALLEE_DONE\\\")\""}'
+call "$M3_P23" tool_define "$m3_def23_sub" >/dev/null
+m3_def23_main='{"name":"m3_t23_main","description":"calls sub","input_schema":{"type":"object"},"interpreter":"sh","script":"cntctr call use \"{\\\"tool\\\":\\\"m3_t23_sub\\\"}\""}'
+call "$M3_P23" tool_define "$m3_def23_main" >/dev/null
+res23_raw=$(call "$M3_P23" use '{"tool":"m3_t23_main"}')
+res23=$(txt "$res23_raw")
+check "T23 fd 3 receives all 20 KB" "$res23" "CALLEE_DONE"
+
+# T24: send to unknown agent mentions list and spawn
+M3_P24=$(m3_newpane m3_p24)
+err24=$(txt "$(call "$M3_P24" send '{"to":"m3_unknown_xyz","text":"hi"}')")
+check "T24 send to unknown agent mentions list" "$err24" "list"
+check "T24 send to unknown agent mentions spawn" "$err24" "spawn"
+
+# T25: tools/list descriptions and list.from
+out25=$(rpc "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | tail -n 1)
+has_from=$(printf '%s' "$out25" | jq -r '.result.tools[] | select(.name=="list") | .inputSchema.properties.from.type // empty')
+check "T25 list has from" "$has_from" "string"
+td_desc=$(printf '%s' "$out25" | jq -r '.result.tools[] | select(.name=="tool_define") | .description')
+check "T25 tool_define mentions stdin" "$td_desc" "stdin"
+check "T25 tool_define mentions cntctr call" "$td_desc" "cntctr call"
+post_desc=$(printf '%s' "$out25" | jq -r '.result.tools[] | select(.name=="post") | .description')
+check "T25 post mentions note" "$post_desc" "note"
+note_desc=$(printf '%s' "$out25" | jq -r '.result.tools[] | select(.name=="note") | .description')
+check "T25 note mentions reply" "$note_desc" "reply"
+tr_desc=$(printf '%s' "$out25" | jq -r '.result.tools[] | select(.name=="tool_revoke") | .description')
+check "T25 tool_revoke mentions tool_verdict" "$tr_desc" "tool_verdict"
+
+# T26: tools/list has tool_verdict only for bound reviewers
+M3_ORD26=$(m3_newpane m3_ord26)
+M3_REV26=$(m3_newpane m3_rev26)
+sq "$CNTCTR_DB" "INSERT INTO tools(project,name,version,status,author,description,input_schema,interpreter,script,reviewer_pane,reviewer) VALUES ('$M3_DIR','m3_t26',1,'pending','fc','t26','{\"type\":\"object\"}','sh','true','$M3_REV26','m3_rev26')"
+lst_ord=$(SKIP=1 session "$M3_ORD26" 2 "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | tail -n 1)
+lst_rev=$(SKIP=1 session "$M3_REV26" 2 "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | tail -n 1)
+refute "T26 ordinary agent tools/list has no tool_verdict" "$lst_ord" '"name":"tool_verdict"'
+check "T26 bound reviewer tools/list has tool_verdict" "$lst_rev" '"name":"tool_verdict"'
+
+# T27: tool_define, use, tool_verdict, tool_revoke with {} report missing arguments
+M3_P27=$(m3_newpane m3_p27)
+for t in tool_define use tool_verdict tool_revoke; do
+    err=$(txt "$(call "$M3_P27" "$t" '{}')")
+    check "T27 $t error has (missing: " "$err" "(missing: "
+    check "T27 $t error has Example:" "$err" "Example:"
+done
+
+# T28: with 15 notes stored, instructions hold at most 10 index lines
+for i in $(seq 15); do
+    call "$M3_P" note "{\"layer\":\"insight\",\"title\":\"T$i\",\"summary\":\"S$i\",\"scope\":\"global\"}" >/dev/null
+done
+out28=$(rpc "$INIT" | tail -n 1 | jq -r '.result.instructions')
+idx_lines28=$(printf '%s\n' "$out28" | awk '/^Knowledge index/{flag=1; next} flag && NF{count++} END{print count+0}')
+[ "$idx_lines28" -le 10 ] && ok_ || bad "T28 instructions hold at most 10 index lines" "got $idx_lines28 lines"
+
+# T29: byte budget of built-in tools/list plus instructions holds
+tools_bytes=$(rpc "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | tail -n 1 | jq -c '.result.tools' | wc -c | tr -d ' ')
+guide_bytes=$(rpc "$INIT" | tail -n 1 | jq -r '.result.instructions' | awk '{print} /^Knowledge index/{exit}' | wc -c | tr -d ' ')
+total_bytes=$((tools_bytes + guide_bytes))
+[ "$total_bytes" -le 13455 ] && ok_ || bad "T29 byte budget holds" "got $total_bytes > 13455"
+
+# T30: reviewer's send to="parent" fails and mentions tool_verdict
+M3_REV30=$(m3_newpane m3_rev30)
+sq "$CNTCTR_DB" "INSERT INTO tools(project,name,version,status,author,description,input_schema,interpreter,script,reviewer_pane,reviewer) VALUES ('$M3_DIR','m3_t30',1,'pending','fc','t30','{\"type\":\"object\"}','sh','true','$M3_REV30','m3_rev30')"
+err30=$(txt "$(call "$M3_REV30" send '{"to":"parent","text":"hello"}')")
+check "T30 reviewer send to parent fails and mentions tool_verdict" "$err30" "tool_verdict"
+
+# T31: after tool_verdict, list shows no open task for reviewer
+M3_REV31=$(m3_newpane m3_rev31)
+sq "$CNTCTR_DB" "INSERT INTO tools(project,name,version,status,author,description,input_schema,interpreter,script,reviewer_pane,reviewer) VALUES ('$M3_DIR','m3_t31',1,'pending','fc','t31','{\"type\":\"object\"}','sh','true','$M3_REV31','m3_rev31')"
+t set -s "@cntctr_to_31313131" "$M3_REV31"
+call "$M3_REV31" tool_verdict '{"name":"m3_t31","version":1,"verdict":"approve"}' >/dev/null
+tasks31=$(txt "$(call "$M3_REV31" list '{}')" | grep "m3_rev31" | grep -o 'tasks=[^ ]*')
+same "T31 after tool_verdict list shows no open task for reviewer" "$tasks31" ""
+
+# T32: reviewer task fences script with longer backtick fence
+M3_A32=$(m3_newpane m3_a32)
+tenv CNTCTR_TEST_VERDICT none
+s32=$(printf 'echo "````"\necho "`````"\necho INSTRUCTION_LINE')
+m3_def32=$(jq -nc --arg s "$s32" '{name:"m3_t32",description:"t32",input_schema:{type:"object"},interpreter:"sh",script:$s,publish:true}')
+call "$M3_A32" tool_define "$m3_def32" >/dev/null
+tunset CNTCTR_TEST_VERDICT
+rev32=$(sq "$CNTCTR_DB" "SELECT reviewer_pane FROM tools WHERE name='m3_t32' AND project='$M3_DIR'")
+task32=""
+[ -n "$rev32" ] && task32=$(screen "$rev32")
+check "T32 reviewer task uses fence longer than script backticks" "$task32" '``````'
+
+# T33: list_changed arrives on draft define, publish, and expiry
+M3_P33=$(m3_newpane m3_p33)
+daemon_start "$M3_P33"
+sleep 0.2
+call "$M3_P33" tool_define '{"name":"m3_t33_d","description":"d","input_schema":{"type":"object"},"interpreter":"sh","script":"true"}' >/dev/null
+sleep 0.3
+lc_draft=$(grep -c 'notifications/tools/list_changed' "$DOUT" 2>/dev/null || true)
+[ "${lc_draft:-0}" -ge 1 ] && ok_ || bad "T33a draft define sends list_changed"
+tenv CNTCTR_TEST_VERDICT none
+call "$M3_P33" tool_define '{"name":"m3_t33_p","description":"p","input_schema":{"type":"object"},"interpreter":"sh","script":"true","publish":true}' >/dev/null
+tunset CNTCTR_TEST_VERDICT
+sleep 0.3
+lc_pub=$(grep -c 'notifications/tools/list_changed' "$DOUT" 2>/dev/null || true)
+[ "${lc_pub:-0}" -gt "${lc_draft:-0}" ] && ok_ || bad "T33b publish sends list_changed"
+sq "$CNTCTR_DB" "INSERT INTO tools(project,name,version,status,author,description,input_schema,interpreter,script,deadline) VALUES ('$M3_DIR','m3_t33_exp',1,'pending','fc','exp','{\"type\":\"object\"}','sh','true',strftime('%s','now') - 100)"
+(cd "$M3_DIR" && "$BIN" tools list >/dev/null 2>&1)
+sleep 0.3
+lc_exp=$(grep -c 'notifications/tools/list_changed' "$DOUT" 2>/dev/null || true)
+[ "${lc_exp:-0}" -gt "${lc_pub:-0}" ] && ok_ || bad "T33c expiry sends list_changed"
+daemon_stop
+
+# T34: pending review with past deadline escalated in cntctr tools list
+sq "$CNTCTR_DB" "INSERT INTO tools(project,name,version,status,author,description,input_schema,interpreter,script,deadline) VALUES ('$M3_DIR','m3_overdue34',1,'pending','fc','overdue','{\"type\":\"object\"}','sh','true',strftime('%s','now') - 100)"
+out34=$(cd "$M3_DIR" && "$BIN" tools list 2>&1)
+check "T34 tools list shows escalated" "$out34" "m3_overdue34 v1 escalated"
+
+# T35: failed tool history entry contains stderr
+M3_P35=$(m3_newpane m3_p35)
+call "$M3_P35" tool_define '{"name":"m3_fail35","description":"fails","input_schema":{"type":"object"},"interpreter":"sh","script":"echo boom >&2; exit 3"}' >/dev/null
+call "$M3_P35" use '{"tool":"m3_fail35"}' >/dev/null
+hist35=$(sq "$CNTCTR_DB" "SELECT body FROM entries WHERE scope='$M3_DIR' AND layer='history' AND title LIKE '%tool m3_fail35%'")
+check "T35 history contains boom" "$hist35" "boom"
+
+# T36: three posts, board limit=1 says 2 older unread posts were not shown
+M3_P36_A=$(m3_newpane m3_p36_a)
+M3_P36_B=$(m3_newpane m3_p36_b)
+call "$M3_P36_A" board '{}' >/dev/null
+call "$M3_P36_B" board '{}' >/dev/null
+call "$M3_P36_A" post '{"text":"post 1 for t36"}' >/dev/null
+call "$M3_P36_A" post '{"text":"post 2 for t36"}' >/dev/null
+call "$M3_P36_A" post '{"text":"post 3 for t36"}' >/dev/null
+b36=$(txt "$(call "$M3_P36_B" board '{"limit":1}')")
+check "T36 board result mentions 2 older unread posts" "$b36" "2 older unread post"
+
+# T37a: list with from=%pane of an untagged live pane shows it alive
+U37=$(t new-window -d -c "$M3_DIR" -P -F '#{pane_id}' sh)
+out37a=$(txt "$(call "$M3_P" list "{\"from\":\"$U37\"}")")
+check "T37a untagged live pane shows alive" "$out37a" "$U37 alive idle"
+t kill-pane -t "$U37" 2>/dev/null
+
+# T37b: a 0755 temp dir still delivers list_changed
+DIR755="$(mktemp -d /tmp/cntctr-test755.XXXXXX)"
+chmod 0755 "$DIR755"
+mkdir -m 0755 "$DIR755/cntctr-$(id -u)"
+M3_P37B=$(m3_newpane m3_p37b)
+TMPDIR="$DIR755" daemon_start "$M3_P37B"
+sleep 0.2
+(cd "$M3_DIR" && TMPDIR="$DIR755" "$BIN" tools approve m3_t4 >/dev/null 2>&1)
+sleep 0.5
+out37b=$(cat "$DOUT")
+TMPDIR="$DIR755" daemon_stop
+rm -rf "$DIR755"
+check "T37b 0755 temp dir still delivers list_changed" "$out37b" "notifications/tools/list_changed"
+
+# T37c: EXPLAIN QUERY PLAN of board query uses an index
+plan37c=$(sq "$CNTCTR_DB" "EXPLAIN QUERY PLAN SELECT text FROM posts WHERE scope='test' ORDER BY at ASC")
+check "T37c board query uses index" "$plan37c" "USING INDEX"
+
+# T37d: task "preview the UI" routes standard
+out37d=$(txt "$(call "$M3_P" spawn '{"harness":"claude","name":"m3_prev37","task":"preview the UI"}')")
+check "T37d preview task routes standard" "$out37d" "claude-sonnet-5-5"
+
+# T37e: with CNTCTR_MAX_AGENTS=2 the third spawn fails and names the variable
+call "$M3_P" spawn '{"harness":"claude","name":"m3_ma1","task":"t1"}' >/dev/null
+call "$M3_P" spawn '{"harness":"claude","name":"m3_ma2","task":"t2"}' >/dev/null
+err37e=$(txt "$(CNTCTR_MAX_AGENTS=2 call "$M3_P" spawn '{"harness":"claude","name":"m3_ma3","task":"t3"}')")
+check "T37e third spawn fails and names CNTCTR_MAX_AGENTS" "$err37e" "CNTCTR_MAX_AGENTS"
+
+# T38: macOS sandbox hardlinks and unix sockets
+if [ "$(uname)" = "Darwin" ]; then
+    echo "ORIGINAL_38" > "$TMPD/outside38.txt"
+    m3_def38a=$(jq -nc --arg f "$TMPD/outside38.txt" '{name:"m3_t38a",description:"hl test",input_schema:{type:"object"},interpreter:"sh",script:("ln " + $f + " ./link.txt && echo OVERWRITTEN > ./link.txt")}')
+    call "$M3_P" tool_define "$m3_def38a" >/dev/null
+    call "$M3_P" use '{"tool":"m3_t38a"}' >/dev/null
+    outside38=$(cat "$TMPD/outside38.txt")
+    same "T38a hardlink write leaves outside file unchanged" "$outside38" "ORIGINAL_38"
+
+    sock38="$TMPD/outside38.sock"
+    rm -f "$sock38"
+    python3 -c "import socket; s = socket.socket(socket.AF_UNIX); s.bind('$sock38'); s.listen(1)" &
+    py_sock_pid=$!
+    sleep 0.3
+    m3_def38b=$(jq -nc --arg s "$sock38" '{name:"m3_t38b",description:"sock test",net:false,input_schema:{type:"object"},interpreter:"sh",script:("python3 -c \"import socket; s = socket.socket(socket.AF_UNIX); s.connect('"'"'" + $s + "'"'"'); print('"'"'CONNECTED'"'"')\"")}')
+    call "$M3_P" tool_define "$m3_def38b" >/dev/null
+    out38b=$(txt "$(call "$M3_P" use '{"tool":"m3_t38b"}')")
+    refute "T38b net=false tool cannot connect to outside unix socket" "$out38b" "CONNECTED"
+    kill $py_sock_pid 2>/dev/null; rm -f "$sock38"
+fi
+
+# T39: redelivery of addressed text
+M3_S39=$(m3_newpane m3_s39)
+M3_W39=$(m3_newpane m3_w39)
+tid39=$(txt "$(call "$M3_S39" send '{"to":"m3_w39","text":"task 39"}')" | sed 's/sent id=//')
+t send-keys -t "$M3_S39" "printf 'Do you want to proceed?'" Enter
+expect_screen "T39 sender prompt" "$M3_S39" "Do you want to proceed?"
+call "$M3_W39" reply "{\"id\":\"$tid39\",\"text\":\"reply 39 text\"}" >/dev/null
+call "$M3_W39" post '{"text":"ordinary unaddressed post 39"}' >/dev/null
+t send-keys -t "$M3_S39" C-c Enter
+expect_screen "T39 reply is redelivered to sender" "$M3_S39" "reply 39 text"
+sleep 0.5
+refute "T39 ordinary post is not typed" "$(screen "$M3_S39")" "ordinary unaddressed post 39"
+
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
