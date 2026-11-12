@@ -41,7 +41,8 @@ static pthread_cond_t live_cv = PTHREAD_COND_INITIALIZER;
 struct call { json_object *req, *id; int cancelled; struct call *next; };
 static struct call *calls;                                    /* guarded by live_mu */
 static pthread_mutex_t mail_mu = PTHREAD_MUTEX_INITIALIZER;
-static char mail_pane[32], mail_name[128];   /* FIFO thread's identity, guarded by mail_mu */
+struct mail_identity { char pane[32], name[128]; struct mail_identity *next; };
+static struct mail_identity *mail_identities;   /* immutable nodes, published under mail_mu */
 static _Thread_local struct call *this_call;
 
 /* Mark the call with JSON-RPC id `id` cancelled, or every call if `id` is NULL. */
@@ -2687,17 +2688,11 @@ static void notify_all(void) {
 }
 
 /* Only the FIFO watcher retries mail, sleeping indefinitely when its queue is empty. */
-static int redeliver_mail(void) {
-    char pane[32], name[128];
-    pthread_mutex_lock(&mail_mu);
-    snprintf(pane, sizeof pane, "%s", mail_pane);
-    snprintf(name, sizeof name, "%s", mail_name);
-    pthread_mutex_unlock(&mail_mu);
-    if (!*pane || !*name) return 0;
+static int redeliver_for(const char *pane, const char *name) {
     char *err = NULL;
     sqlite3 *db = kb(&err);
     free(err);
-    if (!db) return 0;
+    if (!db) return 1;   /* an unavailable queue may still hold mail */
     struct project p;
     resolve_project(db, pane, &p);
     sqlite3_stmt *st = NULL;
@@ -2705,9 +2700,11 @@ static int redeliver_mail(void) {
     if (sqlite3_prepare_v2(db, "SELECT post FROM mail JOIN posts ON posts.rowid=mail.post WHERE name=?1 AND scope=?2 AND delivered=0", -1, &st, NULL) == SQLITE_OK) {
         sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 2, p.key, -1, SQLITE_TRANSIENT);
-        /* Collect ids before injecting: do not keep a SQLite read transaction across terminal IO. */
         json_object *ids = json_object_new_array();
-        while (sqlite3_step(st) == SQLITE_ROW) json_object_array_add(ids, json_object_new_int64(sqlite3_column_int64(st, 0)));
+        int step;
+        while ((step = sqlite3_step(st)) == SQLITE_ROW)
+            json_object_array_add(ids, json_object_new_int64(sqlite3_column_int64(st, 0)));
+        if (step != SQLITE_DONE) pending = 1;
         sqlite3_finalize(st);
         st = NULL;
         for (size_t i = 0; i < json_object_array_length(ids); i++) {
@@ -2718,38 +2715,65 @@ static int redeliver_mail(void) {
             free(err);
             err = NULL;
             if (lock < 0) { pending = 1; continue; }
-            if (sqlite3_prepare_v2(db, "SELECT text FROM posts JOIN mail ON posts.rowid=mail.post WHERE post=?1 AND delivered=0", -1, &st, NULL) == SQLITE_OK) {
+            /* Reserve the DB write before typing, so another writer cannot prevent the delivered mark. */
+            int rc = sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
+            if (rc == SQLITE_OK && sqlite3_prepare_v2(db, "SELECT text FROM posts JOIN mail ON posts.rowid=mail.post WHERE post=?1 AND delivered=0", -1, &st, NULL) == SQLITE_OK) {
                 sqlite3_bind_int64(st, 1, id);
-                char *body = sqlite3_step(st) == SQLITE_ROW ? strdup((const char *)sqlite3_column_text(st, 0)) : NULL;
+                step = sqlite3_step(st);
+                char *body = step == SQLITE_ROW ? strdup((const char *)sqlite3_column_text(st, 0)) : NULL;
+                rc = step == SQLITE_ROW || step == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
                 sqlite3_finalize(st);
                 st = NULL;
                 if (body) {
                     err = inject(pane, name, body);
-                    if (!err && sqlite3_prepare_v2(db, "UPDATE mail SET delivered=1 WHERE post=?1", -1, &st, NULL) == SQLITE_OK) {
+                    rc = err ? SQLITE_ERROR : sqlite3_prepare_v2(db, "UPDATE mail SET delivered=1 WHERE post=?1", -1, &st, NULL);
+                    if (rc == SQLITE_OK) {
                         sqlite3_bind_int64(st, 1, id);
-                        if (sqlite3_step(st) != SQLITE_DONE) pending = 1;
-                        sqlite3_finalize(st);
-                        st = NULL;
-                    } else pending = 1;
+                        rc = sqlite3_step(st) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+                    }
+                    sqlite3_finalize(st);
+                    st = NULL;
                     free(body), free(err);
                     err = NULL;
                 }
-            } else pending = 1;
+            } else rc = SQLITE_ERROR;
+            if (rc == SQLITE_OK) rc = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+            if (rc != SQLITE_OK) {
+                sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+                pending = 1;
+            }
             close(lock);
         }
         json_object_put(ids);
-    }
+    } else pending = 1;
     sqlite3_finalize(st);
     sqlite3_close(db);
+    return pending;
+}
+
+static int redeliver_mail(void) {
+    pthread_mutex_lock(&mail_mu);
+    struct mail_identity *identities = mail_identities;
+    pthread_mutex_unlock(&mail_mu);
+    int pending = 0;
+    for (struct mail_identity *it = identities; it; it = it->next)
+        pending |= redeliver_for(it->pane, it->name);
     return pending;
 }
 
 static void learn_mail_identity(const char *pane, const char *name) {
     if (!*pane || !*name) return;
     pthread_mutex_lock(&mail_mu);
-    int changed = strcmp(mail_pane, pane) || strcmp(mail_name, name);
-    snprintf(mail_pane, sizeof mail_pane, "%s", pane);
-    snprintf(mail_name, sizeof mail_name, "%s", name);
+    struct mail_identity *it = mail_identities;
+    while (it && (strcmp(it->pane, pane) || strcmp(it->name, name))) it = it->next;
+    int changed = !it;
+    if (changed) {
+        it = calloc(1, sizeof *it);
+        snprintf(it->pane, sizeof it->pane, "%s", pane);
+        snprintf(it->name, sizeof it->name, "%s", name);
+        it->next = mail_identities;
+        mail_identities = it;
+    }
     pthread_mutex_unlock(&mail_mu);
     if (changed && *fifo_path) {
         int fd = open(fifo_path, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
