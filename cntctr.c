@@ -2546,6 +2546,8 @@ static json_object *initialize(json_object *params) {
     return r;
 }
 
+static int last_unread = -1;   /* guarded by out_mu */
+
 static void *call_thread(void *arg) {
     this_call = arg;
     json_object *req = this_call->req, *id = this_call->id, *params = NULL, *args = NULL;
@@ -2554,19 +2556,25 @@ static void *call_thread(void *arg) {
     char *text = NULL;
     int is_error = dispatch(sarg(params, "name"), args, &text);
     const char *tool = sarg(params, "name");
-    if (*caller_pane && *caller_name && text && *text != '{' && !(tool && strcmp(tool, "board") == 0)) {
-        int unread = unread_count(caller_pane, caller_name);
-        if (unread) {
-            char *t = fmt("%s\n(%d unread board post%s; call board)", text, unread, unread == 1 ? "" : "s");
-            free(text);
-            text = t;
-        }
-    }
-
     json_object *item = json_object_new_object(), *content = json_object_new_array(), *result = json_object_new_object();
     json_object_object_add(item, "type", json_object_new_string("text"));
     json_object_object_add(item, "text", json_object_new_string(text));
     json_object_array_add(content, item);
+    if (*caller_pane && *caller_name) {
+        int unread = unread_count(caller_pane, caller_name);
+        pthread_mutex_lock(&out_mu);
+        int report = unread != last_unread || (tool && strcmp(tool, "list") == 0);
+        last_unread = unread;
+        pthread_mutex_unlock(&out_mu);
+        if (unread && report) {
+            char *notice = fmt("(%d unread board post%s; call board)", unread, unread == 1 ? "" : "s");
+            item = json_object_new_object();
+            json_object_object_add(item, "type", json_object_new_string("text"));
+            json_object_object_add(item, "text", json_object_new_string(notice));
+            json_object_array_add(content, item);
+            free(notice);
+        }
+    }
     json_object_object_add(result, "content", content);
     json_object_object_add(result, "isError", json_object_new_boolean(is_error));
     respond(id, result);

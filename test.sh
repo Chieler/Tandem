@@ -48,7 +48,7 @@ call() {
     SKIP=1 session "$1" 2 "$INIT" "$(printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"%s","arguments":%s}}' "$2" "$3")" | tail -n 1
 }
 rawtxt() { printf '%s' "$1" | jq -r '.result.content[0].text'; }
-txt() { printf '%s' "$1" | jq -r '.result.content[0].text | sub("\n\\([0-9]+ unread board posts?; call board\\)$"; "")'; }
+txt() { printf '%s' "$1" | jq -r '.result.content[0].text'; }
 iserr() { printf '%s' "$1" | jq -r '.result.isError'; }
 
 screen() { t capture-pane -p -J -t "$1"; }
@@ -430,7 +430,7 @@ case $task in *toolcheck*)
         exec 4> "$f"
         printf '%s\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"%s","arguments":%s}}\n' "$INIT" "$1" "$2" >&4
         for _ in $(seq 100); do [ "$(wc -l < "$f.out")" -ge 2 ] && break; sleep 0.1; done
-        R=$(sed -n 2p "$f.out" | jq -r '.result.content[0].text | sub("\n\\([0-9]+ unread board posts?; call board\\)$"; "")')
+        R=$(sed -n 2p "$f.out" | jq -r '.result.content[0].text')
     }
     [ -n "${CNTCTR_TEST_FAST-}" ] || sleep 0.5
     [ "$mode" = none ] && exec cat
@@ -1430,7 +1430,7 @@ case $task in *toolcheck*)
         exec 4> "$f"
         printf '%s\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"%s","arguments":%s}}\n' "$INIT" "$1" "$2" >&4
         for _ in $(seq 100); do [ "$(wc -l < "$f.out")" -ge 2 ] && break; sleep 0.1; done
-        R=$(sed -n 2p "$f.out" | jq -r '.result.content[0].text | sub("\n\\([0-9]+ unread board posts?; call board\\)$"; "")')
+        R=$(sed -n 2p "$f.out" | jq -r '.result.content[0].text')
     }
     [ -n "${CNTCTR_TEST_FAST-}" ] || sleep 0.5
     [ "$mode" = none ] && exec cat
@@ -1470,7 +1470,7 @@ fi
 
 type tenv >/dev/null 2>&1 || tenv() { t set-environment -g "$1" "$2"; }
 type tunset >/dev/null 2>&1 || tunset() { t set-environment -gu "$1"; }
-txt() { printf '%s' "$1" | jq -r '(.result.content[0].text // "") | sub("\n\\([0-9]+ unread board posts?; call board\\)$"; "")'; }
+txt() { printf '%s' "$1" | jq -r '(.result.content[0].text // "")'; }
 
 M3_DIR="$(realpath "$TMPD")/m3_repo"
 mkdir -p "$M3_DIR"
