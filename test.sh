@@ -191,7 +191,7 @@ same "refusal is a tool error" "$(iserr "$out")" true
 sleep 0.3
 refute "nothing pasted into prompt pane" "$(screen "$G")" "sneaky"
 out=$(call "$A" send '{"to":"nope","text":"x"}')
-same "send to missing agent" "$(txt "$out")" "agent nope not found"
+same "send to missing agent" "$(txt "$out")" "agent nope not found; list shows agents, spawn starts one"
 out=$(rpc "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send","arguments":{"to":"b","text":"x"}}}' | tail -n 1)
 check "send outside tmux says to pass from" "$(txt "$out")" "pass from="
 
@@ -394,7 +394,7 @@ out=$(call "$Z" send '{"to":"b","text":"from a pane about to close"}')
 id=$(txt "$out" | sed 's/sent id=//')
 t kill-pane -t "$Z"
 out=$(call "$B" reply "{\"id\":\"$id\",\"text\":\"too late\"}")
-same "reply to closed sender" "$(txt "$out")" "sender gone"
+same "reply to closed sender" "$(txt "$out")" "reply is on the board"
 out=$(call "$B" reply '{"id":"deadbeef","text":"x"}')
 same "reply to unknown id" "$(txt "$out")" "unknown id deadbeef"
 out=$(call "$B" reply '{"id":"../../x","text":"x"}')
