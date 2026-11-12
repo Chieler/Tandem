@@ -85,6 +85,50 @@ newpane() {
 }
 
 # Isolated 0.4.0 tests can run while another worktree runs the full suite.
+if [ "${ONLY:-}" = u25 ] || [ "${ONLY:-}" = u26 ]; then
+    export CNTCTR_PASTE_WAIT_MS=100
+    U_P=$(newpane u_sender)
+    if [ "$ONLY" = u25 ]; then
+        U_A=$(newpane u_off)
+        t select-pane -d -t "$U_A"
+        r=$(call "$U_P" send '{"to":"u_off","text":"input off text"}')
+        check "U25 disabled input falls back to board" "$(txt "$r")" "board"
+        check "U25 fallback stored" "$(txt "$(call "$U_A" board '{}')")" "input off text"
+        refute "U25 no text typed" "$(screen "$U_A")" "input off text"
+    else
+        cat > "$TMPD/reader.py" <<'EOF'
+import os, signal, sys, termios, tty
+log = sys.argv[1]
+tty.setraw(0)
+def enable(sig, frame): os.write(1, b'\x1b[?2004h')
+signal.signal(signal.SIGUSR1, enable)
+open(log, 'wb').close()
+while True:
+    data = os.read(0, 4096)
+    if not data: break
+    with open(log, 'ab') as f: f.write(data)
+EOF
+        U_A=$(newpane u_raw python3 "$TMPD/reader.py" "$TMPD/u26.log")
+        for _ in $(seq 50); do [ -e "$TMPD/u26.log" ] && break; sleep 0.1; done
+        r=$(call "$U_P" send '{"to":"u_raw","text":"first line\nsecond line"}')
+        check "U26 unbracketed multiline falls back" "$(txt "$r")" "board"
+        check "U26 fallback stored" "$(txt "$(call "$U_A" board '{}')")" "first line"
+        same "U26 unbracketed text not typed" "$(wc -c < "$TMPD/u26.log" | tr -d ' ')" 0
+        kill -USR1 "$(t display -p -t "$U_A" '#{pane_pid}')"
+        for _ in $(seq 50); do [ "$(t display -p -t "$U_A" '#{bracket_paste_flag}')" = 1 ] && break; sleep 0.1; done
+        r=$(call "$U_P" send '{"to":"u_raw","text":"safe first\nsafe second"}')
+        check "U26 bracketed send succeeds" "$(txt "$r")" "sent id="
+        sleep 0.2
+        python3 - "$TMPD/u26.log" <<'EOF' && ok_ || bad "U26 received one bracketed message"
+import sys
+s = open(sys.argv[1], 'rb').read()
+assert s.count(b'\x1b[200~') == 1 and s.count(b'\x1b[201~') == 1 and b'safe first\rsafe second' in s
+EOF
+    fi
+    printf '%d passed, %d failed\n' "$pass" "$fail"
+    [ "$fail" -eq 0 ]; exit $?
+fi
+
 if [ "${ONLY:-}" = u27 ]; then
     cat > "$TMPD/bin/headroom" <<'EOF'
 #!/bin/sh

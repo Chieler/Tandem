@@ -656,6 +656,31 @@ static int enter_delay_ms = 150;   /* CNTCTR_ENTER_DELAY_MS: pause between paste
 /* Write `text` to `pane`'s program through a temporary buffer, bracketed or raw. */
 static char *paste(const char *pane, const char *text, int bracketed) {
     char buf[32], *err;
+    const char *configured = getenv("CNTCTR_PASTE_WAIT_MS");
+    long wait = configured ? strtol(configured, NULL, 10) : 2000;
+    if (wait < 0) wait = 0;
+    struct timespec now, deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += wait / 1000;
+    deadline.tv_nsec += (wait % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+    for (;;) {
+        char *flags = NULL;
+        if (TMUX(NULL, &flags, "display", "-p", "-t", pane, "#{pane_input_off} #{bracket_paste_flag}") != 0) {
+            free(flags);
+            return fmt("paste blocked: cannot read pane input state");
+        }
+        int off = -1, mode = -1;
+        int valid = sscanf(flags, "%d %d", &off, &mode) == 2;
+        free(flags);
+        if (!valid || off) return fmt("paste blocked: pane input is disabled or unknown");
+        if (!bracketed || !strchr(text, '\n') || mode) break;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec > deadline.tv_sec || (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec))
+            return fmt("paste blocked: bracketed paste is disabled");
+        struct timespec pause = {0, 50000000L};
+        nanosleep(&pause, NULL);
+    }
     snprintf(buf, sizeof buf, "cntctr-in-%08x", arc4random());
     if ((err = TMUXE(text, "load-buffer", "-b", buf, "-"))) return err;
     if ((err = bracketed ? TMUXE(NULL, "paste-buffer", "-p", "-d", "-b", buf, "-t", pane)
@@ -843,11 +868,8 @@ static char *buffer_take(const char *buf) {
 static void notify_all(void);
 
 /* A failed terminal delivery is durable mail on the addressee's board. */
-static int deliver(const char *pane, const char *name, const char *scope, const char *id, const char *text) {
-    char *err = pane && *pane ? inject(pane, name, text) : strdup("pane gone");
-    if (!err) return 0;
-    free(err);
-    err = NULL;
+static int deliver_fallback(const char *pane, const char *name, const char *scope, const char *id, const char *text) {
+    char *err = NULL;
     sqlite3 *db = kb(&err);
     free(err);
     if (!db) return -1;
@@ -871,6 +893,13 @@ static int deliver(const char *pane, const char *name, const char *scope, const 
     free(body);
     if (rc == SQLITE_OK) notify_all();
     return rc == SQLITE_OK ? 1 : -1;
+}
+
+static int deliver(const char *pane, const char *name, const char *scope, const char *id, const char *text) {
+    char *err = pane && *pane ? inject(pane, name, text) : strdup("pane gone");
+    if (!err) return 0;
+    free(err);
+    return deliver_fallback(pane, name, scope, id, text);
 }
 
 /* Serialize claims with active waiters. Delete late buffers only after durable delivery. */
@@ -1135,7 +1164,7 @@ static int tool_list(json_object *args, char **res) {
     return ok(res, list);
 }
 
-static int start_send(json_object *a, int wait, char id[9], char **pane_out, char **res) {
+static int start_send(json_object *a, int wait, char id[9], char **pane_out, int *on_board, char **res) {
     if (need(res, a, "send", (const char *const[]){"to", "text", NULL}, "{\"to\":\"codex-2\",\"text\":\"...\"}")) return 1;
     const char *to = sarg(a, "to"), *text = sarg(a, "text");
     char *rerr, *pane = resolve_target(to, &rerr);
@@ -1181,6 +1210,11 @@ static int start_send(json_object *a, int wait, char id[9], char **pane_out, cha
         env = add;
     }
     err = inject(pane, label, env);
+    if (err && strncmp(err, "paste blocked:", 14) == 0 && deliver_fallback(pane, label, NULL, id, env) > 0) {
+        free(err);
+        err = NULL;
+        if (on_board) *on_board = 1;
+    }
     free(env);
     if (err && wait && !pane_alive(pane)) { free(err); err = NULL; }
     if (err) {
@@ -1201,9 +1235,10 @@ static int start_send(json_object *a, int wait, char id[9], char **pane_out, cha
 static int tool_send(json_object *a, char **res) {
     int wait = barg(a, "wait");
     char id[9], *pane;
-    if (start_send(a, wait, id, &pane, res)) return 1;
+    int on_board = 0;
+    if (start_send(a, wait, id, &pane, &on_board, res)) return 1;
     int r = wait ? wait_one(id, pane, sarg(a, "to"), a, res)
-                 : ok(res, fmt("sent id=%s", id));
+                 : ok(res, fmt(on_board ? "sent id=%s on board" : "sent id=%s", id));
     free(pane);
     return r;
 }
@@ -1411,7 +1446,7 @@ static int tool_gather(json_object *a, char **res) {
         } else if (cancelled()) {
             item->text = strdup("gather cancelled before dispatch");
         } else if (item->kind && strcmp(item->kind, "send") == 0) {
-            start_send(task, wait, item->id, &item->pane, &item->text);
+            start_send(task, wait, item->id, &item->pane, NULL, &item->text);
         } else if (item->kind && strcmp(item->kind, "spawn") == 0) {
             start_spawn(task, wait, item->id, &item->pane, NULL, &item->text);
         } else {
