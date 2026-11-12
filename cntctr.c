@@ -877,6 +877,10 @@ static int deliver_buffer(const char *buf, const char *id, const char *agent) {
     int lock = lock_pane(buf, &err);
     free(err);
     if (lock < 0) return -1;
+    char wait_opt[64];
+    snprintf(wait_opt, sizeof wait_opt, "@cntctr_wait_%s", id);
+    char *waiting = sopt_get(wait_opt);
+    if (waiting) { free(waiting); close(lock); return 0; }
     int rc = 0;
     if (TMUX(NULL, &text, "show-buffer", "-b", buf) == 0) {
         char opt[64];
