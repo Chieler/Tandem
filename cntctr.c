@@ -1133,6 +1133,7 @@ static int start_send(json_object *a, int wait, char id[9], char **pane_out, cha
     char *rerr, *pane = resolve_target(to, &rerr);
     if (!pane) return fail(res, rerr);
     char *env, *err;
+    int add_wait = 0;
     const char *re = sarg(a, "re");
     if (re && *re) {
         char opt[64];
@@ -1148,6 +1149,16 @@ static int start_send(json_object *a, int wait, char id[9], char **pane_out, cha
             return fail(res, fmt("unknown open task %s for this sender and agent; omit 're' for a new task", re));
         }
         snprintf(id, 9, "%s", re);
+        if (wait) {
+            snprintf(opt, sizeof opt, "@cntctr_wait_%s", id);
+            char *waiting = sopt_get(opt);
+            if (waiting) {
+                free(waiting), free(pane);
+                return fail(res, fmt("task %s already has a waiter; omit wait for an addendum", id));
+            }
+            free(TMUXE(NULL, "set", "-s", opt, "1"));
+            add_wait = 1;
+        }
     } else {
         new_id(id);
         track(id, wait);
@@ -1165,6 +1176,7 @@ static int start_send(json_object *a, int wait, char id[9], char **pane_out, cha
     free(env);
     if (err) {
         if (!re || !*re) untrack(id);
+        else if (add_wait) unwait(id);
         free(pane);
         free(tname);
         return fail(res, err);
