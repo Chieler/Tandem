@@ -374,7 +374,7 @@ static char *pane_name(const char *pane) {
 }
 
 /* Log a task or reply as private history in the project of the agent in `pane`. Never fails. */
-static void log_history(const char *pane, const char *title, const char *text) {
+static void log_history_in(const char *pane, const char *scope, const char *title, const char *text) {
     char *err = NULL, id[64];
     sqlite3 *db = kb(&err);
     free(err);
@@ -382,11 +382,15 @@ static void log_history(const char *pane, const char *title, const char *text) {
     struct project p;
     resolve_project(db, pane, &p);
     char *summary = first_line(text, 200);
-    struct kb_entry e = {.layer = "history", .scope = p.key, .title = title, .summary = summary, .body = text,
+    struct kb_entry e = {.layer = "history", .scope = scope ? scope : p.key, .title = title, .summary = summary, .body = text,
                          .author = getenv("USER"), .agent = caller_name, .visibility = "private"};
     kb_put(db, &e, id);
     free(summary);
     sqlite3_close(db);
+}
+
+static void log_history(const char *pane, const char *title, const char *text) {
+    log_history_in(pane, NULL, title, text);
 }
 
 /* Up to 5 stored entries matching `text`, as an envelope block; "" if none. */
@@ -698,6 +702,18 @@ static void track(const char *id, int wait) {
     char opt[48];
     snprintf(opt, sizeof opt, "@cntctr_from_%s", id);
     free(TMUXE(NULL, "set", "-s", opt, caller_pane));
+    char *err = NULL;
+    sqlite3 *db = kb(&err);
+    free(err);
+    if (db) {
+        struct project p;
+        resolve_project(db, caller_pane, &p);
+        snprintf(opt, sizeof opt, "@cntctr_scope_%s", id);
+        free(TMUXE(NULL, "set", "-s", opt, p.key));
+        sqlite3_close(db);
+    }
+    snprintf(opt, sizeof opt, "@cntctr_sender_%s", id);
+    free(TMUXE(NULL, "set", "-s", opt, caller_name));
     if (wait) {
         snprintf(opt, sizeof opt, "@cntctr_wait_%s", id);
         free(TMUXE(NULL, "set", "-s", opt, "1"));
@@ -714,6 +730,10 @@ static void track_to(const char *id, const char *pane) {
 
 static void untrack(const char *id) {
     char opt[48];
+    snprintf(opt, sizeof opt, "@cntctr_scope_%s", id);
+    free(TMUXE(NULL, "set", "-su", opt));
+    snprintf(opt, sizeof opt, "@cntctr_sender_%s", id);
+    free(TMUXE(NULL, "set", "-su", opt));
     snprintf(opt, sizeof opt, "@cntctr_from_%s", id);
     free(TMUXE(NULL, "set", "-su", opt));
     snprintf(opt, sizeof opt, "@cntctr_to_%s", id);
@@ -758,17 +778,83 @@ static int buffer_exists(const char *buf) {
  * waiter and a replier race for one reply, only the side whose delete-buffer
  * succeeds delivers it, so every reply arrives exactly once. */
 static char *buffer_take(const char *buf) {
-    char *text, *err;
+    char *text, *err = NULL;
+    int lock = lock_pane(buf, &err);
+    free(err);
+    if (lock < 0) return NULL;
     if (TMUX(NULL, &text, "show-buffer", "-b", buf) != 0) {
         free(text);
+        close(lock);
         return NULL;
     }
     if ((err = TMUXE(NULL, "delete-buffer", "-b", buf))) {
         free(err);
         free(text);
+        close(lock);
         return NULL;
     }
+    close(lock);
     return text;
+}
+
+static void notify_all(void);
+
+/* A failed terminal delivery is durable mail on the addressee's board. */
+static int deliver(const char *pane, const char *name, const char *scope, const char *id, const char *text) {
+    char *err = pane && *pane ? inject(pane, name, text) : strdup("pane gone");
+    if (!err) return 0;
+    free(err);
+    sqlite3 *db = kb(&err);
+    free(err);
+    if (!db) return -1;
+    struct project p;
+    resolve_project(db, pane, &p);
+    char *body = fmt("for %s (reply id=%s):\n%s", name, id, text);
+    int rc = sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
+    if (rc == SQLITE_OK && kb_post(db, scope ? scope : p.key, caller_name, body) == 0) {
+        sqlite3_stmt *st = NULL;
+        rc = sqlite3_prepare_v2(db, "INSERT INTO mail(post,name,pane) VALUES(last_insert_rowid(),?1,?2)", -1, &st, NULL);
+        if (rc == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(st, 2, pane ? pane : "", -1, SQLITE_TRANSIENT);
+            rc = sqlite3_step(st) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+        }
+        sqlite3_finalize(st);
+    } else rc = SQLITE_ERROR;
+    if (rc == SQLITE_OK) rc = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+    if (rc != SQLITE_OK) sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    sqlite3_close(db);
+    free(body);
+    if (rc == SQLITE_OK) notify_all();
+    return rc == SQLITE_OK ? 1 : -1;
+}
+
+/* Serialize claims with active waiters. Delete late buffers only after durable delivery. */
+static int deliver_buffer(const char *buf, const char *id, const char *agent) {
+    char *err = NULL, *text = NULL;
+    int lock = lock_pane(buf, &err);
+    free(err);
+    if (lock < 0) return -1;
+    int rc = 0;
+    if (TMUX(NULL, &text, "show-buffer", "-b", buf) == 0) {
+        char opt[64];
+        snprintf(opt, sizeof opt, "@cntctr_from_%s", id);
+        char *pane = sopt_get(opt);
+        snprintf(opt, sizeof opt, "@cntctr_scope_%s", id);
+        char *scope = sopt_get(opt);
+        snprintf(opt, sizeof opt, "@cntctr_sender_%s", id);
+        char *name = sopt_get(opt);
+        char *env = fmt("[cntctr reply from=%s id=%s]\n%s", agent, id, text);
+        rc = deliver(pane, name ? name : "?", scope, id, env);
+        if (rc >= 0) {
+            free(TMUXE(NULL, "delete-buffer", "-b", buf));
+            untrack(id);
+        }
+        free(env), free(pane), free(scope), free(name);
+    }
+    free(text);
+    close(lock);
+    return rc;
 }
 
 /* ---- waiting ---- */
@@ -1031,7 +1117,11 @@ static int tool_send(json_object *a, char **res) {
  * ponytail: a reply retried after a failed delivery is stored again; the librarian merges duplicates. */
 static void remember_reply(const char *id, const char *to, const char *sender, const char *text, json_object *a) {
     char *me = pane_name(to), *them = pane_name(sender), *title = fmt("reply %s %s→%s", id, me ? me : "?", them ? them : "?");
-    log_history(sender, title, text);
+    char opt[48];
+    snprintf(opt, sizeof opt, "@cntctr_scope_%s", id);
+    char *scope = sopt_get(opt);
+    log_history_in(sender, scope, title, text);
+    free(scope);
     json_object *ins = NULL;
     char *err = NULL;
     sqlite3 *db = json_object_object_get_ex(a, "insights", &ins) && json_object_is_type(ins, json_type_array) ? kb(&err) : NULL;
@@ -1062,7 +1152,7 @@ static void remember_reply(const char *id, const char *to, const char *sender, c
 static int tool_reply(json_object *a, char **res) {
     const char *id = sarg(a, "id"), *text = sarg(a, "text");
     if (need(res, a, "reply", (const char *const[]){"id", "text", NULL}, "{\"id\":\"1a2b3c4d\",\"text\":\"done\"}")) return 1;
-    char opt[48], buf[40], *sender = NULL, *to, *waiting, *env, *err;
+    char opt[48], buf[40], *sender = NULL, *to, *waiting, *err;
     snprintf(opt, sizeof opt, "@cntctr_from_%s", id);
     if (strlen(id) != 8 || strspn(id, "0123456789abcdef") != 8 || !(sender = sopt_get(opt)))
         return fail(res, fmt("unknown id %s", id));
@@ -1085,30 +1175,11 @@ static int tool_reply(json_object *a, char **res) {
         free(to);
         return ok(res, fmt("ok"));
     }
-    /* Nobody waiting: type the reply into the sender's pane, unless a timed-out
-     * waiter claimed the buffer first. */
-    if ((err = TMUXE(NULL, "delete-buffer", "-b", buf))) {
-        free(err);
-        free(sender);
-        free(to);
-        return ok(res, fmt("ok"));
-    }
-    if (!pane_alive(sender)) {
-        free(sender);
-        free(to);
-        untrack(id);
-        return fail(res, fmt("sender gone"));
-    }
     char *me = pane_name(to);
-    env = fmt("[cntctr reply from=%s id=%s]\n%s", me && *me ? me : *self_name ? self_name : client_name, id, text);
-    free(me);
-    free(to);
-    err = inject(sender, "sender", env);
-    free(env);
-    free(sender);
-    if (err) return fail(res, err);   /* still tracked, so the replier can retry */
-    untrack(id);
-    return ok(res, fmt("ok"));
+    int rc = deliver_buffer(buf, id, me && *me ? me : caller_name);
+    free(me), free(sender), free(to);
+    if (rc < 0) return fail(res, fmt("delivery failed; reply retained for retry"));
+    return ok(res, fmt(rc ? "reply is on the board" : "ok"));
 }
 
 static int start_spawn(json_object *a, int wait, char id[9], char **pane_out,
@@ -1482,6 +1553,25 @@ static int unread_count(const char *pane, const char *name) {
     sqlite3_close(db);
     if (!count && newest > after) set_seen(name, newest);   /* only our own posts were new */
     return count;
+}
+
+static int mail_waiting(const char *pane, const char *name) {
+    char *err = NULL;
+    sqlite3 *db = kb(&err);
+    free(err);
+    if (!db) return 0;
+    struct project p;
+    resolve_project(db, pane, &p);
+    sqlite3_stmt *st = NULL;
+    int waiting = 0;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM mail JOIN posts ON posts.rowid=mail.post WHERE name=?1 AND scope=?2 AND delivered=0 LIMIT 1", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, p.key, -1, SQLITE_TRANSIENT);
+        waiting = sqlite3_step(st) == SQLITE_ROW;
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return waiting;
 }
 
 /* Keep `text` on the board of `scope` (NULL: every project); urgent posts also type into live agents except `skip_pane`
@@ -2005,7 +2095,9 @@ static int tool_verdict(json_object *a, char **res) {
         free(announce(db, p.key, caller_name, text, caller_pane, 0));   /* by key: a sweep may already have unmapped the reviewer's copy */
     } else if (!strcmp(verdict, "reject")) {
         text = fmt("fleet tool %s v%d was rejected: %s", name, version, reason ? reason : "");
-        if (pane) free(inject(pane, author, text));
+        char *vid = fmt("%s-v%d", name, version);
+        deliver(pane, author ? author : "?", p.key, vid, text);
+        free(vid);
         free(announce(db, p.key, caller_name, text, pane, 0));   /* the board keeps the reason if the author's pane is gone */
     } else {
         needs_human(db, p.key, name, version, reason && *reason ? reason : "the reviewer could not decide");
@@ -2567,7 +2659,8 @@ static void *call_thread(void *arg) {
         last_unread = unread;
         pthread_mutex_unlock(&out_mu);
         if (unread && report) {
-            char *notice = fmt("(%d unread board post%s; call board)", unread, unread == 1 ? "" : "s");
+            char *notice = fmt("(%d unread board post%s; call board)%s", unread, unread == 1 ? "" : "s",
+                               mail_waiting(caller_pane, caller_name) ? "; a reply is waiting for you" : "");
             item = json_object_new_object();
             json_object_object_add(item, "type", json_object_new_string("text"));
             json_object_object_add(item, "text", json_object_new_string(notice));

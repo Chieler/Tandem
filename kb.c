@@ -30,6 +30,7 @@ static const char SCHEMA[] =
     " INSERT INTO entries_fts(rowid, title, summary, body, tags) VALUES (new.rowid, new.title, new.summary, new.body, new.tags); END;"
     "CREATE TABLE IF NOT EXISTS projects(root TEXT PRIMARY KEY, key TEXT NOT NULL);"
     "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);"
+    "CREATE TABLE IF NOT EXISTS mail(post INTEGER PRIMARY KEY, name TEXT NOT NULL, pane TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0);"
     "CREATE TABLE IF NOT EXISTS posts(scope TEXT NOT NULL, sender TEXT NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL);"
     "CREATE TABLE IF NOT EXISTS tools(project TEXT NOT NULL, name TEXT NOT NULL, version INTEGER NOT NULL,"
     " status TEXT NOT NULL, author TEXT NOT NULL, author_model TEXT NOT NULL DEFAULT '', description TEXT NOT NULL,"
