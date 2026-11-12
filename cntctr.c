@@ -696,15 +696,15 @@ static char *paste(const char *pane, const char *text, int bracketed) {
     if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
     for (;;) {
         char *flags = NULL;
-        if (TMUX(NULL, &flags, "display", "-p", "-t", pane, "#{pane_input_off} #{bracket_paste_flag}") != 0) {
+        if (TMUX(NULL, &flags, "display", "-p", "-t", pane, "#{pane_input_off} #{bracket_paste_flag} #{pane_in_mode}") != 0) {
             free(flags);
             return fmt("paste blocked: cannot read pane input state");
         }
-        int off = -1, mode = -1;
-        int valid = sscanf(flags, "%d %d", &off, &mode) == 2;
+        int off = -1, mode = -1, scrolled = 0;
+        int valid = sscanf(flags, "%d %d %d", &off, &mode, &scrolled) == 3;
         free(flags);
         if (!valid || off) return fmt("paste blocked: pane input is disabled or unknown");
-        if (!bracketed || !strchr(text, '\n') || mode) break;
+        if (!bracketed || !strchr(text, '\n') || mode || scrolled) break;   /* copy-mode hides the program's flag: do not guess */
         clock_gettime(CLOCK_MONOTONIC, &now);
         if (now.tv_sec > deadline.tv_sec || (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec))
             return fmt("paste blocked: bracketed paste is disabled");
