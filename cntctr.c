@@ -840,6 +840,7 @@ static int deliver(const char *pane, const char *name, const char *scope, const 
     char *err = pane && *pane ? inject(pane, name, text) : strdup("pane gone");
     if (!err) return 0;
     free(err);
+    err = NULL;
     sqlite3 *db = kb(&err);
     free(err);
     if (!db) return -1;
@@ -1139,7 +1140,7 @@ static int start_send(json_object *a, int wait, char id[9], char **pane_out, cha
         free(sender), free(target);
         if (!valid) {
             free(pane);
-            return fail(res, fmt("unknown open task %s for this sender and agent; omit re for a new task", re));
+            return fail(res, fmt("unknown open task %s for this sender and agent; omit 're' for a new task", re));
         }
         snprintf(id, 9, "%s", re);
     } else {
@@ -2206,24 +2207,25 @@ static int tool_verdict(json_object *a, char **res) {
     untrack_pane(self_pane);
     notify_all();
     char *author = kb_tool_field(db, p.key, name, version, "author"), *root = kb_tool_field(db, p.key, name, version, "review_root");
+    int delivery = 0;
     char *text, *pane = author ? find_agent(author) : NULL;
     if (!strcmp(verdict, "approve")) {
         text = fmt("new fleet tool %s v%d by %s; see tools/list", name, version, author ? author : "?");
         char *vid = fmt("%s-v%d", name, version);
-        deliver(pane, author ? author : "?", p.key, vid, text);
+        delivery = deliver(pane, author ? author : "?", p.key, vid, text);
         free(vid);
         free(announce(db, p.key, caller_name, text, caller_pane, 0));   /* by key: a sweep may already have unmapped the reviewer's copy */
     } else if (!strcmp(verdict, "reject")) {
         text = fmt("fleet tool %s v%d was rejected: %s", name, version, reason ? reason : "");
         char *vid = fmt("%s-v%d", name, version);
-        deliver(pane, author ? author : "?", p.key, vid, text);
+        delivery = deliver(pane, author ? author : "?", p.key, vid, text);
         free(vid);
         free(announce(db, p.key, caller_name, text, pane, 0));   /* the board keeps the reason if the author's pane is gone */
     } else {
         needs_human(db, p.key, name, version, reason && *reason ? reason : "the reviewer could not decide");
         text = fmt("fleet tool %s v%d escalated: %s", name, version, reason ? reason : "");
         char *vid = fmt("%s-v%d", name, version);
-        deliver(pane, author ? author : "?", p.key, vid, text);
+        delivery = deliver(pane, author ? author : "?", p.key, vid, text);
         free(vid);
     }
     sqlite3_close(db);
@@ -2237,7 +2239,8 @@ static int tool_verdict(json_object *a, char **res) {
     else free(c);
     free(author);
     free(root);
-    return ok(res, fmt("ok"));
+    return delivery < 0 ? fail(res, fmt("verdict committed but delivery failed"))
+                        : ok(res, fmt(delivery ? "verdict is on the board" : "ok"));
 }
 
 static int tool_revoke(json_object *a, char **res) {
@@ -2475,7 +2478,7 @@ static const char TOOLS[] =
     "\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"},"
     "\"timeout\":{\"type\":\"integer\",\"description\":\"Seconds to block when wait=true (default 600)\"}},"
     "\"required\":[\"to\",\"text\"]}},"
-    "{\"name\":\"gather\",\"description\":\"Dispatch delegated send or spawn tasks, then return one JSON result when all answer or the shared deadline expires. Check complete before deciding. Task item fields: send takes to,text,re; spawn takes harness,name,task,cwd,tier,model,effort. wait and timeout are top-level only. Each result has a status: answered, timed_out, dead, limited (with resets), failed, or sent when wait=false. Replies that arrive after a timeout or cancel are typed into your pane.\","
+    "{\"name\":\"gather\",\"description\":\"Dispatch delegated send or spawn tasks, then return one JSON result when all answer or the shared deadline expires. Check complete before deciding. Task item fields: kind=send takes to,text,re; kind=spawn takes harness,name,task,cwd,tier,model,effort. wait and timeout are top-level only. Each result has a status: answered, timed_out, dead, limited (with resets), failed, or sent when wait=false. Replies that arrive after a timeout or cancel are typed into your pane.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
     "\"wait\":{\"type\":\"boolean\",\"description\":\"Default true. false: send every task and return their ids at once; replies arrive in your pane as they come\"},"
     "\"tasks\":{\"type\":\"array\",\"minItems\":1,\"items\":{\"type\":\"object\",\"properties\":{"
@@ -3037,12 +3040,19 @@ static int tools_cmd(int argc, char **argv) {
         } else {
             if (reviews) close_reviews(reviews);
             out = fmt("%s %s v%d", approve ? "approved" : "rejected", name, version);
-            if (approve) {
-                notify_all();
-                char *author = kb_tool_field(db, p.key, name, version, "author");
-                text = fmt("new fleet tool %s v%d by %s; see tools/list", name, version, author ? author : "?");
-                free(author);
+            notify_all();
+            char *author = kb_tool_field(db, p.key, name, version, "author");
+            char *pane = author ? find_agent(author) : NULL, *vid = fmt("%s-v%d", name, version);
+            text = approve ? fmt("new fleet tool %s v%d by %s; see tools/list", name, version, author ? author : "?")
+                           : fmt("fleet tool %s v%d was rejected by a human", name, version);
+            int delivery = deliver(pane, author ? author : "?", p.key, vid, text);
+            if (delivery) {
+                char *more = fmt("%s; %s", out, delivery > 0 ? "verdict is on the board" : "verdict delivery failed");
+                free(out);
+                out = more;
+                if (delivery < 0) rc = 1;
             }
+            free(author), free(pane), free(vid);
         }
     } else if (revoke) {
         if (kb_tool_revoke(db, global ? "global" : p.key, name, "revoked by a human", &reviews) < 1) {
