@@ -5,6 +5,16 @@ BIN=$(cd "$(dirname "${BIN:-./cntctr}")" && pwd)/$(basename "${BIN:-./cntctr}")
 TMPD=$(mktemp -d)
 INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"test"}}}'
 mkdir "$TMPD/bin" "$TMPD/home"
+# Fake agents are `cat` on a terminal. Real harnesses (Claude Code, codex, agy) turn bracketed
+# paste on, which the H7 paste guard needs; so a cat that reads a terminal turns it on first.
+# Plain `cat` in pipes and heredocs is untouched. U25, U26 and the plain shells keep their own programs.
+cat > "$TMPD/bin/cat" <<'EOF'
+#!/bin/sh
+[ -t 0 ] && printf '\033[?2004h'
+exec /bin/cat "$@"
+EOF
+chmod +x "$TMPD/bin/cat"
+FSH='printf "\033[?2004h"; exec sh'   # a fake agent that is a shell, same reason
 export HOME="$TMPD/home"   # fleet tools keep their cache under ~/.cache
 export BIN INIT CNTCTR_ENTER_DELAY_MS=50 LC_ALL=en_US.UTF-8 PATH="$TMPD/bin:$PATH" CNTCTR_DB="$TMPD/kb.db" CNTCTR_MEM_URL=
 export CNTCTR_MAX_AGENTS=${CNTCTR_MAX_AGENTS:-256}
@@ -389,7 +399,7 @@ t send-keys -t "$C" -X cancel
 for _ in $(seq 50); do [ "$(screen "$C" | grep -c 'when done')" -ge 2 ] && break; sleep 0.1; done
 same "Enter reaches a pane in copy-mode" "$(screen "$C" | grep -c 'when done')" 2
 # read without -r, like Claude's input box, treats a trailing backslash as "continue on the next line"
-K=$(newpane bs sh -c 'while read l; do echo "GOT:$l"; done')
+K=$(newpane bs sh -c 'printf "\033[?2004h"; while read l; do echo "GOT:$l"; done')
 id=$(txt "$(call "$K" send '{"to":"b","text":"ask"}')" | sed 's/sent id=//')
 call "$B" reply "{\"id\":\"$id\",\"text\":\"ends in \\\\\"}" >/dev/null
 expect_screen "reply ending in a backslash is still submitted" "$K" "GOT:ends in"
@@ -1702,7 +1712,7 @@ mkdir -p "$M3_DIR"
 ln -sf "$BIN" "$TMPD/bin/cntctr"
 m3_newpane() {
     local name=$1; shift
-    [ $# -gt 0 ] || set -- sh
+    [ $# -gt 0 ] || set -- "$FSH"
     local p; p=$(newpane "$name" -c "$M3_DIR" "$@")
     t set -p -t "$p" @cntctr_harness claude
     echo "$p"
@@ -1777,7 +1787,7 @@ tunset CNTCTR_TEST_VERDICT
 # T8: cntctr tools promote: no pane gets text; each project board has the notice
 M3_DIR8_2="$(realpath "$TMPD")/m3_repo8_2"; mkdir -p "$M3_DIR8_2"
 M3_P8_1=$(m3_newpane m3_p8_1)
-M3_P8_2=$(newpane m3_p8_2 -c "$M3_DIR8_2" sh)
+M3_P8_2=$(newpane m3_p8_2 -c "$M3_DIR8_2" "$FSH")
 call "$M3_P8_1" tool_define '{"name":"m3_t8","description":"t8","input_schema":{"type":"object"},"interpreter":"sh","script":"true"}' >/dev/null
 sq "$CNTCTR_DB" "UPDATE tools SET version=1, status='escalated' WHERE name='m3_t8' AND project='$M3_DIR'"
 (cd "$M3_DIR" && "$BIN" tools approve m3_t8 >/dev/null 2>&1)
@@ -1847,7 +1857,7 @@ refute "T12 fd 3 reply has no notice" "$c0_12" "unread board post"
 check "T12 outer use result has unread notice" "$c1_12" "unread board post"
 
 # T13: reply while sender shows permission prompt falls back to board
-M3_S13=$(m3_newpane m3_s13 sh)
+M3_S13=$(m3_newpane m3_s13 "$FSH")
 M3_W13=$(m3_newpane m3_w13)
 tid13=$(txt "$(call "$M3_S13" send '{"to":"m3_w13","text":"task 13"}')" | sed 's/sent id=//')
 t send-keys -t "$M3_S13" "printf 'Do you want to proceed?'" Enter
@@ -1865,8 +1875,8 @@ check "T13 sender next result says reply waiting" "$s13_next" "reply is waiting"
 # T14: kill sender pane, then reply from another project: board post and history in sender project
 M3_DIR14_1="$(realpath "$TMPD")/m3_repo14_1"; mkdir -p "$M3_DIR14_1"
 M3_DIR14_2="$(realpath "$TMPD")/m3_repo14_2"; mkdir -p "$M3_DIR14_2"
-M3_S14=$(newpane m3_s14 -c "$M3_DIR14_1" sh)
-M3_W14=$(newpane m3_w14 -c "$M3_DIR14_2" sh)
+M3_S14=$(newpane m3_s14 -c "$M3_DIR14_1" "$FSH")
+M3_W14=$(newpane m3_w14 -c "$M3_DIR14_2" "$FSH")
 tid14=$(txt "$(call "$M3_S14" send '{"to":"m3_w14","text":"task 14"}')" | sed 's/sent id=//')
 t kill-pane -t "$M3_S14"
 call "$M3_W14" reply "{\"id\":\"$tid14\",\"text\":\"done 14\"}" >/dev/null
@@ -1876,7 +1886,7 @@ h14=$(sq "$CNTCTR_DB" "SELECT body FROM entries WHERE scope='$M3_DIR14_1' AND la
 check "T14 history entry is in sender project" "$h14" "done 14"
 
 # T15: gather times out, caller at permission prompt, worker replies late: text on board
-M3_C15=$(m3_newpane m3_c15 sh)
+M3_C15=$(m3_newpane m3_c15 "$FSH")
 M3_W15=$(m3_newpane m3_w15)
 call "$M3_C15" gather '{"tasks":[{"kind":"send","to":"m3_w15","text":"slow task 15"}],"timeout":1}' >/dev/null
 tid15=$(lastid "$M3_W15")
@@ -2197,7 +2207,7 @@ same "T38b outside Unix socket connection is rejected" "$(iserr "$res38b_raw")" 
 fi
 
 # T39: redelivery of addressed text
-M3_S39=$(m3_newpane m3_s39 sh)
+M3_S39=$(m3_newpane m3_s39 "$FSH")
 M3_W39=$(m3_newpane m3_w39)
 tid39=$(txt "$(call "$M3_S39" send '{"to":"m3_w39","text":"task 39"}')" | sed 's/sent id=//')
 daemon_start "$M3_S39"
@@ -2234,8 +2244,8 @@ refute "T39 ordinary post is not typed" "$(screen "$M3_S39")" "ordinary unaddres
 
 # T40-T43: digest, age, post limit, and private fallback mail
 M3_DIR40="$(realpath "$TMPD")/m3_repo40"; mkdir -p "$M3_DIR40"
-M3_A40=$(newpane m3_a40 -c "$M3_DIR40" sh)
-M3_B40=$(newpane m3_b40 -c "$M3_DIR40" sh)
+M3_A40=$(newpane m3_a40 -c "$M3_DIR40" "$FSH")
+M3_B40=$(newpane m3_b40 -c "$M3_DIR40" "$FSH")
 guide40=$(printf '%s\n' "$INIT" | "$BIN" | tail -n 1 | jq -r '.result.instructions')
 check "T40 instructions request board before final" "$guide40" "before your final reply"
 check "T42 post description directs one agent to send" "$post_desc" "use send"
@@ -2261,9 +2271,9 @@ same "T42 urgent 501 bytes rejected" "$(iserr "$res42u")" "true"
 same "T42 rejected urgent post stores nothing" "$(sq "$CNTCTR_DB" "SELECT count(*) FROM posts WHERE scope='$M3_DIR40'")" "$count42u"
 refute "T42 urgent rejected text not typed" "$(screen "$M3_B40")" "$text501"
 M3_DIR43="$(realpath "$TMPD")/m3_repo43"; mkdir -p "$M3_DIR43"
-M3_A43=$(newpane m3_a43 -c "$M3_DIR43" sh)
-M3_B43=$(newpane m3_b43 -c "$M3_DIR43" sh)
-M3_W43=$(newpane m3_w43 -c "$M3_DIR43" sh)
+M3_A43=$(newpane m3_a43 -c "$M3_DIR43" "$FSH")
+M3_B43=$(newpane m3_b43 -c "$M3_DIR43" "$FSH")
+M3_W43=$(newpane m3_w43 -c "$M3_DIR43" "$FSH")
 tid43=$(txt "$(call "$M3_A43" send '{"to":"m3_w43","text":"task 43"}')" | sed 's/sent id=//')
 t send-keys -t "$M3_A43" "printf 'Do you want to proceed?'" Enter
 expect_screen "T43 sender prompt visible" "$M3_A43" "Do you want to proceed?"
@@ -2275,8 +2285,8 @@ check "T43 addressee board lists mail" "$(txt "$(call "$M3_A43" board '{}')")" "
 
 # T45: a renamed pane still owns its undelivered fallback mail.
 M3_DIR45="$(realpath "$TMPD")/m3_repo45"; mkdir -p "$M3_DIR45"
-M3_A45=$(newpane m3_old45 -c "$M3_DIR45" sh)
-M3_W45=$(newpane m3_w45 -c "$M3_DIR45" sh)
+M3_A45=$(newpane m3_old45 -c "$M3_DIR45" "$FSH")
+M3_W45=$(newpane m3_w45 -c "$M3_DIR45" "$FSH")
 tid45=$(txt "$(call "$M3_A45" send '{"to":"m3_w45","text":"task 45"}')" | sed 's/sent id=//')
 t send-keys -t "$M3_A45" "printf 'Do you want to proceed?'" Enter
 expect_screen "T45 sender prompt" "$M3_A45" "Do you want to proceed?"
@@ -2287,8 +2297,8 @@ check "T45 renamed agent board lists reply" "$(txt "$(call "$M3_A45" board '{}')
 
 # T46: old undelivered mail counts, old ordinary news does not.
 M3_DIR46="$(realpath "$TMPD")/m3_repo46"; mkdir -p "$M3_DIR46"
-M3_A46=$(newpane m3_a46 -c "$M3_DIR46" sh)
-M3_W46=$(newpane m3_w46 -c "$M3_DIR46" sh)
+M3_A46=$(newpane m3_a46 -c "$M3_DIR46" "$FSH")
+M3_W46=$(newpane m3_w46 -c "$M3_DIR46" "$FSH")
 tid46=$(txt "$(call "$M3_A46" send '{"to":"m3_w46","text":"task 46"}')" | sed 's/sent id=//')
 t send-keys -t "$M3_A46" "printf 'Do you want to proceed?'" Enter
 expect_screen "T46 sender prompt" "$M3_A46" "Do you want to proceed?"
@@ -2301,8 +2311,8 @@ check "T46 old mail says reply waiting" "$n46" "a reply is waiting"
 
 # T47: own posts fill the board window but do not hide an unread omission.
 M3_DIR47="$(realpath "$TMPD")/m3_repo47"; mkdir -p "$M3_DIR47"
-M3_X47=$(newpane m3_x47 -c "$M3_DIR47" sh)
-M3_Y47=$(newpane m3_y47 -c "$M3_DIR47" sh)
+M3_X47=$(newpane m3_x47 -c "$M3_DIR47" "$FSH")
+M3_Y47=$(newpane m3_y47 -c "$M3_DIR47" "$FSH")
 call "$M3_Y47" post '{"text":"IMPORTANT 47"}' >/dev/null
 for i47 in $(seq 21); do call "$M3_X47" post "{\"text\":\"own post $i47\"}" >/dev/null; done
 check "T47 unread before board" "$(notice "$(call "$M3_X47" list '{}')")" "1 unread board post"
@@ -2312,7 +2322,7 @@ same "T47 omission line counts unread outside window" "$(printf '%s\n' "$b47" | 
 
 # T48: embedded NUL is rejected before post or send has side effects.
 M3_DIR48="$(realpath "$TMPD")/m3_repo48"; mkdir -p "$M3_DIR48"
-M3_A48=$(newpane m3_a48 -c "$M3_DIR48" sh)
+M3_A48=$(newpane m3_a48 -c "$M3_DIR48" "$FSH")
 M3_B48=$(newpane m3_b48 -c "$M3_DIR48" cat)
 count48=$(sq "$CNTCTR_DB" "SELECT count(*) FROM posts WHERE scope='$M3_DIR48'")
 r48p=$(call "$M3_A48" post '{"text":"NUL-PREFIX\u0000suffix","urgent":true}')
@@ -2338,8 +2348,8 @@ daemon_stop
 
 # T50: a pane ID reused by a later tmux server does not own old mail.
 M3_DIR50="$(realpath "$TMPD")/m3_repo50"; mkdir -p "$M3_DIR50"
-M3_A50=$(newpane m3_old50 -c "$M3_DIR50" sh)
-M3_W50=$(newpane m3_w50 -c "$M3_DIR50" sh)
+M3_A50=$(newpane m3_old50 -c "$M3_DIR50" "$FSH")
+M3_W50=$(newpane m3_w50 -c "$M3_DIR50" "$FSH")
 tid50=$(txt "$(call "$M3_A50" send '{"to":"m3_w50","text":"task 50"}')" | sed 's/sent id=//')
 t send-keys -t "$M3_A50" "printf 'Do you want to proceed?'" Enter
 expect_screen "T50 sender prompt" "$M3_A50" "Do you want to proceed?"
