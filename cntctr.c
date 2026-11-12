@@ -1817,7 +1817,7 @@ static const struct { const char *name; tool_fn fn; int needs_pane; } TOOL_FNS[]
     {"tool_define", tool_define, 0},
     {"tool_verdict", tool_verdict, 0},
     {"tool_revoke", tool_revoke, 0},
-    {"use", tool_use, 1},
+    {"use", tool_use, 0},
     {NULL, NULL, 0},
 };
 
