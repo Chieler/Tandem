@@ -701,9 +701,10 @@ static char *inject(const char *pane, const char *who, const char *text) {
         err = fmt("%s awaiting permission prompt; retry later", who);
         goto done;
     }
-    const char *id = strstr(text, "id="), *nl = strchr(text, '\n');
+    const char *id = strncmp(text, "[cntctr ", 8) == 0 ? strstr(text, "id=") : NULL;
+    const char *end = strchr(text, ']'), *nl = strchr(text, '\n');
     char fresh[9];
-    if (!id || (nl && id > nl)) {
+    if (!id || !end || id > end || (nl && (id > nl || end > nl))) {
         snprintf(fresh, sizeof fresh, "%08x", arc4random());
         id = fresh;
     } else id += 3;
@@ -1661,7 +1662,7 @@ static int unread_count(const char *pane, const char *name) {
     resolve_project(db, pane, &p);
     long long after = seen_of(name), newest = after;
     int count = 0;
-    free(kb_unread(db, p.key, name, after, &newest, &count));
+    free(kb_unread(db, p.key, name, pane, after, &newest, &count));
     sqlite3_close(db);
     if (!count && newest > after) set_seen(name, newest);   /* only our own posts were new */
     return count;
@@ -1676,9 +1677,10 @@ static int mail_waiting(const char *pane, const char *name) {
     resolve_project(db, pane, &p);
     sqlite3_stmt *st = NULL;
     int waiting = 0;
-    if (sqlite3_prepare_v2(db, "SELECT 1 FROM mail JOIN posts ON posts.rowid=mail.post WHERE name=?1 AND scope=?2 AND delivered=0 LIMIT 1", -1, &st, NULL) == SQLITE_OK) {
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM mail JOIN posts ON posts.rowid=mail.post WHERE (name=?1 OR pane=?3) AND scope=?2 AND delivered=0 LIMIT 1", -1, &st, NULL) == SQLITE_OK) {
         sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 2, p.key, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 3, pane, -1, SQLITE_TRANSIENT);
         waiting = sqlite3_step(st) == SQLITE_ROW;
     }
     sqlite3_finalize(st);
@@ -1778,13 +1780,14 @@ static int tool_board(json_object *a, char **res) {
     struct project p;
     sqlite3 *db = kb_for_caller(&p, res);
     if (!db) return 1;
-    char *out = kb_board(db, p.key, caller_name, limit);
+    char *out = kb_board(db, p.key, caller_name, caller_pane, limit);
     long long newest = 0;
     int unseen = 0;
-    free(kb_unread(db, p.key, caller_name, seen_of(caller_name), &newest, &unseen));
+    free(kb_unread(db, p.key, caller_name, caller_pane, seen_of(caller_name), &newest, &unseen));
+    int omitted = kb_omitted(db, p.key, caller_name, caller_pane, seen_of(caller_name), limit);
     if (*caller_name) set_seen(caller_name, newest);
-    if (unseen > limit) {
-        char *more = fmt("%s\n%d older unread posts were not shown", out, unseen - limit);
+    if (omitted > 0) {
+        char *more = fmt("%s\n%d older unread posts were not shown", out, omitted);
         free(out);
         out = more;
     }
@@ -2435,9 +2438,29 @@ static char *set_caller(json_object *args) {
     return from && *from ? resolve_from(from) : NULL;
 }
 
+static const char *nul_argument(json_object *value, const char *key) {
+    if (!value) return NULL;
+    if (json_object_is_type(value, json_type_string))
+        return strlen(json_object_get_string(value)) != (size_t)json_object_get_string_len(value) ? key : NULL;
+    if (json_object_is_type(value, json_type_object)) {
+        json_object_object_foreach(value, name, child) {
+            const char *bad = nul_argument(child, name);
+            if (bad) return bad;
+        }
+    } else if (json_object_is_type(value, json_type_array)) {
+        for (size_t i = 0; i < json_object_array_length(value); i++) {
+            const char *bad = nul_argument(json_object_array_get_idx(value, i), key);
+            if (bad) return bad;
+        }
+    }
+    return NULL;
+}
+
 /* Run `tool` as the given caller, ignoring any `from` in args. The thread's own caller is restored on
  * return, so a nested call (a fleet tool calling use) does not change the outer call's identity. */
 static int dispatch_as(const char *pane, const char *name, const char *tool, json_object *args, char **res) {
+    const char *bad = nul_argument(args, "argument");
+    if (bad) return fail(res, fmt("argument %s contains NUL byte", bad));
     char saved_pane[sizeof caller_pane], saved_name[sizeof caller_name];
     memcpy(saved_pane, caller_pane, sizeof saved_pane);
     memcpy(saved_name, caller_name, sizeof saved_name);
@@ -2469,6 +2492,8 @@ static int dispatch_as(const char *pane, const char *name, const char *tool, jso
 static void learn_mail_identity(const char *pane, const char *name);
 
 static int dispatch(const char *name, json_object *args, char **res) {
+    const char *bad = nul_argument(args, "argument");
+    if (bad) return fail(res, fmt("argument %s contains NUL byte", bad));
     char *err = set_caller(args);
     if (err) return fail(res, err);
     learn_mail_identity(caller_pane, caller_name);
@@ -2718,9 +2743,10 @@ static int redeliver_for(const char *pane, const char *name) {
     resolve_project(db, pane, &p);
     sqlite3_stmt *st = NULL;
     int pending = 0;
-    if (sqlite3_prepare_v2(db, "SELECT post FROM mail JOIN posts ON posts.rowid=mail.post WHERE name=?1 AND scope=?2 AND delivered=0", -1, &st, NULL) == SQLITE_OK) {
+    if (sqlite3_prepare_v2(db, "SELECT post FROM mail JOIN posts ON posts.rowid=mail.post WHERE (name=?1 OR pane=?3) AND scope=?2 AND delivered=0", -1, &st, NULL) == SQLITE_OK) {
         sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 2, p.key, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 3, pane, -1, SQLITE_TRANSIENT);
         json_object *ids = json_object_new_array();
         int step;
         while ((step = sqlite3_step(st)) == SQLITE_ROW)
@@ -2746,7 +2772,8 @@ static int redeliver_for(const char *pane, const char *name) {
                 sqlite3_finalize(st);
                 st = NULL;
                 if (body) {
-                    err = inject(pane, name, body);
+                    char *message = strchr(body, '\n');
+                    err = inject(pane, name, message ? message + 1 : body);
                     rc = err ? SQLITE_ERROR : sqlite3_prepare_v2(db, "UPDATE mail SET delivered=1 WHERE post=?1", -1, &st, NULL);
                     if (rc == SQLITE_OK) {
                         sqlite3_bind_int64(st, 1, id);

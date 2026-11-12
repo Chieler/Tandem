@@ -7,14 +7,17 @@ INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":
 mkdir "$TMPD/bin" "$TMPD/home"
 export HOME="$TMPD/home"   # fleet tools keep their cache under ~/.cache
 export BIN INIT CNTCTR_ENTER_DELAY_MS=50 LC_ALL=en_US.UTF-8 PATH="$TMPD/bin:$PATH" CNTCTR_DB="$TMPD/kb.db" CNTCTR_MEM_URL=
+export CNTCTR_MAX_AGENTS=${CNTCTR_MAX_AGENTS:-256}
 unset TMUX_PANE
 
 SOCKET="cntctr-test-$$"
 t() { tmux -L "$SOCKET" -f /dev/null "$@"; }
+trap 't kill-server 2>/dev/null; sq "$CNTCTR_DB" "select review_root from tools where review_root > \"\"" 2>/dev/null | xargs rm -rf; rm -rf "$TMPD"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 t kill-server 2>/dev/null
 t new-session -d -s test -x 200 -y 50 cat
 export TMUX="$(t display -p '#{socket_path}'),0,0"
-trap 't kill-server 2>/dev/null; sq "$CNTCTR_DB" "select review_root from tools where review_root > \"\"" 2>/dev/null | xargs rm -rf; rm -rf "$TMPD"' EXIT
 
 pass=0 fail=0
 ok_() { pass=$((pass + 1)); }
@@ -2064,6 +2067,68 @@ call "$M3_W43" reply "{\"id\":\"$tid43\",\"text\":\"private reply 43\"}" >/dev/n
 refute "T43 other agent has no unread mail" "$(notice "$(call "$M3_B43" list '{}')")" "unread board post"
 refute "T43 other agent board hides mail" "$(txt "$(call "$M3_B43" board '{}')")" "private reply 43"
 check "T43 addressee board lists mail" "$(txt "$(call "$M3_A43" board '{}')")" "private reply 43"
+
+
+# T45: a renamed pane still owns its undelivered fallback mail.
+M3_DIR45="$(realpath "$TMPD")/m3_repo45"; mkdir -p "$M3_DIR45"
+M3_A45=$(newpane m3_old45 -c "$M3_DIR45" sh)
+M3_W45=$(newpane m3_w45 -c "$M3_DIR45" sh)
+tid45=$(txt "$(call "$M3_A45" send '{"to":"m3_w45","text":"task 45"}')" | sed 's/sent id=//')
+t send-keys -t "$M3_A45" "printf 'Do you want to proceed?'" Enter
+expect_screen "T45 sender prompt" "$M3_A45" "Do you want to proceed?"
+call "$M3_W45" reply "{\"id\":\"$tid45\",\"text\":\"reply 45\"}" >/dev/null
+t set -p -t "$M3_A45" @cntctr_name m3_new45
+check "T45 renamed agent sees unread reply" "$(notice "$(call "$M3_A45" list '{}')")" "a reply is waiting"
+check "T45 renamed agent board lists reply" "$(txt "$(call "$M3_A45" board '{}')")" "reply 45"
+
+# T46: old undelivered mail counts, old ordinary news does not.
+M3_DIR46="$(realpath "$TMPD")/m3_repo46"; mkdir -p "$M3_DIR46"
+M3_A46=$(newpane m3_a46 -c "$M3_DIR46" sh)
+M3_W46=$(newpane m3_w46 -c "$M3_DIR46" sh)
+tid46=$(txt "$(call "$M3_A46" send '{"to":"m3_w46","text":"task 46"}')" | sed 's/sent id=//')
+t send-keys -t "$M3_A46" "printf 'Do you want to proceed?'" Enter
+expect_screen "T46 sender prompt" "$M3_A46" "Do you want to proceed?"
+call "$M3_W46" reply "{\"id\":\"$tid46\",\"text\":\"reply 46\"}" >/dev/null
+call "$M3_W46" post '{"text":"old ordinary news 46"}' >/dev/null
+sq "$CNTCTR_DB" "UPDATE posts SET at=at-90000 WHERE scope='$M3_DIR46'"
+n46=$(notice "$(call "$M3_A46" list '{}')")
+check "T46 old mail remains unread" "$n46" "1 unread board post"
+check "T46 old mail says reply waiting" "$n46" "a reply is waiting"
+
+# T47: own posts fill the board window but do not hide an unread omission.
+M3_DIR47="$(realpath "$TMPD")/m3_repo47"; mkdir -p "$M3_DIR47"
+M3_X47=$(newpane m3_x47 -c "$M3_DIR47" sh)
+M3_Y47=$(newpane m3_y47 -c "$M3_DIR47" sh)
+call "$M3_Y47" post '{"text":"IMPORTANT 47"}' >/dev/null
+for i47 in $(seq 21); do call "$M3_X47" post "{\"text\":\"own post $i47\"}" >/dev/null; done
+check "T47 unread before board" "$(notice "$(call "$M3_X47" list '{}')")" "1 unread board post"
+b47=$(txt "$(call "$M3_X47" board '{}')")
+refute "T47 old unread outside window" "$b47" "IMPORTANT 47"
+same "T47 omission line counts unread outside window" "$(printf '%s\n' "$b47" | tail -n 1)" "1 older unread posts were not shown"
+
+# T48: embedded NUL is rejected before post or send has side effects.
+M3_DIR48="$(realpath "$TMPD")/m3_repo48"; mkdir -p "$M3_DIR48"
+M3_A48=$(newpane m3_a48 -c "$M3_DIR48" sh)
+M3_B48=$(newpane m3_b48 -c "$M3_DIR48" cat)
+count48=$(sq "$CNTCTR_DB" "SELECT count(*) FROM posts WHERE scope='$M3_DIR48'")
+r48p=$(call "$M3_A48" post '{"text":"NUL-PREFIX\u0000suffix","urgent":true}')
+r48s=$(call "$M3_A48" send '{"to":"m3_b48","text":"NUL-PREFIX\u0000suffix"}')
+for r48 in "$r48p" "$r48s"; do
+    same "T48 NUL argument rejected" "$(iserr "$r48")" true
+    check "T48 error names text" "$(txt "$r48")" "text"
+    check "T48 error names NUL byte" "$(txt "$r48")" "NUL byte"
+done
+same "T48 no post stored" "$(sq "$CNTCTR_DB" "SELECT count(*) FROM posts WHERE scope='$M3_DIR48'")" "$count48"
+refute "T48 no text typed" "$(screen "$M3_B48")" "NUL-PREFIX"
+
+# T49: text in an urgent post cannot supply the end marker ID.
+M3_DIR49="$(realpath "$TMPD")/m3_repo49"; mkdir -p "$M3_DIR49"
+M3_A49=$(newpane m3_a49 -c "$M3_DIR49" cat)
+M3_B49=$(newpane m3_b49 -c "$M3_DIR49" cat)
+call "$M3_A49" post '{"text":"urgent body id=deadbeef","urgent":true}' >/dev/null
+expect_screen "T49 urgent body delivered" "$M3_B49" "urgent body id=deadbeef"
+check "T49 has end marker" "$(screen "$M3_B49")" "[cntctr end id="
+refute "T49 body id is not used in end marker" "$(screen "$M3_B49")" "[cntctr end id=deadbeef]"
 
 daemon_stop
 
