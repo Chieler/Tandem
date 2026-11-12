@@ -24,7 +24,7 @@
 
 #define OUT_CAP (256 * 1024)
 #define ERR_CAP (16 * 1024)
-#define ERR_SHOWN 4096     /* how much of stderr's tail an error carries */
+#define ERR_SHOWN ERR_CAP     /* how much of stderr's tail an error carries */
 #define LINE_CAP (1 << 20)
 
 extern char **environ;
@@ -300,6 +300,48 @@ static int drain(int *fd, struct buf *b, size_t cap) {
     return 0;
 }
 
+/* Stderr is diagnostic: keep its tail without stopping a tool for being verbose. */
+static void drain_tail(int *fd, struct buf *b) {
+    char tmp[8192];
+    while (*fd >= 0) {
+        ssize_t n = read(*fd, tmp, sizeof tmp);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            if (n < 0 && errno == EAGAIN) return;
+            close_fd(fd);
+            return;
+        }
+        size_t drop = b->len + (size_t)n > ERR_CAP ? b->len + (size_t)n - ERR_CAP : 0;
+        if (drop) { memmove(b->p, b->p + drop, b->len - drop); b->len -= drop; }
+        put(b, tmp, (size_t)n);
+    }
+}
+
+/* Save bytes before cleaning or abbreviating them. Each output has an unguessable private filename. */
+static char *save_output(const char *cache, const struct buf *b) {
+    DIR *d = opendir(cache);
+    for (struct dirent *e; d && (e = readdir(d));) {
+        if (strncmp(e->d_name, "output-", 7)) continue;
+        char *path = fmt("%s/%s", cache, e->d_name);
+        struct stat st;
+        if (lstat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_mtime < time(NULL) - 86400) unlink(path);
+        free(path);
+    }
+    if (d) closedir(d);
+    char *path = fmt("%s/output-XXXXXX", cache);
+    int fd = mkstemp(path), bad = fd < 0;
+    size_t off = 0;
+    while (!bad && off < b->len) {
+        ssize_t n = write(fd, b->p + off, b->len - off);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) bad = 1;
+        else off += (size_t)n;
+    }
+    if (fd >= 0 && close(fd) != 0) bad = 1;
+    if (bad) { unlink(path); free(path); return NULL; }
+    return path;
+}
+
 /* Answer each complete request line in `in` and queue the replies on `outq`. */
 static void serve_lines(const struct fleet_run *r, struct buf *in, struct buf *outq) {
     char *nl;
@@ -433,7 +475,7 @@ int fleet_run(const struct fleet_run *r, char **out) {
     size_t woff = 0, soff = 0;
     long long deadline = r->deadline_ms ? r->deadline_ms : now_ms() + (long long)r->timeout * 1000;
     struct buf req = {0};
-    int ocap = 0, ecap = 0, scap = 0, timed_out = 0, status = 0, exited = 0;
+    int ocap = 0, scap = 0, timed_out = 0, status = 0, exited = 0;
     put(&req, "", 0);
 
     while (!exited) {
@@ -453,7 +495,7 @@ int fleet_run(const struct fleet_run *r, char **out) {
             if (woff == sin.len || (w < 0 && errno != EAGAIN && errno != EINTR)) close_fd(&win);
         }
         ocap |= drain(&rout, &obuf, OUT_CAP);
-        ecap |= drain(&rerr, &ebuf, ERR_CAP);
+        drain_tail(&rerr, &ebuf);
         if (sock >= 0) {
             drain(&sock, &req, LINE_CAP);
             serve_lines(r, &req, &sout);   /* complete lines first; an incomplete oversized one is never run */
@@ -473,13 +515,13 @@ int fleet_run(const struct fleet_run *r, char **out) {
             if (soff == sout.len) sout.len = soff = 0;
             if (req.len >= LINE_CAP && sout.len == 0) close_fd(&sock);
         }
-        if (ocap || ecap) break;
+        if (ocap) break;
         siginfo_t si = {0};
         if (waitid(P_PID, (id_t)pid, &si, WEXITED | WNOHANG | WNOWAIT) == 0 && si.si_pid == pid) exited = 1;
     }
     if (exited) {   /* take what the tool wrote last, then stop stragglers it left holding the pipes */
         ocap |= drain(&rout, &obuf, OUT_CAP);
-        ecap |= drain(&rerr, &ebuf, ERR_CAP);
+        drain_tail(&rerr, &ebuf);
     }
     killpg(pid, SIGKILL);
     while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
@@ -495,10 +537,6 @@ int fleet_run(const struct fleet_run *r, char **out) {
         char *head = fmt("tool %s timed out after %d s", r->name, r->timeout);
         *out = error_with(head, &ebuf);
         free(head);
-    } else if (ecap && !ocap) {
-        char *head = fmt("tool %s was stopped: stderr over %d KB", r->name, ERR_CAP / 1024);
-        *out = error_with(head, &ebuf);
-        free(head);
     } else if (ocap) {
         char *text = result_text(obuf.p ? obuf.p : "", obuf.len);
         *out = fmt("%s\ntool %s was stopped: output over %d KB", text, r->name, OUT_CAP / 1024);
@@ -512,6 +550,24 @@ int fleet_run(const struct fleet_run *r, char **out) {
         *out = result_text(obuf.p ? obuf.p : "", obuf.len);
         rc = 0;
     }
+    if (!r->composed && obuf.len > 16 * 1024) {
+        char *path = save_output(cache, &obuf);
+        char *head = result_text(obuf.p, 8 * 1024);
+        char *tail = result_text(obuf.p + obuf.len - 4 * 1024, 4 * 1024);
+        char *summary = fmt("%s\n...\n%s\n%s (%zu bytes)%s%s", head, tail,
+                            path ? path : "output file could not be saved", obuf.len,
+                            rc ? "\n" : "", rc ? *out : "");
+        /* An output-cap error previously included all captured bytes. */
+        if (ocap) {
+            free(summary);
+            summary = fmt("%s\n...\n%s\n%s (%zu bytes)\ntool %s was stopped: output over %d KB", head, tail,
+                          path ? path : "output file could not be saved", obuf.len, r->name, OUT_CAP / 1024);
+        }
+        free(*out);
+        *out = summary;
+        free(path), free(head), free(tail);
+    }
+
 done:
     if (pid > 0) {
         killpg(pid, SIGKILL);

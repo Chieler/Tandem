@@ -2251,7 +2251,7 @@ static int use_tool(const char *name, json_object *args, char **res) {
     long long deadline = fleet_now_ms() + (long long)timeout * 1000, outer = fleet_deadline;
     if (outer && outer < deadline) deadline = outer;   /* a nested run counts against the outer tool's deadline */
     struct fleet_run r = {.name = t.name, .root = p.root, .interpreter = t.interpreter, .script = t.script,
-                          .args_json = argjson, .db_path = kb_path(def, sizeof def), .net = t.net, .fork_mu = &fork_mu,
+                          .args_json = argjson, .db_path = kb_path(def, sizeof def), .net = t.net, .composed = fleet_depth > 0, .fork_mu = &fork_mu,
                           .timeout = timeout, .deadline_ms = deadline, .serve = serve_call, .ctx = &who};
     fleet_depth++;
     fleet_deadline = deadline;
