@@ -913,7 +913,6 @@ static int poll_task(struct gathered *it) {
     if (buffer_exists(buf)) {
         /* wait flag stays set so tool_reply never claims the buffer; untrack clears it */
         if ((it->text = buffer_take(buf))) {
-            untrack(it->id);
             it->status = "answered";
             return 1;
         }
@@ -923,7 +922,6 @@ static int poll_task(struct gathered *it) {
     if (st == P_DEAD) {
         unwait(it->id);
         if ((it->text = buffer_take(buf))) {   /* answered just before exiting */
-            untrack(it->id);
             it->status = "answered";
             return 1;
         }
@@ -935,7 +933,6 @@ static int poll_task(struct gathered *it) {
     if (st == P_LIMITED) {
         unwait(it->id);   /* a reply after the reset goes to the caller's pane */
         if ((it->text = buffer_take(buf))) {   /* replied between the last check and unwait */
-            untrack(it->id);
             it->status = "answered";
             free(resets);
             return 1;
@@ -970,22 +967,24 @@ static void finish_pending(struct gathered *items, size_t n) {
     int gone = cancelled();
     for (size_t i = 0; i < n; i++) {
         struct gathered *it = &items[i];
+        char buf[40];
+        snprintf(buf, sizeof buf, "cntctr-reply-%s", it->id);
         if (!it->status) {
-            char buf[40];
-            snprintf(buf, sizeof buf, "cntctr-reply-%s", it->id);
             unwait(it->id);
-            if ((it->text = buffer_take(buf))) {
-                untrack(it->id);
-                it->status = "answered";
-            } else {
+            if (gone) {
+                deliver_buffer(buf, it->id, it->agent ? it->agent : "?");
                 it->status = "timed_out";
-            }
+            } else if ((it->text = buffer_take(buf))) {
+                it->status = "answered";
+            } else it->status = "timed_out";
         }
-        if (gone && strcmp(it->status, "answered") == 0) {
-            char *env = fmt("[cntctr reply from=%s id=%s]\n%s", it->agent ? it->agent : "?", it->id, it->text);
-            char *err = inject(caller_pane, "your pane", env);
-            free(env);
-            free(err);   /* ponytail: a failed inject here loses the reply; retry loop if this ever shows up */
+        if (strcmp(it->status, "answered") == 0) {
+            if (gone) {
+                /* A reply already read by this waiter still needs durable delivery on cancellation. */
+                char *err = TMUXE(it->text, "load-buffer", "-b", buf, "-");
+                if (!err) deliver_buffer(buf, it->id, it->agent ? it->agent : "?");
+                free(err);
+            } else untrack(it->id);
         }
     }
 }
@@ -2210,6 +2209,9 @@ static int tool_verdict(json_object *a, char **res) {
     char *text, *pane = author ? find_agent(author) : NULL;
     if (!strcmp(verdict, "approve")) {
         text = fmt("new fleet tool %s v%d by %s; see tools/list", name, version, author ? author : "?");
+        char *vid = fmt("%s-v%d", name, version);
+        deliver(pane, author ? author : "?", p.key, vid, text);
+        free(vid);
         free(announce(db, p.key, caller_name, text, caller_pane, 0));   /* by key: a sweep may already have unmapped the reviewer's copy */
     } else if (!strcmp(verdict, "reject")) {
         text = fmt("fleet tool %s v%d was rejected: %s", name, version, reason ? reason : "");
@@ -2219,7 +2221,10 @@ static int tool_verdict(json_object *a, char **res) {
         free(announce(db, p.key, caller_name, text, pane, 0));   /* the board keeps the reason if the author's pane is gone */
     } else {
         needs_human(db, p.key, name, version, reason && *reason ? reason : "the reviewer could not decide");
-        text = NULL;
+        text = fmt("fleet tool %s v%d escalated: %s", name, version, reason ? reason : "");
+        char *vid = fmt("%s-v%d", name, version);
+        deliver(pane, author ? author : "?", p.key, vid, text);
+        free(vid);
     }
     sqlite3_close(db);
     free(text);
