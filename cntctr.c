@@ -61,6 +61,7 @@ static int cancelled(void) {
 }
 
 static char client_name[64] = "agent";   /* clientInfo.name from initialize */
+static long long server_start = LLONG_MAX;  /* no pane match if tmux start time is unavailable */
 static char self_pane[32];               /* our tmux pane id, e.g. "%3"; empty outside tmux */
 static char self_name[128];              /* our agent name (the pane's @cntctr_name) */
 /* Who the current tool call is from: self_*, or the `from` argument when one shared
@@ -1662,7 +1663,7 @@ static int unread_count(const char *pane, const char *name) {
     resolve_project(db, pane, &p);
     long long after = seen_of(name), newest = after;
     int count = 0;
-    free(kb_unread(db, p.key, name, pane, after, &newest, &count));
+    free(kb_unread(db, p.key, name, pane, server_start, after, &newest, &count));
     sqlite3_close(db);
     if (!count && newest > after) set_seen(name, newest);   /* only our own posts were new */
     return count;
@@ -1677,10 +1678,11 @@ static int mail_waiting(const char *pane, const char *name) {
     resolve_project(db, pane, &p);
     sqlite3_stmt *st = NULL;
     int waiting = 0;
-    if (sqlite3_prepare_v2(db, "SELECT 1 FROM mail JOIN posts ON posts.rowid=mail.post WHERE (name=?1 OR pane=?3) AND scope=?2 AND delivered=0 LIMIT 1", -1, &st, NULL) == SQLITE_OK) {
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM mail JOIN posts ON posts.rowid=mail.post WHERE (name=?1 OR (pane=?3 AND posts.at>=?4)) AND scope=?2 AND delivered=0 LIMIT 1", -1, &st, NULL) == SQLITE_OK) {
         sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 2, p.key, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 3, pane, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 4, server_start);
         waiting = sqlite3_step(st) == SQLITE_ROW;
     }
     sqlite3_finalize(st);
@@ -1780,11 +1782,20 @@ static int tool_board(json_object *a, char **res) {
     struct project p;
     sqlite3 *db = kb_for_caller(&p, res);
     if (!db) return 1;
-    char *out = kb_board(db, p.key, caller_name, caller_pane, limit);
-    long long newest = 0;
+    if (sqlite3_exec(db, "BEGIN", NULL, NULL, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return fail(res, fmt("cannot read board snapshot"));
+    }
+    char *out = kb_board(db, p.key, caller_name, caller_pane, server_start, limit);
+    long long after = seen_of(caller_name), newest = 0;
     int unseen = 0;
-    free(kb_unread(db, p.key, caller_name, caller_pane, seen_of(caller_name), &newest, &unseen));
-    int omitted = kb_omitted(db, p.key, caller_name, caller_pane, seen_of(caller_name), limit);
+    free(kb_unread(db, p.key, caller_name, caller_pane, server_start, after, &newest, &unseen));
+    int omitted = kb_omitted(db, p.key, caller_name, caller_pane, server_start, after, limit);
+    if (sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
+        free(out);
+        sqlite3_close(db);
+        return fail(res, fmt("cannot read board snapshot"));
+    }
     if (*caller_name) set_seen(caller_name, newest);
     if (omitted > 0) {
         char *more = fmt("%s\n%d older unread posts were not shown", out, omitted);
@@ -2743,10 +2754,11 @@ static int redeliver_for(const char *pane, const char *name) {
     resolve_project(db, pane, &p);
     sqlite3_stmt *st = NULL;
     int pending = 0;
-    if (sqlite3_prepare_v2(db, "SELECT post FROM mail JOIN posts ON posts.rowid=mail.post WHERE (name=?1 OR pane=?3) AND scope=?2 AND delivered=0", -1, &st, NULL) == SQLITE_OK) {
+    if (sqlite3_prepare_v2(db, "SELECT post FROM mail JOIN posts ON posts.rowid=mail.post WHERE (name=?1 OR (pane=?3 AND posts.at>=?4)) AND scope=?2 AND delivered=0", -1, &st, NULL) == SQLITE_OK) {
         sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 2, p.key, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 3, pane, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 4, server_start);
         json_object *ids = json_object_new_array();
         int step;
         while ((step = sqlite3_step(st)) == SQLITE_ROW)
@@ -3181,6 +3193,13 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < sizeof BUSY / sizeof *BUSY; i++) regcomp(&busy_re[i], BUSY[i], REG_EXTENDED | REG_ICASE | REG_NOSUB);
     regcomp(&resets_re, "(resets( in)?|continuing automatically at) +([0-9][0-9:hmsapHMSAP ]*(\\([^)]*\\))?)", REG_EXTENDED | REG_ICASE);
     if (argc > 1 && strcmp(argv[1], "tools") == 0) return tools_cmd(argc, argv);
+    char *started = NULL;
+    if (TMUX(NULL, &started, "display", "-p", "#{start_time}") == 0) {
+        char *end;
+        long long value = strtoll(started, &end, 10);
+        if (*started && !*end && value > 0) server_start = value;
+    }
+    free(started);
     char *line = NULL;
     size_t cap = 0;
     while (getline(&line, &cap, stdin) > 0) handle(line);

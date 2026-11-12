@@ -2132,5 +2132,27 @@ refute "T49 body id is not used in end marker" "$(screen "$M3_B49")" "[cntctr en
 
 daemon_stop
 
+# T50: a pane ID reused by a later tmux server does not own old mail.
+M3_DIR50="$(realpath "$TMPD")/m3_repo50"; mkdir -p "$M3_DIR50"
+M3_A50=$(newpane m3_old50 -c "$M3_DIR50" sh)
+M3_W50=$(newpane m3_w50 -c "$M3_DIR50" sh)
+tid50=$(txt "$(call "$M3_A50" send '{"to":"m3_w50","text":"task 50"}')" | sed 's/sent id=//')
+t send-keys -t "$M3_A50" "printf 'Do you want to proceed?'" Enter
+expect_screen "T50 sender prompt" "$M3_A50" "Do you want to proceed?"
+call "$M3_W50" reply "{\"id\":\"$tid50\",\"text\":\"private reply 50\"}" >/dev/null
+start50=$(t display -p '#{start_time}')
+sq "$CNTCTR_DB" "UPDATE posts SET at=$start50-1 WHERE scope='$M3_DIR50' AND text LIKE 'for m3_old50 (reply id=$tid50):%'"
+t set -p -t "$M3_A50" @cntctr_name m3_new50
+refute "T50 reused pane has no unread mail" "$(notice "$(call "$M3_A50" list '{}')")" "unread board post"
+refute "T50 reused pane board hides mail" "$(txt "$(call "$M3_A50" board '{}')")" "private reply 50"
+t send-keys -t "$M3_A50" C-c
+t send-keys -t "$M3_A50" clear Enter
+t send-keys -t "$M3_A50" 'stty -echo; exec cat' Enter
+daemon_start "$M3_A50"
+sleep 3
+refute "T50 reused pane receives no mail" "$(screen "$M3_A50")" "private reply 50"
+same "T50 mail remains undelivered" "$(sq "$CNTCTR_DB" "SELECT delivered FROM mail JOIN posts ON posts.rowid=mail.post WHERE scope='$M3_DIR50' AND text LIKE 'for m3_old50 (reply id=$tid50):%'")" 0
+daemon_stop
+
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
