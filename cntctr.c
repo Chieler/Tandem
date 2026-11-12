@@ -40,6 +40,8 @@ static pthread_cond_t live_cv = PTHREAD_COND_INITIALIZER;
 /* A running tools/call. The client can cancel it; so does stdin EOF. */
 struct call { json_object *req, *id; int cancelled; struct call *next; };
 static struct call *calls;                                    /* guarded by live_mu */
+static pthread_mutex_t mail_mu = PTHREAD_MUTEX_INITIALIZER;
+static char mail_pane[32], mail_name[128];   /* FIFO thread's identity, guarded by mail_mu */
 static _Thread_local struct call *this_call;
 
 /* Mark the call with JSON-RPC id `id` cancelled, or every call if `id` is NULL. */
@@ -2309,9 +2311,12 @@ static int dispatch_as(const char *pane, const char *name, const char *tool, jso
 }
 
 /* Resolve the caller from self and `from`, then run as that caller. */
+static void learn_mail_identity(const char *pane, const char *name);
+
 static int dispatch(const char *name, json_object *args, char **res) {
     char *err = set_caller(args);
     if (err) return fail(res, err);
+    learn_mail_identity(caller_pane, caller_name);
     char pane[sizeof caller_pane], who[sizeof caller_name];   /* dispatch_as overwrites caller_* */
     memcpy(pane, caller_pane, sizeof pane);
     memcpy(who, caller_name, sizeof who);
@@ -2536,20 +2541,92 @@ static void notify_all(void) {
     if (d) closedir(d);
 }
 
+/* Only the FIFO watcher retries mail, sleeping indefinitely when its queue is empty. */
+static int redeliver_mail(void) {
+    char pane[32], name[128];
+    pthread_mutex_lock(&mail_mu);
+    snprintf(pane, sizeof pane, "%s", mail_pane);
+    snprintf(name, sizeof name, "%s", mail_name);
+    pthread_mutex_unlock(&mail_mu);
+    if (!*pane || !*name) return 0;
+    char *err = NULL;
+    sqlite3 *db = kb(&err);
+    free(err);
+    if (!db) return 0;
+    struct project p;
+    resolve_project(db, pane, &p);
+    sqlite3_stmt *st = NULL;
+    int pending = 0;
+    if (sqlite3_prepare_v2(db, "SELECT post FROM mail JOIN posts ON posts.rowid=mail.post WHERE name=?1 AND scope=?2 AND delivered=0", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, p.key, -1, SQLITE_TRANSIENT);
+        /* Collect ids before injecting: do not keep a SQLite read transaction across terminal IO. */
+        json_object *ids = json_object_new_array();
+        while (sqlite3_step(st) == SQLITE_ROW) json_object_array_add(ids, json_object_new_int64(sqlite3_column_int64(st, 0)));
+        sqlite3_finalize(st);
+        st = NULL;
+        for (size_t i = 0; i < json_object_array_length(ids); i++) {
+            long long id = json_object_get_int64(json_object_array_get_idx(ids, i));
+            char key[64];
+            snprintf(key, sizeof key, "mail-%lld", id);
+            int lock = lock_pane(key, &err);
+            free(err);
+            err = NULL;
+            if (lock < 0) { pending = 1; continue; }
+            if (sqlite3_prepare_v2(db, "SELECT text FROM posts JOIN mail ON posts.rowid=mail.post WHERE post=?1 AND delivered=0", -1, &st, NULL) == SQLITE_OK) {
+                sqlite3_bind_int64(st, 1, id);
+                char *body = sqlite3_step(st) == SQLITE_ROW ? strdup((const char *)sqlite3_column_text(st, 0)) : NULL;
+                sqlite3_finalize(st);
+                st = NULL;
+                if (body) {
+                    err = inject(pane, name, body);
+                    if (!err && sqlite3_prepare_v2(db, "UPDATE mail SET delivered=1 WHERE post=?1", -1, &st, NULL) == SQLITE_OK) {
+                        sqlite3_bind_int64(st, 1, id);
+                        if (sqlite3_step(st) != SQLITE_DONE) pending = 1;
+                        sqlite3_finalize(st);
+                        st = NULL;
+                    } else pending = 1;
+                    free(body), free(err);
+                    err = NULL;
+                }
+            } else pending = 1;
+            close(lock);
+        }
+        json_object_put(ids);
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return pending;
+}
+
+static void learn_mail_identity(const char *pane, const char *name) {
+    if (!*pane || !*name) return;
+    pthread_mutex_lock(&mail_mu);
+    int changed = strcmp(mail_pane, pane) || strcmp(mail_name, name);
+    snprintf(mail_pane, sizeof mail_pane, "%s", pane);
+    snprintf(mail_name, sizeof mail_name, "%s", name);
+    pthread_mutex_unlock(&mail_mu);
+    if (changed) notify_all();
+}
+
 /* Turn any bytes in our FIFO into one list_changed; a burst is one notification. */
 static void *fifo_watch(void *arg) {
     struct pollfd pf = {(int)(intptr_t)arg, POLLIN, 0};
     char buf[256];
+    int pending = redeliver_mail();
     for (;;) {
-        if (poll(&pf, 1, -1) < 1) {
+        int ready = poll(&pf, 1, pending ? 30000 : -1);
+        if (ready < 0) {
             if (errno == EINTR) continue;
             return NULL;
         }
+        if (!ready) { pending = redeliver_mail(); continue; }
         while (read(pf.fd, buf, sizeof buf) > 0) {}   /* until EAGAIN: our own keepalive writer means never EOF */
         json_object *m = json_object_new_object();
         json_object_object_add(m, "jsonrpc", json_object_new_string("2.0"));
         json_object_object_add(m, "method", json_object_new_string("notifications/tools/list_changed"));
         emit(m);
+        pending = redeliver_mail();
     }
 }
 
@@ -2622,6 +2699,7 @@ static json_object *initialize(json_object *params) {
     const char *version = sarg(params, "protocolVersion");
     if (name && *name) snprintf(client_name, sizeof client_name, "%s", name);
     find_self();
+    learn_mail_identity(self_pane, self_name);
 
     json_object *r = json_object_new_object(), *caps = json_object_new_object(), *server = json_object_new_object();
     json_object *tcap = json_object_new_object();
