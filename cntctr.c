@@ -991,6 +991,7 @@ static void finish_pending(struct gathered *items, size_t n) {
         if (strcmp(it->status, "answered") == 0) {
             if (gone) {
                 /* A reply already read by this waiter still needs durable delivery on cancellation. */
+                unwait(it->id);
                 char *err = TMUXE(it->text, "load-buffer", "-b", buf, "-");
                 if (!err) deliver_buffer(buf, it->id, it->agent ? it->agent : "?");
                 free(err);
@@ -1178,6 +1179,7 @@ static int start_send(json_object *a, int wait, char id[9], char **pane_out, cha
     }
     err = inject(pane, label, env);
     free(env);
+    if (err && wait && !pane_alive(pane)) { free(err); err = NULL; }
     if (err) {
         if (!re || !*re) untrack(id);
         else if (add_wait) unwait(id);
