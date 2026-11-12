@@ -2600,6 +2600,7 @@ static json_object *tools_list(void) {
                 break;
             }
     }
+    /* MCP has no client list_changed capability; the client name is the only signal. */
     if (strcasestr(client_name, "codex")) return r;
     char *err = NULL;
     sqlite3 *db = kb(&err);

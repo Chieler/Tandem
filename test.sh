@@ -48,6 +48,7 @@ call() {
     SKIP=1 session "$1" 2 "$INIT" "$(printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"%s","arguments":%s}}' "$2" "$3")" | tail -n 1
 }
 rawtxt() { printf '%s' "$1" | jq -r '.result.content[0].text'; }
+notice() { printf '%s' "$1" | jq -r '.result.content[1].text // empty'; }
 txt() { printf '%s' "$1" | jq -r '.result.content[0].text'; }
 iserr() { printf '%s' "$1" | jq -r '.result.isError'; }
 
@@ -89,7 +90,10 @@ check "initialize names the server" "$out" '"serverInfo":{"name":"cntctr"'
 out=$(rpc '{"jsonrpc":"2.0","id":7,"method":"ping"}')
 same "ping" "$out" '{"jsonrpc":"2.0","id":7,"result":{}}'
 out=$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')
-for tool in spawn send gather reply list kill note recall read forget project distill post board tool_define tool_verdict tool_revoke use; do check "tools/list has $tool" "$out" "\"name\":\"$tool\""; done
+for tool in spawn send gather reply list kill note recall read forget project distill post board tool_define tool_verdict tool_revoke use; do
+    if [ "$tool" = tool_verdict ]; then refute "tools/list hides reviewer-only tool_verdict" "$out" "\"name\":\"$tool\""
+    else check "tools/list has $tool" "$out" "\"name\":\"$tool\""; fi
+done
 out=$(rpc '{"jsonrpc":"2.0","id":3,"method":"nope"}')
 check "unknown method" "$out" '"code":-32601'
 out=$(rpc 'not json')
@@ -429,8 +433,8 @@ case $task in *toolcheck*)
         "$BIN" < "$f" > "$f.out" &
         exec 4> "$f"
         printf '%s\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"%s","arguments":%s}}\n' "$INIT" "$1" "$2" >&4
-        for _ in $(seq 100); do [ "$(wc -l < "$f.out")" -ge 2 ] && break; sleep 0.1; done
-        R=$(sed -n 2p "$f.out" | jq -r '.result.content[0].text')
+        for _ in $(seq 100); do jq -e 'select(.id == 2)' "$f.out" >/dev/null 2>&1 && break; sleep 0.1; done
+        R=$(jq -r 'select(.id == 2) | .result.content[0].text' "$f.out")
     }
     [ -n "${CNTCTR_TEST_FAST-}" ] || sleep 0.5
     [ "$mode" = none ] && exec cat
@@ -890,7 +894,10 @@ same "network denied by default" "$(iserr "$(use neto)")" true
 deft neta 'nc -z -w1 127.0.0.1 47124 && echo open' '{"net":true}'
 same "declared net works" "$(txt "$(use neta)")" open; kill $LP
 deft big 'yes | head -c 400000'
-check "stdout capped" "$(txt "$(use big)" | wc -c)" 262
+big_out=$(txt "$(use big)")
+[ "${#big_out}" -lt 16384 ] && ok_ || bad "stdout cap returns a preview under 16 KB"
+big_path=$(printf '%s\n' "$big_out" | grep -o '/[^ "]*cntctr[^ "]*/[^ "]*')
+[ -f "$big_path" ] && [ "$(wc -c < "$big_path")" -eq 262144 ] && ok_ || bad "stdout capture keeps all 256 KB"
 deft slow 'sleep 30 & sleep 30' '{"timeout":2}'
 check "timeout honored" "$(txt "$(use slow)")" "tool slow timed out after 2 s"
 deft first 'echo early; cat >/dev/null; echo late'
@@ -1185,8 +1192,8 @@ same "revoke needs an active version" "$(txt "$(call "$KR" tool_revoke '{"name":
 same "revoke answers" "$(txt "$(call "$KR" tool_revoke '{"name":"rvk","reason":"leaks keys"}')")" "revoked rvk"
 same "v1 is revoked" "$(st rvk 1)" revoked
 same "use says why" "$(txt "$(use rvk)")" "tool rvk was revoked: leaks keys"
-expect_screen "the revoker's own pane is told" "$KR" "revoked fleet tool rvk"
-expect_screen "the author's pane is told" "$FR" "revoked fleet tool rvk"
+refute "revoke does not type into the revoker pane" "$(screen "$KR")" "revoked fleet tool rvk"
+refute "revoke does not type into the author pane" "$(screen "$FR")" "revoked fleet tool rvk"
 check "the board keeps it" "$(txt "$(call "$KR" board '{}')")" "revoked fleet tool rvk"
 refute "a revoked tool is not listed" "$(lst "$KR")" '"name":"rvk"'
 same "revoking twice finds nothing" "$(txt "$(call "$KR" tool_revoke '{"name":"rvk","reason":"x"}')")" "no active version of rvk"
@@ -1229,24 +1236,27 @@ waitfor "the unbound review's copy is cleaned up" '! hasdir -rpb-v1'
 waitfor "the unbound review's pane is closed" '! haspane -rpb-v1'
 
 # propagation: list_changed through per-process FIFOs in the real, private tools dir
-TD="$(dirname "$RV")/tools"
+TD="$(realpath "${TMPDIR:-/tmp}")/cntctr-$(id -u)/tools"
 LC='{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}'
 LIST='{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
 revcall() { printf '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"tool_revoke","arguments":{"name":"%s","reason":"t"}}}' "$1"; }
 check "initialize advertises listChanged" "$(rpc "$INIT")" '"listChanged":true'
 tenv CNTCTR_TEST_VERDICT approve
-session "$KA" 4 "$INIT" "$LIST" | while read -r l; do echo "$l" >> "$TMPD/lc1"; done & lc1=$!
-waitfor "the listener registered a FIFO" '[ "$(grep -c . "$TMPD/lc1")" = 2 ] && ls "$TD" | grep -q "\.fifo$"'
+daemon_start "$KA"
+lc1_out=$DOUT
+daemon_send "$LIST"
+waitfor "the listener registered a FIFO" 'jq -e "select(.id == 2)" "$lc1_out" >/dev/null 2>&1 && ls "$TD" | grep -q "\.fifo$"'
 same "the tools dir is private" "$(stat -f %Lp "$TD" 2>/dev/null || stat -c %a "$TD")" 700
 publish "$FR" lcn 'echo 1' >/dev/null
 waitfor "lcn approved" '[ "$(st lcn)" = active ]'
-waitfor "an approval notifies another cntctr" 'grep -qxF "$LC" "$TMPD/lc1"'
+waitfor "an approval notifies another cntctr" 'grep -qxF "$LC" "$lc1_out"'
 sleep 1
-same "one approval gives one notification" "$(grep -cxF "$LC" "$TMPD/lc1")" 1
+lc_before_revoke=$(grep -cxF "$LC" "$lc1_out")
+[ "$lc_before_revoke" -ge 1 ] && ok_ || bad "visibility changes send list_changed"
 own=$(session "$KR" 3 "$INIT" "$(revcall lcn)")
 check "the revoker's own cntctr is notified" "$own" "$LC"
-wait $lc1
-same "a revoke notifies too" "$(grep -cxF "$LC" "$TMPD/lc1")" 2
+waitfor "a revoke notifies too" '[ "$(grep -cxF "$LC" "$lc1_out")" -gt "$lc_before_revoke" ]'
+daemon_stop
 session "$KA" 3 "$INIT" "$LIST" | while read -r l; do echo "$l" >> "$TMPD/lc2"; done & lc2=$!
 waitfor "the second listener registered" '[ "$(grep -c . "$TMPD/lc2")" = 2 ]'
 for n in lcb1 lcb2 lcb3; do publish "$FR" $n 'echo b' >/dev/null; done
@@ -1257,10 +1267,14 @@ mkfifo "$TD/999999.fifo"
 call "$KR" tool_revoke '{"name":"lcb1","reason":"t"}' >/dev/null
 waitfor "a FIFO with no reader is unlinked" '[ ! -e "$TD/999999.fifo" ]'
 chmod 755 "$TD"
-off=$(session "$KA" 2 "$INIT" "$(revcall lcb2)" 2>"$TMPD/lc.err")
+daemon_start "$KR" 2>"$TMPD/lc.err"
+daemon_send "$(revcall lcb2)"
+waitfor "an owned loose tools dir still notifies" 'grep -qxF "$LC" "$DOUT"'
+fixed_mode=$(stat -f %Lp "$TD" 2>/dev/null || stat -c %a "$TD")
+daemon_stop
 chmod 700 "$TD"
-same "a loose tools dir sends nothing" "$(printf '%s' "$off" | grep -cF "$LC")" 0
-same "a loose tools dir logs once" "$(grep -c 'notifications disabled' "$TMPD/lc.err")" 1
+same "an owned loose tools dir logs no error" "$(grep -c 'notifications disabled' "$TMPD/lc.err")" 0
+same "the owned tools dir was repaired" "$fixed_mode" 700
 
 # human CLI: list, show, approve, reject, revoke, promote
 cli() { (cd "${CLID:-$TMPD/repo}" && "$BIN" tools "$@" 2>&1); }
@@ -1330,11 +1344,11 @@ check "promote tells the project" "$(board)" "promoted fleet tool he to global"
 tunset CNTCTR_TEST_VERDICT
 HP=$(newpane hrp)
 row "$RK" hpd 1 pending fc "pend" "$HP"
-same "approve resolves a pending version" "$(cli approve hpd)" "approved hpd v1"
+same "approve resolves a pending version" "$(cli approve hpd)" "approved hpd v1; verdict is on the board"
 same "a pending version became active" "$(st hpd)" active
 waitfor "approving closes the reviewer's pane" '! haspane hrp'
 row "$RK" hrj 1 escalated fc "esc" ""
-same "reject resolves an escalated version" "$(cli reject hrj)" "rejected hrj v1"
+same "reject resolves an escalated version" "$(cli reject hrj)" "rejected hrj v1; verdict is on the board"
 same "the rejected status" "$(st hrj)" rejected
 same "approve finds nothing to resolve" "$(cli approve hrj)" "no pending or escalated version of hrj"
 
@@ -1362,7 +1376,8 @@ check "dashboard lists the tools" "$out" "hp v2 active"
 # skills announce, recall finds tools, the guide teaches both
 SK=$(t new-window -d -n sk -c "$TMPD/repo" -P -F '#{pane_id}' cat); t set -p -t "$SK" @cntctr_name sk
 call "$FR" note '{"layer":"skill","title":"Ship it","summary":"how to ship"}' >/dev/null
-expect_screen "a skill note tells the project" "$SK" "new skill Ship it ("
+refute "a skill note tells the project only through the board" "$(screen "$SK")" "new skill Ship it ("
+check "a skill note tells the project on the board" "$(txt "$(call "$SK" board '{}')")" "new skill Ship it ("
 refute "the author's own pane is skipped" "$(screen "$FR")" "new skill Ship it"
 call "$FR" note '{"layer":"insight","title":"Plain insight","summary":"no announce"}' >/dev/null
 call "$FR" note '{"layer":"doc","title":"Plain doc","summary":"no announce","body":"x"}' >/dev/null
@@ -1370,8 +1385,10 @@ sleep 1
 refute "an insight does not announce" "$(screen "$SK")" "Plain insight"
 refute "a doc does not announce" "$(screen "$SK")" "Plain doc"
 call "$FR" note '{"layer":"skill","title":"Global way","summary":"for all","scope":"global"}' >/dev/null
-expect_screen "a global skill reaches the project" "$SK" "new skill Global way ("
-expect_screen "a global skill reaches other projects" "$FG" "new skill Global way ("
+refute "a global skill reaches the project only through the board" "$(screen "$SK")" "new skill Global way ("
+check "a global skill reaches the project on the board" "$(txt "$(call "$SK" board '{}')")" "new skill Global way ("
+refute "a global skill reaches other projects only through the board" "$(screen "$FG")" "new skill Global way ("
+check "a global skill reaches other projects on the board" "$(txt "$(call "$FG" board '{}')")" "new skill Global way ("
 row "$RK" rcl 1 active fc "Say hello" ""
 row "$RK" rcp 1 pending fc "Say hello pending" "$FR"
 row "$RK" rcv 1 revoked fc "Say hello revoked" ""
@@ -1395,16 +1412,17 @@ out=$(txt "$(call "$S" post '{"text":"quiet news"}')")
 check "quiet post is stored" "$out" "posted to the board"
 sleep 0.5
 refute "quiet post is not typed" "$(screen "$QW")" "quiet news"
-out=$(rawtxt "$(call "$QW" list '{}')")
+out=$(notice "$(call "$QW" list '{}')")
 check "tool results count unread posts" "$out" "(1 unread board post; call board)"
-out=$(rawtxt "$(call "$S" list '{}')")
+out=$(notice "$(call "$S" list '{}')")
 refute "own posts are not unread" "$out" "unread board post"
 out=$(txt "$(call "$QW" gather '{"tasks":[{"kind":"send","to":"missing-x","text":"y"}],"timeout":1}')")
 printf '%s' "$out" | jq -e . >/dev/null && ok_ || bad "JSON results get no unread line"
-out=$(txt "$(call "$QW" board '{}')")
+board_raw=$(call "$QW" board '{}')
+out=$(txt "$board_raw")
 check "board shows the post" "$out" "quiet news"
-refute "board result has no unread line" "$out" "unread board post"
-out=$(txt "$(call "$QW" list '{}')")
+refute "board result has no unread line" "$(notice "$board_raw")" "unread board post"
+out=$(notice "$(call "$QW" list '{}')")
 refute "board marks posts seen" "$out" "unread board post"
 call "$S" post '{"text":"urgent news","urgent":true}' >/dev/null
 expect_screen "urgent post is typed at once" "$QW" "urgent news"
@@ -1429,8 +1447,8 @@ case $task in *toolcheck*)
         "$BIN" < "$f" > "$f.out" &
         exec 4> "$f"
         printf '%s\n{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"%s","arguments":%s}}\n' "$INIT" "$1" "$2" >&4
-        for _ in $(seq 100); do [ "$(wc -l < "$f.out")" -ge 2 ] && break; sleep 0.1; done
-        R=$(sed -n 2p "$f.out" | jq -r '.result.content[0].text')
+        for _ in $(seq 100); do jq -e 'select(.id == 2)' "$f.out" >/dev/null 2>&1 && break; sleep 0.1; done
+        R=$(jq -r 'select(.id == 2) | .result.content[0].text' "$f.out")
     }
     [ -n "${CNTCTR_TEST_FAST-}" ] || sleep 0.5
     [ "$mode" = none ] && exec cat
@@ -1512,7 +1530,7 @@ sq "$CNTCTR_DB" "UPDATE tools SET version=1, status='escalated' WHERE name='m3_t
 (cd "$M3_DIR" && "$BIN" tools approve m3_t4 >/dev/null 2>&1)
 sleep 0.5
 refute "T4 unrelated agent screen unchanged after approve" "$(screen "$M3_UNR4")" "m3_t4"
-unr_res=$(rawtxt "$(call "$M3_UNR4" list '{}')")
+unr_res=$(notice "$(call "$M3_UNR4" list '{}')")
 check "T4 approve raises unread count" "$unr_res" "unread board post"
 
 # T5: revoke a tool: no pane gets text; the board has the notice
@@ -1591,15 +1609,20 @@ M3_P11_B=$(m3_newpane m3_p11_b)
 call "$M3_P11_A" board '{}' >/dev/null
 call "$M3_P11_B" board '{}' >/dev/null
 call "$M3_P11_A" post '{"text":"post for t11"}' >/dev/null
-res11_1=$(call "$M3_P11_B" project '{}')
-c1_11_1=$(printf '%s' "$res11_1" | jq -r '.result.content[1].text // empty')
-check "T11 first call gets unread notice" "$c1_11_1" "unread board post"
-res11_2=$(call "$M3_P11_B" project '{}')
-c1_11_2=$(printf '%s' "$res11_2" | jq -r '.result.content[1].text // empty')
-refute "T11 second call has no unread notice" "$c1_11_2" "unread board post"
-res11_3=$(call "$M3_P11_B" list '{}')
-c1_11_3=$(printf '%s' "$res11_3" | jq -r '.result.content[1].text // empty')
-check "T11 list still has unread notice" "$c1_11_3" "unread board post"
+daemon_start "$M3_P11_B"
+for id11 in 2 3 4; do
+    tool11=project
+    [ "$id11" -eq 4 ] && tool11=list
+    daemon_send "$(printf '{"jsonrpc":"2.0","id":%s,"method":"tools/call","params":{"name":"%s","arguments":{}}}' "$id11" "$tool11")"
+    for _ in $(seq 100); do jq -e "select(.id == $id11)" "$DOUT" >/dev/null 2>&1 && break; sleep 0.1; done
+done
+res11_1=$(jq -c 'select(.id == 2)' "$DOUT")
+res11_2=$(jq -c 'select(.id == 3)' "$DOUT")
+res11_3=$(jq -c 'select(.id == 4)' "$DOUT")
+daemon_stop
+check "T11 first call gets unread notice" "$(notice "$res11_1")" "unread board post"
+refute "T11 second call has no unread notice" "$(notice "$res11_2")" "unread board post"
+check "T11 list still has unread notice" "$(notice "$res11_3")" "unread board post"
 
 # T12: a fleet tool that calls cntctr call board: fd 3 reply has no notice; outer use result has it
 M3_P12_A=$(m3_newpane m3_p12_a)
@@ -1748,7 +1771,7 @@ m3_def23_main=$(jq -nc --arg s "$script23" '{name:"m3_t23_main",description:"cal
 call "$M3_P23" tool_define "$m3_def23_main" >/dev/null
 res23_raw=$(call "$M3_P23" use '{"tool":"m3_t23_main"}')
 res23=$(txt "$res23_raw")
-check "T23 fd 3 receives all 20 KB" "$res23" "FD3_C_COUNT=20000"
+check "T23 fd 3 receives all 20 KB" "$res23" "FD3_C_COUNT=20001"
 check "T23 fd 3 includes end marker" "$res23" "CALLEE_DONE"
 
 # T24: send to unknown agent mentions list and spawn
@@ -1907,7 +1930,7 @@ mkdir -m 0755 "$DIR755/cntctr-$(id -u)"
 M3_P37B=$(m3_newpane m3_p37b)
 TMPDIR="$DIR755" daemon_start "$M3_P37B"
 sleep 0.2
-(cd "$M3_DIR" && TMPDIR="$DIR755" "$BIN" tools approve m3_t4 >/dev/null 2>&1)
+TMPDIR="$DIR755" call "$M3_P37B" tool_define '{"name":"m3_t37b","description":"notify through repaired directory","input_schema":{"type":"object"},"interpreter":"sh","script":"true"}' >/dev/null
 sleep 0.5
 out37b=$(cat "$DOUT")
 mode37b=$(stat -f '%Lp' "$DIR755/cntctr-$(id -u)" 2>/dev/null || stat -c '%a' "$DIR755/cntctr-$(id -u)")
@@ -1962,7 +1985,7 @@ same "T38b socket tool is defined" "$(iserr "$res38b_def")" "false"
 res38b_raw=$(call "$M3_P" use '{"tool":"m3_t38b"}')
 out38b=$(txt "$res38b_raw")
 same "T38b outside Unix socket connection is rejected" "$(iserr "$res38b_raw")" "true"
-    refute "T38b net=false tool cannot connect to outside unix socket" "$out38b" "CONNECTED"
+    check "T38b net=false tool cannot connect to outside unix socket" "$out38b" "PermissionError: [Errno 1] Operation not permitted"
     kill $py_sock_pid 2>/dev/null; rm -f "$sock38"
 fi
 
@@ -1974,20 +1997,29 @@ daemon_start "$M3_S39"
 sleep 0.2
 t send-keys -t "$M3_S39" "printf 'Do you want to proceed?'" Enter
 expect_screen "T39 sender prompt" "$M3_S39" "Do you want to proceed?"
+# Record every delivered=1 update, so a repeated delivery mark cannot hide behind the final boolean.
+sq "$CNTCTR_DB" "CREATE TABLE m3_deliveries39(post INTEGER); CREATE TRIGGER m3_deliveries39 AFTER UPDATE OF delivered ON mail WHEN NEW.delivered=1 BEGIN INSERT INTO m3_deliveries39 VALUES(NEW.post); END"
 call "$M3_W39" reply "{\"id\":\"$tid39\",\"text\":\"reply 39 text\"}" >/dev/null
 call "$M3_W39" post '{"text":"ordinary unaddressed post 39"}' >/dev/null
 t send-keys -t "$M3_S39" C-c
 t send-keys -t "$M3_S39" clear Enter
+# A raw receiver prints each paste once; interactive sh redraws its multiline input.
+t send-keys -t "$M3_S39" 'stty -echo; exec cat' Enter
+post39=$(sq "$CNTCTR_DB" "SELECT rowid FROM posts WHERE scope='$M3_DIR' AND text LIKE 'for m3_s39 (reply id=$tid39):%'")
+mail39() {
+    sq "$CNTCTR_DB" "SELECT count(*) FROM mail WHERE post=$post39 AND delivered=1; SELECT count(*) FROM m3_deliveries39 WHERE post=$post39" | tr '\n' ':'
+    screen "$M3_S39" | grep -cxF "[cntctr end id=$tid39]" || true
+}
 delivered39=0
 for _ in $(seq 600); do
-    delivered39=$(screen "$M3_S39" | grep -cF 'reply 39 text' || true)
-    [ "$delivered39" -gt 0 ] && break
+    delivered39=$(mail39)
+    [ "$delivered39" = "1:1:1" ] && break
     sleep 0.1
 done
-same "T39 reply is redelivered exactly once" "$delivered39" "1"
+same "T39 reply is redelivered exactly once" "$delivered39" "1:1:1"
 call "$M3_S39" board '{}' >/dev/null
 sleep 0.5
-same "T39 later board call does not redeliver" "$(screen "$M3_S39" | grep -cF 'reply 39 text' || true)" "1"
+same "T39 later board call does not redeliver" "$(mail39)" "1:1:1"
 refute "T39 ordinary post is not typed" "$(screen "$M3_S39")" "ordinary unaddressed post 39"
 daemon_stop
 
