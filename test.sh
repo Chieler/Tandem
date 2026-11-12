@@ -2154,5 +2154,17 @@ refute "T50 reused pane receives no mail" "$(screen "$M3_A50")" "private reply 5
 same "T50 mail remains undelivered" "$(sq "$CNTCTR_DB" "SELECT delivered FROM mail JOIN posts ON posts.rowid=mail.post WHERE scope='$M3_DIR50' AND text LIKE 'for m3_old50 (reply id=$tid50):%'")" 0
 daemon_stop
 
+# T51: an empty pane ID matches no stored mail.
+M3_DIR51="$(realpath "$TMPD")/m3_repo51"; mkdir -p "$M3_DIR51"
+M3_A51=$(newpane m3_a51 -c "$M3_DIR51" sh)
+start51=$(t display -p '#{start_time}')
+sq "$CNTCTR_DB" "INSERT INTO posts(scope, sender, text, at) VALUES('$M3_DIR51', 'sender51', 'for m3_a51 (reply id=t51):\nprivate mail 51', $((start51 + 5))); INSERT INTO mail(post, name, pane) VALUES(last_insert_rowid(), 'm3_a51', '')"
+call "$M3_A51" post '{"text":"ordinary post 51"}' >/dev/null
+res51=$(cd "$M3_DIR51" && call "" board '{}')
+res51_1=$(cd "$M3_DIR51" && call "" board '{"limit":1}')
+refute "T51 paneless board hides mail" "$(txt "$res51")" "private mail 51"
+refute "T51 paneless board has no unread notice" "$(txt "$res51_1")" "older unread posts were not shown"
+check "T51 addressee board lists mail" "$(txt "$(call "$M3_A51" board '{}')")" "private mail 51"
+
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

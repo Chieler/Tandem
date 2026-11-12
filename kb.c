@@ -269,7 +269,7 @@ char *kb_tool_projects(sqlite3 *db) {
 char *kb_board(sqlite3 *db, const char *scope, const char *me, const char *pane, long long server_start, int limit) {
     sqlite3_stmt *st = prep(db,
         "SELECT line FROM (SELECT rowid, datetime(at, 'unixepoch') || ' ' || sender || ': ' || text AS line FROM posts"
-        " WHERE scope = ?1 AND NOT EXISTS (SELECT 1 FROM mail WHERE mail.post = posts.rowid AND (mail.name != ?3 AND (mail.pane != ?4 OR posts.at <= ?5))) ORDER BY rowid DESC LIMIT ?2) ORDER BY rowid");
+        " WHERE scope = ?1 AND NOT EXISTS (SELECT 1 FROM mail WHERE mail.post = posts.rowid AND (mail.name != ?3 AND (mail.pane != ?4 OR posts.at <= ?5 OR ?4 = ''))) ORDER BY rowid DESC LIMIT ?2) ORDER BY rowid");
     sqlite3_bind_text(st, 1, scope, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(st, 2, limit);
     sqlite3_bind_text(st, 3, me, -1, SQLITE_TRANSIENT);
@@ -713,7 +713,7 @@ int kb_tool_promote(sqlite3 *db, const char *project, const char *name, int *fro
 }
 char *kb_unread(sqlite3 *db, const char *scope, const char *me, const char *pane, long long server_start, long long after, long long *newest, int *count) {
     sqlite3_stmt *st = prep(db, "SELECT rowid, sender, text FROM posts WHERE scope = ?1 AND rowid > ?2 "
-        "AND (EXISTS (SELECT 1 FROM mail WHERE mail.post = posts.rowid AND (mail.name = ?3 OR (mail.pane = ?4 AND posts.at > ?5)) AND mail.delivered = 0) "
+        "AND (EXISTS (SELECT 1 FROM mail WHERE mail.post = posts.rowid AND (mail.name = ?3 OR (mail.pane = ?4 AND posts.at > ?5 AND ?4 != '')) AND mail.delivered = 0) "
         "OR (at >= strftime('%s', 'now') - 86400 AND NOT EXISTS (SELECT 1 FROM mail WHERE mail.post = posts.rowid))) ORDER BY rowid");
     sqlite3_bind_text(st, 1, scope, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 2, after);
@@ -739,10 +739,10 @@ char *kb_unread(sqlite3 *db, const char *scope, const char *me, const char *pane
 int kb_omitted(sqlite3 *db, const char *scope, const char *me, const char *pane, long long server_start, long long after, int limit) {
     sqlite3_stmt *st = prep(db,
         "SELECT count(*) FROM posts WHERE scope=?1 AND rowid>?2 AND sender!=?3 "
-        "AND (EXISTS (SELECT 1 FROM mail WHERE mail.post=posts.rowid AND (name=?3 OR (pane=?4 AND posts.at>?6)) AND delivered=0) "
+        "AND (EXISTS (SELECT 1 FROM mail WHERE mail.post=posts.rowid AND (name=?3 OR (pane=?4 AND posts.at>?6 AND ?4 != '')) AND delivered=0) "
         "OR (at >= strftime('%s','now') - 86400 AND NOT EXISTS (SELECT 1 FROM mail WHERE mail.post=posts.rowid))) "
         "AND rowid NOT IN (SELECT rowid FROM posts WHERE scope=?1 AND NOT EXISTS "
-        "(SELECT 1 FROM mail WHERE mail.post=posts.rowid AND name!=?3 AND (pane!=?4 OR posts.at<=?6)) ORDER BY rowid DESC LIMIT ?5)");
+        "(SELECT 1 FROM mail WHERE mail.post=posts.rowid AND name!=?3 AND (pane!=?4 OR posts.at<=?6 OR ?4 = '')) ORDER BY rowid DESC LIMIT ?5)");
     sqlite3_bind_text(st, 1, scope, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 2, after);
     sqlite3_bind_text(st, 3, me, -1, SQLITE_TRANSIENT);
