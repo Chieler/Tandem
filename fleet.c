@@ -180,7 +180,7 @@ static char *sbpl_str(const char *path) {
 static char *sbpl(const char *root, const char *tmp, const char *cache, const char *gitreal, int net) {
     char *git = fmt("%s/.git", root), *q[] = {sbpl_str(root), sbpl_str(tmp), sbpl_str(cache), sbpl_str(git),
                                                sbpl_str(gitreal ? gitreal : git)};
-    char *p = fmt("(version 1)(allow default)(deny file-write*)(deny file-link*)"
+    char *p = fmt("(version 1)(allow default)(deny file-write*)(deny file-link)"
                   "(allow file-write* (subpath %s) (subpath %s) (subpath %s) (subpath \"/dev\"))"
                   "(deny file-write* (subpath %s) (literal %s) (subpath %s) (literal %s))%s",
                   q[0], q[1], q[2], q[3], q[3], q[4], q[4], net ? "" : "(deny network*)(deny system-socket (socket-domain AF_UNIX))");
