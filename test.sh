@@ -2141,7 +2141,7 @@ t send-keys -t "$M3_A50" "printf 'Do you want to proceed?'" Enter
 expect_screen "T50 sender prompt" "$M3_A50" "Do you want to proceed?"
 call "$M3_W50" reply "{\"id\":\"$tid50\",\"text\":\"private reply 50\"}" >/dev/null
 start50=$(t display -p '#{start_time}')
-sq "$CNTCTR_DB" "UPDATE posts SET at=$start50-1 WHERE scope='$M3_DIR50' AND text LIKE 'for m3_old50 (reply id=$tid50):%'"
+sq "$CNTCTR_DB" "UPDATE posts SET at=$start50 WHERE scope='$M3_DIR50' AND text LIKE 'for m3_old50 (reply id=$tid50):%'"
 t set -p -t "$M3_A50" @cntctr_name m3_new50
 refute "T50 reused pane has no unread mail" "$(notice "$(call "$M3_A50" list '{}')")" "unread board post"
 refute "T50 reused pane board hides mail" "$(txt "$(call "$M3_A50" board '{}')")" "private reply 50"
