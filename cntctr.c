@@ -1272,7 +1272,7 @@ static int is_layer(const char *l) {
     return l && (strcmp(l, "insight") == 0 || strcmp(l, "skill") == 0 || strcmp(l, "doc") == 0);
 }
 
-static char *announce(sqlite3 *db, const char *scope, const char *sender, const char *text, const char *skip_pane);
+static char *announce(sqlite3 *db, const char *scope, const char *sender, const char *text, const char *skip_pane, int urgent);
 
 static int tool_note(json_object *a, char **res) {
     const char *layer = sarg(a, "layer"), *title = sarg(a, "title"), *summary = sarg(a, "summary");
@@ -1318,7 +1318,7 @@ static int tool_note(json_object *a, char **res) {
     if (mem) kb_set_mem(db, id, mem);
     if (strcmp(layer, "skill") == 0) {
         char *text = fmt("new skill %s (%s); read it with read", title, id);
-        free(announce(db, global ? NULL : p.key, caller_name, text, caller_pane));
+        free(announce(db, global ? NULL : p.key, caller_name, text, caller_pane, 0));
         free(text);
     }
     free(line);
@@ -1484,9 +1484,9 @@ static int unread_count(const char *pane, const char *name) {
     return count;
 }
 
-/* Keep `text` on the board of `scope` (NULL: every project) and type it into every live agent there except `skip_pane`
+/* Keep `text` on the board of `scope` (NULL: every project); urgent posts also type into live agents except `skip_pane`
    (NULL: none). Returns the "posted to ..." summary, or the error. Leaves `db` open. */
-static char *announce(sqlite3 *db, const char *scope, const char *sender, const char *text, const char *skip_pane) {
+static char *announce(sqlite3 *db, const char *scope, const char *sender, const char *text, const char *skip_pane, int urgent) {
     struct project q;
     char *panes, *posted = strdup("\n");   /* "\n" then "<key>\n" per board written, for scope NULL */
     if (scope && kb_post(db, scope, sender, text) != 0) return fmt("post failed: %s", sqlite3_errmsg(db));
@@ -1534,7 +1534,7 @@ static char *announce(sqlite3 *db, const char *scope, const char *sender, const 
             }
             free(mark);
         }
-        char *err = inject(line, name, env), **list = err ? &skipped : &sent;
+        char *err = urgent ? inject(line, name, env) : NULL, **list = err ? &skipped : &sent;
         t = err ? fmt("%s %s (%s)", *list, name, err) : fmt("%s %s", *list, name);
         free(*list);
         *list = t;
@@ -1562,7 +1562,7 @@ static int tool_post(json_object *a, char **res) {
         sqlite3_close(db);
         return rc ? fail(res, fmt("post failed")) : ok(res, fmt("posted to the board; agents see an unread count on their next cntctr call"));
     }
-    char *r = announce(db, p.key, caller_name, text, caller_pane);
+    char *r = announce(db, p.key, caller_name, text, caller_pane, 1);
     sqlite3_close(db);
     return strncmp(r, "posted to", 9) ? fail(res, r) : ok(res, r);
 }
@@ -1791,7 +1791,7 @@ static void review_cleanup(const char *pane, const char *root) {
 /* Ask project `key` for a human with a board post. */
 static void needs_human(sqlite3 *db, const char *key, const char *name, int version, const char *why) {
     char *text = fmt("fleet tool %s v%d needs a human: %s", name, version, why);
-    free(announce(db, key, caller_name, text, caller_pane));
+    free(announce(db, key, caller_name, text, caller_pane, 0));
     free(text);
 }
 
@@ -2002,11 +2002,11 @@ static int tool_verdict(json_object *a, char **res) {
     char *text, *pane = author ? find_agent(author) : NULL;
     if (!strcmp(verdict, "approve")) {
         text = fmt("new fleet tool %s v%d by %s; see tools/list", name, version, author ? author : "?");
-        free(announce(db, p.key, caller_name, text, caller_pane));   /* by key: a sweep may already have unmapped the reviewer's copy */
+        free(announce(db, p.key, caller_name, text, caller_pane, 0));   /* by key: a sweep may already have unmapped the reviewer's copy */
     } else if (!strcmp(verdict, "reject")) {
         text = fmt("fleet tool %s v%d was rejected: %s", name, version, reason ? reason : "");
         if (pane) free(inject(pane, author, text));
-        free(announce(db, p.key, caller_name, text, pane));   /* the board keeps the reason if the author's pane is gone */
+        free(announce(db, p.key, caller_name, text, pane, 0));   /* the board keeps the reason if the author's pane is gone */
     } else {
         needs_human(db, p.key, name, version, reason && *reason ? reason : "the reviewer could not decide");
         text = NULL;
@@ -2040,7 +2040,7 @@ static int tool_revoke(json_object *a, char **res) {
     free(reviews);
     notify_all();
     char *text = fmt("revoked fleet tool %s", name);
-    free(announce(db, p.key, caller_name, text, NULL));
+    free(announce(db, p.key, caller_name, text, NULL, 0));
     sqlite3_close(db);
     free(text);
     return ok(res, fmt("revoked %s", name));
@@ -2738,7 +2738,7 @@ static int tools_cmd(int argc, char **argv) {
         scope = NULL;
     }
     free(reviews);
-    if (text) free(announce(db, scope, "human", text, NULL));
+    if (text) free(announce(db, scope, "human", text, NULL, 0));
     sqlite3_close(db);
     if (*out) fprintf(rc ? stderr : stdout, "%s\n", out);
     free(out);
