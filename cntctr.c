@@ -1061,7 +1061,15 @@ static const char *ROUTES[3][4][2] = {
 static int route(const char *task) {
     for (size_t r = 0; r < sizeof RULES / sizeof *RULES; r++)
         for (int w = 0; RULES[r].words[w]; w++)
-            if (strcasestr(task, RULES[r].words[w])) return RULES[r].tier;
+            {
+                const char *word = RULES[r].words[w], *hit = task;
+                size_t n = strlen(word);
+                while ((hit = strcasestr(hit, word))) {
+                    if ((hit == task || (!isalnum((unsigned char)hit[-1]) && hit[-1] != '_')) &&
+                        !isalnum((unsigned char)hit[n]) && hit[n] != '_') return RULES[r].tier;
+                    hit++;
+                }
+            }
     return strlen(task) > 6000 ? 2 : 1;
 }
 
@@ -1071,15 +1079,18 @@ static int tool_list(json_object *args, char **res) {
     (void)args;
     char *out;
     if (TMUX(NULL, &out, "list-panes", "-a", "-F",
-             "#{@cntctr_name} #{@cntctr_harness} #{pane_id} #{?pane_dead,dead,alive} #{window_activity}") != 0)
+             "#{@cntctr_name}\t#{@cntctr_harness}\t#{pane_id}\t#{?pane_dead,dead,alive}\t#{window_activity}") != 0)
         return fail(res, out);
     char *opts = server_opts(), *list = strdup(""), *save;
     time_t now = time(NULL);
     for (char *line = strtok_r(out, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
-        if (*line == ' ') continue;   /* untagged panes have an empty name, so the line starts with a space */
-        char name[128], harness[64], pane[32], alive[8];
-        long long act = 0;
-        if (sscanf(line, "%127s %63s %31s %7s %lld", name, harness, pane, alive, &act) < 4) continue;
+        char *name = line, *harness = strchr(name, '\t');
+        char *pane = harness ? strchr(harness + 1, '\t') : NULL;
+        char *alive = pane ? strchr(pane + 1, '\t') : NULL;
+        char *activity = alive ? strchr(alive + 1, '\t') : NULL;
+        if (!activity || harness == name) continue;
+        *harness++ = *pane++ = *alive++ = *activity++ = '\0';
+        long long act = atoll(activity);
         char *resets = NULL, *tasks = strdup("");
         enum pstate st = pane_state(pane, &resets);
         for (const char *l = opts; *l; l += strcspn(l, "\n") + (l[strcspn(l, "\n")] == '\n')) {
@@ -1240,7 +1251,7 @@ static int tool_reply(json_object *a, char **res) {
     return ok(res, fmt(rc ? "reply is on the board" : "ok"));
 }
 
-static int start_spawn(json_object *a, int wait, char id[9], char **pane_out,
+static int spawn_locked(json_object *a, int wait, char id[9], char **pane_out,
                        char **summary, char **res) {
     const char *harness = sarg(a, "harness"), *name = sarg(a, "name"), *task = sarg(a, "task"), *cwd = sarg(a, "cwd");
     if (need(res, a, "spawn", (const char *const[]){"harness", "name", "task", NULL}, "{\"harness\":\"codex\",\"name\":\"codex-2\",\"task\":\"...\"}")) return 1;
@@ -1316,6 +1327,26 @@ static int start_spawn(json_object *a, int wait, char id[9], char **pane_out,
     if (summary) *summary = fmt("spawned %s in %s id=%s (%s: %s %s)", name, pane, id, TIERS[t], model, effort);
     *pane_out = pane;
     return 0;
+}
+
+static int start_spawn(json_object *a, int wait, char id[9], char **pane_out, char **summary, char **res) {
+    char *err = NULL;
+    int lock = lock_pane("spawn", &err);
+    if (lock < 0) return fail(res, err);
+    char *panes = NULL;
+    int rc = TMUX(NULL, &panes, "list-panes", "-a", "-F", "#{pane_dead}\t#{@cntctr_name}");
+    long max = 32;
+    const char *value = getenv("CNTCTR_MAX_AGENTS");
+    if (value && *value) { char *end; long n = strtol(value, &end, 10); if (!*end && n > 0) max = n; }
+    long count = 0;
+    char *save = NULL;
+    for (char *line = strtok_r(panes, "\n", &save); line; line = strtok_r(NULL, "\n", &save))
+        if (line[0] == '0' && line[1] == '\t' && line[2]) count++;
+    free(panes);
+    if (rc || count >= max) rc = fail(res, fmt("CNTCTR_MAX_AGENTS=%ld reached; kill idle agents or raise CNTCTR_MAX_AGENTS", max));
+    else rc = spawn_locked(a, wait, id, pane_out, summary, res);
+    close(lock);
+    return rc;
 }
 
 static int tool_spawn(json_object *a, char **res) {
@@ -1727,6 +1758,11 @@ static int tool_board(json_object *a, char **res) {
     int unseen = 0;
     free(kb_unread(db, p.key, caller_name, seen_of(caller_name), &newest, &unseen));
     if (*caller_name) set_seen(caller_name, newest);
+    if (unseen > limit) {
+        char *more = fmt("%s\n%d older unread posts were not shown", out, unseen - limit);
+        free(out);
+        out = more;
+    }
     sqlite3_close(db);
     if (*out) return ok(res, out);
     free(out);
@@ -2587,11 +2623,13 @@ static int fifo_warned;
 static int fifo_dir(char dir[4096]) {
     char base[PATH_MAX];
     struct stat sb;
-    int ok = realpath("/tmp", base) && stat(base, &sb) == 0 && (sb.st_mode & S_ISVTX);
+    const char *tmp = getenv("TMPDIR");
+    int ok = realpath(tmp && *tmp ? tmp : "/tmp", base) && stat(base, &sb) == 0 &&
+             ((sb.st_mode & S_ISVTX) || (sb.st_uid == getuid() && !(sb.st_mode & 022)));
     for (int i = 0; ok && i < 2; i++) {
         snprintf(dir, 4096, i ? "%s/cntctr-%d/tools" : "%s/cntctr-%d", base, (int)getuid());
         ok = (mkdir(dir, 0700) == 0 || errno == EEXIST) && lstat(dir, &sb) == 0 && S_ISDIR(sb.st_mode)
-             && sb.st_uid == getuid() && (sb.st_mode & 0777) == 0700;
+             && sb.st_uid == getuid() && chmod(dir, 0700) == 0;
     }
     if (!ok && !fifo_warned++) fprintf(stderr, "cntctr: tool notifications disabled: /tmp/cntctr-%d/tools is not a private directory of ours\n", (int)getuid());
     return ok ? 0 : -1;
