@@ -1499,9 +1499,9 @@ ver=$("$BIN" --version 2>&1)
 check "T2 --version prints 0.3.0" "$ver" "cntctr 0.3.0"
 
 # T3: two test.sh runs use different tmux socket names
-s1=$(bash -c 'SOCKET="cntctr-test-$$"; echo "$SOCKET"')
-s2=$(bash -c 'SOCKET="cntctr-test-$$"; echo "$SOCKET"')
-[ -n "$s1" ] && [ -n "$s2" ] && [ "$s1" != "$s2" ] && ok_ || bad "T3 two test.sh runs use different tmux socket names"
+s1=$(t display -p '#{socket_path}')
+s2=$(bash -c 'printf "cntctr-test-%s" "$$"')
+case $s1 in *"/$SOCKET") [ "$SOCKET" != "$s2" ] && ok_ || bad "T3 two test.sh runs use different tmux socket names" ;; *) bad "T3 current run uses its unique tmux socket" ;; esac
 
 # T4: approve a tool: an unrelated agent's screen is unchanged; its unread count rises
 M3_TA4=$(m3_newpane m3_ta4)
@@ -1612,16 +1612,19 @@ call "$M3_P12_A" post '{"text":"post for t12"}' >/dev/null
 raw_u12=$(call "$M3_P12_B" use '{"tool":"m3_t12"}')
 c0_12=$(printf '%s' "$raw_u12" | jq -r '.result.content[0].text // empty')
 c1_12=$(printf '%s' "$raw_u12" | jq -r '.result.content[1].text // empty')
+check "T12 fd 3 board call returned the post" "$c0_12" "post for t12"
 refute "T12 fd 3 reply has no notice" "$c0_12" "unread board post"
 check "T12 outer use result has unread notice" "$c1_12" "unread board post"
 
 # T13: reply while sender shows permission prompt falls back to board
-M3_S13=$(m3_newpane m3_s13)
+M3_S13=$(m3_newpane m3_s13 sh)
 M3_W13=$(m3_newpane m3_w13)
 tid13=$(txt "$(call "$M3_S13" send '{"to":"m3_w13","text":"task 13"}')" | sed 's/sent id=//')
 t send-keys -t "$M3_S13" "printf 'Do you want to proceed?'" Enter
 expect_screen "T13 sender prompt visible" "$M3_S13" "Do you want to proceed?"
-rep13=$(txt "$(call "$M3_W13" reply "{\"id\":\"$tid13\",\"text\":\"done 13\"}")")
+rep13_raw=$(call "$M3_W13" reply "{\"id\":\"$tid13\",\"text\":\"done 13\"}")
+rep13=$(txt "$rep13_raw")
+same "T13 board fallback is a successful reply" "$(iserr "$rep13_raw")" "false"
 check "T13 reply result says on the board" "$rep13" "on the board"
 b13=$(txt "$(call "$M3_W13" board '{}')")
 check "T13 sender project board has fallback" "$b13" "for m3_s13 (reply id=$tid13):"
@@ -1643,7 +1646,7 @@ h14=$(sq "$CNTCTR_DB" "SELECT body FROM entries WHERE scope='$M3_DIR14_1' AND la
 check "T14 history entry is in sender project" "$h14" "done 14"
 
 # T15: gather times out, caller at permission prompt, worker replies late: text on board
-M3_C15=$(m3_newpane m3_c15)
+M3_C15=$(m3_newpane m3_c15 sh)
 M3_W15=$(m3_newpane m3_w15)
 call "$M3_C15" gather '{"tasks":[{"kind":"send","to":"m3_w15","text":"slow task 15"}],"timeout":1}' >/dev/null
 tid15=$(lastid "$M3_W15")
@@ -1669,40 +1672,60 @@ M3_R17=$(m3_newpane m3_r17)
 tid17=$(txt "$(call "$M3_S17" send '{"to":"m3_r17","text":"t17 msg"}')" | sed 's/sent id=//')
 expect_screen "T17 header received" "$M3_R17" "[cntctr from=m3_s17 id=$tid17]"
 expect_screen "T17 envelope ends with end tag" "$M3_R17" "[cntctr end id=$tid17]"
+guide17=$(rpc "$INIT" | tail -n 1 | jq -r '.result.instructions')
+check "T17 instructions explain the end marker" "$guide17" "cntctr end id="
+check "T17 instructions tell agent to ask for resend" "$guide17" "resend"
 
 # T18: send re=<open id> adds to task
 M3_S18=$(m3_newpane m3_s18)
 M3_W18=$(m3_newpane m3_w18)
-tid18=$(txt "$(call "$M3_S18" send '{"to":"m3_w18","text":"t18 initial"}')" | sed 's/sent id=//')
+call "$M3_S18" gather '{"tasks":[{"kind":"send","to":"m3_w18","text":"t18 initial"}],"timeout":30}' > "$TMPD/m3-gather18" & gather18_pid=$!
+expect_screen "T18 gather dispatched original task" "$M3_W18" "t18 initial"
+tid18=$(lastid "$M3_W18")
 call "$M3_S18" send "{\"to\":\"m3_w18\",\"text\":\"t18 follow up\",\"re\":\"$tid18\"}" >/dev/null
 tasks18=$(txt "$(call "$M3_S18" list '{}')" | grep "m3_w18" | grep -o 'tasks=[^ ]*' | tr ',' '\n' | wc -l | tr -d ' ')
 same "T18a list shows one open task for worker" "$tasks18" "1"
+call "$M3_W18" reply "{\"id\":\"$tid18\",\"text\":\"t18 answer\"}" >/dev/null
 expect_screen "T18b envelope has original id and addendum" "$M3_W18" "[cntctr from=m3_s18 id=$tid18 addendum]"
+wait "$gather18_pid"
+gather18=$(txt "$(cat "$TMPD/m3-gather18")")
+same "T18c one reply completes gather" "$(printf '%s' "$gather18" | jq -r '.complete')" "true"
+same "T18c gather completes original id" "$(printf '%s' "$gather18" | jq -r '.results[0].id')" "$tid18"
+same "T18c gather records answer" "$(printf '%s' "$gather18" | jq -r '.results[0].text')" "t18 answer"
 
 # T19: send re=<unknown id> errors
 M3_S19=$(m3_newpane m3_s19)
 M3_W19=$(m3_newpane m3_w19)
-err19=$(txt "$(call "$M3_S19" send '{"to":"m3_w19","text":"hello","re":"deadbeef"}')")
+err19_raw=$(call "$M3_S19" send '{"to":"m3_w19","text":"hello","re":"deadbeef"}')
+err19=$(txt "$err19_raw")
+same "T19 unknown re is an error" "$(iserr "$err19_raw")" "true"
 check "T19 error names id" "$err19" "deadbeef"
 check "T19 error says to omit re" "$err19" "omit 're'"
 
 # T20: tool prints 20 KB ending FINAL
 M3_P20=$(m3_newpane m3_p20)
-m3_def20='{"name":"m3_t20","description":"prints 20k","input_schema":{"type":"object"},"interpreter":"sh","script":"python3 -c \"print(\\\"A\\\"*20000 + \\\"FINAL\\\")\""}'
+m3_def20='{"name":"m3_t20","description":"prints 20k","input_schema":{"type":"object"},"interpreter":"sh","script":"python3 -c \"print(\\\"START\\\" + \\\"A\\\"*20000 + \\\"FINAL\\\")\""}'
 call "$M3_P20" tool_define "$m3_def20" >/dev/null
 res20_raw=$(call "$M3_P20" use '{"tool":"m3_t20"}')
 res20=$(txt "$res20_raw")
 len20=${#res20}
 [ "$len20" -lt 16384 ] && ok_ || bad "T20 result under 16 KB" "got $len20 bytes"
 check "T20 result contains FINAL" "$res20" "FINAL"
+check "T20 result keeps first 8 KB" "$res20" "START"
 fpath20=$(printf '%s\n' "$res20" | grep -o '/[^ "]*cntctr[^ "]*/[^ "]*')
 [ -n "$fpath20" ] && [ -f "$fpath20" ] && [ "$(wc -c < "$fpath20")" -ge 20005 ] && ok_ || bad "T20 file holds all 20 KB"
+if [ -n "$fpath20" ] && [ -f "$fpath20" ]; then
+    touch -t 202001010000 "$fpath20"
+    call "$M3_P20" use '{"tool":"m3_t20"}' >/dev/null
+    [ ! -e "$fpath20" ] && ok_ || bad "T20 output file older than 24 h is removed on next output"
+fi
 
 # T21: tool prints 300 KB: error names file holding output
 M3_P21=$(m3_newpane m3_p21)
 m3_def21='{"name":"m3_t21","description":"prints 300k","input_schema":{"type":"object"},"interpreter":"sh","script":"python3 -c \"print(\\\"B\\\"*300000)\""}'
 call "$M3_P21" tool_define "$m3_def21" >/dev/null
 res21_raw=$(call "$M3_P21" use '{"tool":"m3_t21"}')
+same "T21 hard cap returns an error" "$(iserr "$res21_raw")" "true"
 err21=$(txt "$res21_raw")
 fpath21=$(printf '%s\n' "$err21" | grep -o '/[^ "]*cntctr[^ "]*/[^ "]*')
 [ -n "$fpath21" ] && [ -f "$fpath21" ] && [ "$(wc -c < "$fpath21")" -ge 262144 ] && ok_ || bad "T21 captured file holds 300 KB output"
@@ -1713,17 +1736,20 @@ m3_def22='{"name":"m3_t22","description":"stderr 20k","input_schema":{"type":"ob
 call "$M3_P22" tool_define "$m3_def22" >/dev/null
 res22_raw=$(call "$M3_P22" use '{"tool":"m3_t22"}')
 err22=$(txt "$res22_raw")
+same "T22 failed tool reports an error" "$(iserr "$res22_raw")" "true"
 check "T22 error contains FINAL ERROR" "$err22" "FINAL ERROR"
 
 # T23: a tool calling a 20 KB tool over fd 3 receives all 20 KB
 M3_P23=$(m3_newpane m3_p23)
 m3_def23_sub='{"name":"m3_t23_sub","description":"sub 20k","input_schema":{"type":"object"},"interpreter":"sh","script":"python3 -c \"print(\\\"C\\\"*20000 + \\\"CALLEE_DONE\\\")\""}'
 call "$M3_P23" tool_define "$m3_def23_sub" >/dev/null
-m3_def23_main='{"name":"m3_t23_main","description":"calls sub","input_schema":{"type":"object"},"interpreter":"sh","script":"cntctr call use \"{\\\"tool\\\":\\\"m3_t23_sub\\\"}\""}'
+script23='out=$(cntctr call use "{\"tool\":\"m3_t23_sub\"}"); printf "FD3_C_COUNT=%s\n" "$(printf %s "$out" | tr -cd C | wc -c | tr -d " ")"; case "$out" in *CALLEE_DONE*) echo CALLEE_DONE;; esac'
+m3_def23_main=$(jq -nc --arg s "$script23" '{name:"m3_t23_main",description:"calls sub",input_schema:{type:"object"},interpreter:"sh",script:$s}')
 call "$M3_P23" tool_define "$m3_def23_main" >/dev/null
 res23_raw=$(call "$M3_P23" use '{"tool":"m3_t23_main"}')
 res23=$(txt "$res23_raw")
-check "T23 fd 3 receives all 20 KB" "$res23" "CALLEE_DONE"
+check "T23 fd 3 receives all 20 KB" "$res23" "FD3_C_COUNT=20000"
+check "T23 fd 3 includes end marker" "$res23" "CALLEE_DONE"
 
 # T24: send to unknown agent mentions list and spawn
 M3_P24=$(m3_newpane m3_p24)
@@ -1737,13 +1763,21 @@ has_from=$(printf '%s' "$out25" | jq -r '.result.tools[] | select(.name=="list")
 check "T25 list has from" "$has_from" "string"
 td_desc=$(printf '%s' "$out25" | jq -r '.result.tools[] | select(.name=="tool_define") | .description')
 check "T25 tool_define mentions stdin" "$td_desc" "stdin"
+check "T25 tool_define mentions stdout" "$td_desc" "stdout"
 check "T25 tool_define mentions cntctr call" "$td_desc" "cntctr call"
+gather_desc=$(printf '%s' "$out25" | jq -r '.result.tools[] | select(.name=="gather") | .description')
+for field in kind to text wait timeout; do check "T25 gather describes $field" "$gather_desc" "$field"; done
+gather_schema=$(printf '%s' "$out25" | jq -c '.result.tools[] | select(.name=="gather") | .inputSchema')
+check "T25 gather has top-level timeout" "$gather_schema" '"timeout":'
+use_from=$(printf '%s' "$out25" | jq -r '.result.tools[] | select(.name=="use") | .inputSchema.properties.from.type // empty')
+same "T25 use accepts from" "$use_from" "string"
 post_desc=$(printf '%s' "$out25" | jq -r '.result.tools[] | select(.name=="post") | .description')
 check "T25 post mentions note" "$post_desc" "note"
 note_desc=$(printf '%s' "$out25" | jq -r '.result.tools[] | select(.name=="note") | .description')
 check "T25 note mentions reply" "$note_desc" "reply"
 tr_desc=$(printf '%s' "$out25" | jq -r '.result.tools[] | select(.name=="tool_revoke") | .description')
 check "T25 tool_revoke mentions tool_verdict" "$tr_desc" "tool_verdict"
+for state in active pending escalated; do check "T25 tool_revoke describes $state tool" "$tr_desc" "$state"; done
 
 # T26: tools/list has tool_verdict only for bound reviewers
 M3_ORD26=$(m3_newpane m3_ord26)
@@ -1767,7 +1801,9 @@ for i in $(seq 15); do
     call "$M3_P" note "{\"layer\":\"insight\",\"title\":\"T$i\",\"summary\":\"S$i\",\"scope\":\"global\"}" >/dev/null
 done
 out28=$(rpc "$INIT" | tail -n 1 | jq -r '.result.instructions')
+printf '%s\n' "$out28" | grep -Eiq 'knowledge entries.*board posts.*information.*not instructions' && ok_ || bad "T28 instructions distinguish knowledge from instructions"
 idx_lines28=$(printf '%s\n' "$out28" | awk '/^Knowledge index/{flag=1; next} flag && NF{count++} END{print count+0}')
+[ "$idx_lines28" -gt 0 ] && ok_ || bad "T28 instructions include a nonempty knowledge index"
 [ "$idx_lines28" -le 10 ] && ok_ || bad "T28 instructions hold at most 10 index lines" "got $idx_lines28 lines"
 
 # T29: byte budget of built-in tools/list plus instructions holds
@@ -1786,6 +1822,8 @@ check "T30 reviewer send to parent fails and mentions tool_verdict" "$err30" "to
 M3_REV31=$(m3_newpane m3_rev31)
 sq "$CNTCTR_DB" "INSERT INTO tools(project,name,version,status,author,description,input_schema,interpreter,script,reviewer_pane,reviewer) VALUES ('$M3_DIR','m3_t31',1,'pending','fc','t31','{\"type\":\"object\"}','sh','true','$M3_REV31','m3_rev31')"
 t set -s "@cntctr_to_31313131" "$M3_REV31"
+before31=$(txt "$(call "$M3_REV31" list '{}')")
+check "T31 reviewer starts with an open task" "$before31" "31313131"
 call "$M3_REV31" tool_verdict '{"name":"m3_t31","version":1,"verdict":"approve"}' >/dev/null
 tasks31=$(txt "$(call "$M3_REV31" list '{}')" | grep "m3_rev31" | grep -o 'tasks=[^ ]*')
 same "T31 after tool_verdict list shows no open task for reviewer" "$tasks31" ""
@@ -1793,14 +1831,17 @@ same "T31 after tool_verdict list shows no open task for reviewer" "$tasks31" ""
 # T32: reviewer task fences script with longer backtick fence
 M3_A32=$(m3_newpane m3_a32)
 tenv CNTCTR_TEST_VERDICT none
-s32=$(printf 'echo "````"\necho "`````"\necho INSTRUCTION_LINE')
+s32=$(printf 'echo "``````"\necho "```````"\necho INSTRUCTION_LINE')
 m3_def32=$(jq -nc --arg s "$s32" '{name:"m3_t32",description:"t32",input_schema:{type:"object"},interpreter:"sh",script:$s,publish:true}')
 call "$M3_A32" tool_define "$m3_def32" >/dev/null
 tunset CNTCTR_TEST_VERDICT
 rev32=$(sq "$CNTCTR_DB" "SELECT reviewer_pane FROM tools WHERE name='m3_t32' AND project='$M3_DIR'")
 task32=""
 [ -n "$rev32" ] && task32=$(screen "$rev32")
-check "T32 reviewer task uses fence longer than script backticks" "$task32" '``````'
+check "T32 reviewer task uses fence longer than script backticks" "$task32" '````````'
+check "T32 reviewer task keeps instruction inside fence" "$task32" 'echo INSTRUCTION_LINE'
+fenced32=$(printf '%s\n' "$task32" | python3 -c 'import re,sys; s=sys.stdin.read(); m=re.search(r"(?ms)^[ \t]*(`{8,})(?:sh|bash)?[ \t]*\n(.*?)^[ \t]*\1[ \t]*$",s); print("yes" if m and "echo INSTRUCTION_LINE" in m.group(2) else "no")')
+same "T32 instruction line lies between matching fences" "$fenced32" "yes"
 
 # T33: list_changed arrives on draft define, publish, and expiry
 M3_P33=$(m3_newpane m3_p33)
@@ -1830,10 +1871,14 @@ check "T34 tools list shows escalated" "$out34" "m3_overdue34 v1 escalated"
 
 # T35: failed tool history entry contains stderr
 M3_P35=$(m3_newpane m3_p35)
-call "$M3_P35" tool_define '{"name":"m3_fail35","description":"fails","input_schema":{"type":"object"},"interpreter":"sh","script":"echo boom >&2; exit 3"}' >/dev/null
+script35="python3 -c 'import sys; sys.stderr.write(\"E\"*1000 + \"boom\"); sys.exit(3)'"
+m3_def35=$(jq -nc --arg s "$script35" '{name:"m3_fail35",description:"fails",input_schema:{type:"object"},interpreter:"sh",script:$s}')
+call "$M3_P35" tool_define "$m3_def35" >/dev/null
 call "$M3_P35" use '{"tool":"m3_fail35"}' >/dev/null
 hist35=$(sq "$CNTCTR_DB" "SELECT body FROM entries WHERE scope='$M3_DIR' AND layer='history' AND title LIKE '%tool m3_fail35%'")
 check "T35 history contains boom" "$hist35" "boom"
+count35=$(printf '%s' "$hist35" | tr -cd E | wc -c | tr -d ' ')
+case $hist35 in *boom*) [ "$count35" -le 200 ] && ok_ || bad "T35 history reason stays within 200 bytes" "got $count35 stderr bytes" ;; *) bad "T35 cannot measure reason cap without recorded reason" ;; esac
 
 # T36: three posts, board limit=1 says 2 older unread posts were not shown
 M3_P36_A=$(m3_newpane m3_p36_a)
@@ -1844,6 +1889,9 @@ call "$M3_P36_A" post '{"text":"post 1 for t36"}' >/dev/null
 call "$M3_P36_A" post '{"text":"post 2 for t36"}' >/dev/null
 call "$M3_P36_A" post '{"text":"post 3 for t36"}' >/dev/null
 b36=$(txt "$(call "$M3_P36_B" board '{"limit":1}')")
+check "T36 board limit shows newest post" "$b36" "post 3 for t36"
+refute "T36 board limit hides first older post" "$b36" "post 1 for t36"
+refute "T36 board limit hides second older post" "$b36" "post 2 for t36"
 check "T36 board result mentions 2 older unread posts" "$b36" "2 older unread post"
 
 # T37a: list with from=%pane of an untagged live pane shows it alive
@@ -1862,9 +1910,11 @@ sleep 0.2
 (cd "$M3_DIR" && TMPDIR="$DIR755" "$BIN" tools approve m3_t4 >/dev/null 2>&1)
 sleep 0.5
 out37b=$(cat "$DOUT")
+mode37b=$(stat -f '%Lp' "$DIR755/cntctr-$(id -u)" 2>/dev/null || stat -c '%a' "$DIR755/cntctr-$(id -u)")
 TMPDIR="$DIR755" daemon_stop
 rm -rf "$DIR755"
 check "T37b 0755 temp dir still delivers list_changed" "$out37b" "notifications/tools/list_changed"
+same "T37b stale temp directory is private" "$mode37b" "700"
 
 # T37c: EXPLAIN QUERY PLAN of board query uses an index
 plan37c=$(sq "$CNTCTR_DB" "EXPLAIN QUERY PLAN SELECT text FROM posts WHERE scope='test' ORDER BY at ASC")
@@ -1875,44 +1925,71 @@ out37d=$(txt "$(call "$M3_P" spawn '{"harness":"claude","name":"m3_prev37","task
 check "T37d preview task routes standard" "$out37d" "claude-sonnet-5-5"
 
 # T37e: with CNTCTR_MAX_AGENTS=2 the third spawn fails and names the variable
-call "$M3_P" spawn '{"harness":"claude","name":"m3_ma1","task":"t1"}' >/dev/null
-call "$M3_P" spawn '{"harness":"claude","name":"m3_ma2","task":"t2"}' >/dev/null
-err37e=$(txt "$(CNTCTR_MAX_AGENTS=2 call "$M3_P" spawn '{"harness":"claude","name":"m3_ma3","task":"t3"}')")
+limit37e=$(t list-panes -a -F '#{@cntctr_name}' | grep -c . || true)
+limit37e=$((limit37e + 2))
+first37e=$(CNTCTR_MAX_AGENTS=$limit37e call "$M3_P" spawn '{"harness":"claude","name":"m3_ma1","task":"t1"}')
+second37e=$(CNTCTR_MAX_AGENTS=$limit37e call "$M3_P" spawn '{"harness":"claude","name":"m3_ma2","task":"t2"}')
+same "T37e first spawn below limit succeeds" "$(iserr "$first37e")" "false"
+same "T37e second spawn at limit succeeds" "$(iserr "$second37e")" "false"
+res37e=$(CNTCTR_MAX_AGENTS=$limit37e call "$M3_P" spawn '{"harness":"claude","name":"m3_ma3","task":"t3"}')
+err37e=$(txt "$res37e")
+same "T37e third spawn is an error" "$(iserr "$res37e")" "true"
 check "T37e third spawn fails and names CNTCTR_MAX_AGENTS" "$err37e" "CNTCTR_MAX_AGENTS"
+check "T37e limit error suggests killing idle agents" "$err37e" "kill idle"
+check "T37e limit error suggests raising the limit" "$err37e" "raise"
 
 # T38: macOS sandbox hardlinks and unix sockets
 if [ "$(uname)" = "Darwin" ]; then
     echo "ORIGINAL_38" > "$TMPD/outside38.txt"
     m3_def38a=$(jq -nc --arg f "$TMPD/outside38.txt" '{name:"m3_t38a",description:"hl test",input_schema:{type:"object"},interpreter:"sh",script:("ln " + $f + " ./link.txt && echo OVERWRITTEN > ./link.txt")}')
-    call "$M3_P" tool_define "$m3_def38a" >/dev/null
-    call "$M3_P" use '{"tool":"m3_t38a"}' >/dev/null
+res38a_def=$(call "$M3_P" tool_define "$m3_def38a")
+same "T38a hardlink tool is defined" "$(iserr "$res38a_def")" "false"
+res38a_raw=$(call "$M3_P" use '{"tool":"m3_t38a"}')
+same "T38a hardlink attempt is rejected" "$(iserr "$res38a_raw")" "true"
+[ ! -e "$M3_DIR/link.txt" ] && ok_ || bad "T38a hardlink was created inside tool root"
     outside38=$(cat "$TMPD/outside38.txt")
     same "T38a hardlink write leaves outside file unchanged" "$outside38" "ORIGINAL_38"
 
     sock38="$TMPD/outside38.sock"
     rm -f "$sock38"
-    python3 -c "import socket; s = socket.socket(socket.AF_UNIX); s.bind('$sock38'); s.listen(1)" &
+python3 -c "import socket,time; s = socket.socket(socket.AF_UNIX); s.bind('$sock38'); s.listen(2); time.sleep(30)" &
     py_sock_pid=$!
-    sleep 0.3
+for _ in $(seq 30); do [ -S "$sock38" ] && break; sleep 0.1; done
+python3 -c "import socket; s = socket.socket(socket.AF_UNIX); s.connect('$sock38'); s.close()" && ok_ || bad "T38b outside Unix socket is reachable before sandbox test"
     m3_def38b=$(jq -nc --arg s "$sock38" '{name:"m3_t38b",description:"sock test",net:false,input_schema:{type:"object"},interpreter:"sh",script:("python3 -c \"import socket; s = socket.socket(socket.AF_UNIX); s.connect('"'"'" + $s + "'"'"'); print('"'"'CONNECTED'"'"')\"")}')
-    call "$M3_P" tool_define "$m3_def38b" >/dev/null
-    out38b=$(txt "$(call "$M3_P" use '{"tool":"m3_t38b"}')")
+res38b_def=$(call "$M3_P" tool_define "$m3_def38b")
+same "T38b socket tool is defined" "$(iserr "$res38b_def")" "false"
+res38b_raw=$(call "$M3_P" use '{"tool":"m3_t38b"}')
+out38b=$(txt "$res38b_raw")
+same "T38b outside Unix socket connection is rejected" "$(iserr "$res38b_raw")" "true"
     refute "T38b net=false tool cannot connect to outside unix socket" "$out38b" "CONNECTED"
     kill $py_sock_pid 2>/dev/null; rm -f "$sock38"
 fi
 
 # T39: redelivery of addressed text
-M3_S39=$(m3_newpane m3_s39)
+M3_S39=$(m3_newpane m3_s39 sh)
 M3_W39=$(m3_newpane m3_w39)
 tid39=$(txt "$(call "$M3_S39" send '{"to":"m3_w39","text":"task 39"}')" | sed 's/sent id=//')
+daemon_start "$M3_S39"
+sleep 0.2
 t send-keys -t "$M3_S39" "printf 'Do you want to proceed?'" Enter
 expect_screen "T39 sender prompt" "$M3_S39" "Do you want to proceed?"
 call "$M3_W39" reply "{\"id\":\"$tid39\",\"text\":\"reply 39 text\"}" >/dev/null
 call "$M3_W39" post '{"text":"ordinary unaddressed post 39"}' >/dev/null
-t send-keys -t "$M3_S39" C-c Enter
-expect_screen "T39 reply is redelivered to sender" "$M3_S39" "reply 39 text"
+t send-keys -t "$M3_S39" C-c
+t send-keys -t "$M3_S39" clear Enter
+delivered39=0
+for _ in $(seq 600); do
+    delivered39=$(screen "$M3_S39" | grep -cF 'reply 39 text' || true)
+    [ "$delivered39" -gt 0 ] && break
+    sleep 0.1
+done
+same "T39 reply is redelivered exactly once" "$delivered39" "1"
+call "$M3_S39" board '{}' >/dev/null
 sleep 0.5
+same "T39 later board call does not redeliver" "$(screen "$M3_S39" | grep -cF 'reply 39 text' || true)" "1"
 refute "T39 ordinary post is not typed" "$(screen "$M3_S39")" "ordinary unaddressed post 39"
+daemon_stop
 
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
