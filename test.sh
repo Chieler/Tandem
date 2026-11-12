@@ -90,7 +90,14 @@ if [ "${ONLY:-}" = hooks ]; then
     exit $?
 fi
 
-# gather wait=false must say when a send took the board fallback
+# U28 (hooks install/remove/status) and the gather wait=false board wording: run alone with ONLY=u28 or ONLY=gboard, and in the full suite
+u28_run() {
+    local out p=0 f=0
+    out=$(python3 tests/hooks_step3.py "$BIN" "$TMPD" 2>&1)
+    printf '%s\n' "$out" | grep -v ' passed, '
+    case $out in *' passed, '*) p=$(printf '%s\n' "$out" | sed -n 's/^\([0-9]*\) passed.*/\1/p'); f=$(printf '%s\n' "$out" | sed -n 's/.* \([0-9]*\) failed$/\1/p') ;; *) f=1 ;; esac
+    pass=$((pass + p)); fail=$((fail + f))
+}
 gboard_run() {
     local sender target r
     sender=$(newpane gb_sender); target=$(newpane gb_off)
@@ -99,8 +106,9 @@ gboard_run() {
     same "gather wait=false names the board fallback" "$(printf '%s' "$r" | jq -r '.results[0].status')" "sent on board"
     check "gather wait=false board send is stored" "$(txt "$(call "$target" board '{}')")" "gather input off"
 }
-if [ "${ONLY:-}" = gboard ]; then
-    gboard_run
+if [ "${ONLY:-}" = u28 ] || [ "${ONLY:-}" = gboard ]; then
+    export CNTCTR_PASTE_WAIT_MS=100
+    if [ "$ONLY" = u28 ]; then u28_run; else gboard_run; fi
     printf '%d passed, %d failed\n' "$pass" "$fail"
     [ "$fail" -eq 0 ]; exit $?
 fi
@@ -278,6 +286,8 @@ EOF
 fi
 
 if [ "${ONLY:-}" != "m3" ]; then
+
+u28_run
 
 # ---- MCP protocol ----
 out=$(rpc "$INIT")

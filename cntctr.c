@@ -3366,6 +3366,20 @@ static void record_hook(sqlite3 *db, const char *socket, const char *pane, const
     sqlite3_finalize(st);
 }
 
+/* hooks status: has any session of this harness reported a hook event? */
+static int hook_seen(const char *harness) {
+    char *err = NULL; sqlite3 *db = kb_timed(&err, 1000); free(err);
+    sqlite3_stmt *st = NULL;
+    int yes = 0;
+    if (db && sqlite3_prepare_v2(db, "SELECT 1 FROM hook_sessions WHERE harness=?1 LIMIT 1", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, harness, -1, SQLITE_TRANSIENT);
+        yes = sqlite3_step(st) == SQLITE_ROW;
+    }
+    sqlite3_finalize(st);
+    if (db) sqlite3_close(db);
+    return yes;
+}
+
 static int hook_cmd(int argc, char **argv) {
     struct sigaction sa = {0}; sa.sa_handler = hook_alarm; sigemptyset(&sa.sa_mask); sigaction(SIGALRM, &sa, NULL);
     struct itimerval timer = {{0, 0}, {1, 800000}}; setitimer(ITIMER_REAL, &timer, NULL);
@@ -3435,10 +3449,7 @@ int main(int argc, char **argv) {
         free(tmux);
     }
     if (argc > 1 && !strcmp(argv[1], "hook")) return hook_cmd(argc, argv);
-    if (argc > 1 && !strcmp(argv[1], "hooks")) {
-        fprintf(stderr, "hook installation is not available in this step\n");
-        return 1;
-    }
+    if (argc > 1 && !strcmp(argv[1], "hooks")) return hooks_admin(argc, argv, hook_seen);
     const char *delay = getenv("CNTCTR_ENTER_DELAY_MS");
     if (delay) enter_delay_ms = atoi(delay);
     regcomp(&name_re, "^[a-z][a-z0-9_]{1,40}$", REG_EXTENDED | REG_NOSUB);
