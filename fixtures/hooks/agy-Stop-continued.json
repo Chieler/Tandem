@@ -1,0 +1,7 @@
+{
+  "conversationId": "SESSION-1",
+  "executionNum": 1,
+  "continuationActive": false,
+  "fullyIdle": true,
+  "terminationReason": "NO_TOOL_CALL"
+}

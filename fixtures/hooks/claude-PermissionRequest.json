@@ -1,0 +1,11 @@
+{
+  "session_id": "SESSION-1",
+  "prompt_id": "fa2f2d82-eba1-45c7-a0ed-273864988cb3",
+  "permission_mode": "auto",
+  "hook_event_name": "PermissionRequest",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "echo permission_test_42",
+    "description": "Echo permission_test_42 to stdout"
+  }
+}

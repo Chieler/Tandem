@@ -30,6 +30,7 @@
 #include <json-c/json.h>
 #include "kb.h"
 #include "fleet.h"
+#include "hooks.h"
 
 #define CNTCTR_VERSION "0.3.0"
 
@@ -318,7 +319,7 @@ static const char *kb_path(char *def, size_t n) {
     return def;
 }
 
-static sqlite3 *kb(char **err) {
+static sqlite3 *kb_timed(char **err, int timeout_ms) {
     char def[4096];
     const char *path = kb_path(def, sizeof def), *home = getenv("HOME");
     if (path == def) {
@@ -332,11 +333,13 @@ static sqlite3 *kb(char **err) {
         path = kb_path(def, sizeof def);
     }
     char *why = NULL;
-    sqlite3 *db = kb_open(path, &why);
+    sqlite3 *db = kb_open_timeout(path, &why, timeout_ms);
     if (!db) *err = fmt("knowledge store unavailable: %s", why);
     free(why);
     return db;
 }
+
+static sqlite3 *kb(char **err) { return kb_timed(err, 5000); }
 
 struct project { char root[4096], key[1024], base[256]; };
 
@@ -3249,6 +3252,170 @@ static int tools_cmd(int argc, char **argv) {
     return rc;
 }
 
+/* Hook processes always return a neutral answer if stdin or storage stalls. */
+static void hook_alarm(int sig) {
+    (void)sig;
+    (void)write(STDOUT_FILENO, "{}\n", 3);
+    _exit(0);
+}
+
+static char *hook_socket(void) {
+    const char *socket = getenv("CNTCTR_TMUX"), *tmux = getenv("TMUX");
+    if (socket && *socket) return strdup(socket);
+    if (!tmux || !*tmux) return strdup("");
+    return strndup(tmux, strcspn(tmux, ","));
+}
+
+static int hook_process_alive(long pid, const char *harness) {
+    if (pid <= 1 || kill((pid_t)pid, 0) != 0) return 0;
+    char arg[32], *command = NULL;
+    snprintf(arg, sizeof arg, "%ld", pid);
+    int ok = 0;
+    if (run(NULL, &command, (const char *[]){"ps", "-p", arg, "-o", "comm=", NULL}) == 0) {
+        const char *base = strrchr(command, '/');
+        ok = !strcmp(base ? base + 1 : command, harness);
+    }
+    free(command);
+    return ok;
+}
+
+static long hook_parent(const char *harness) {
+    char *procs = NULL;
+    if (run(NULL, &procs, (const char *[]){"ps", "-A", "-o", "pid=,ppid=", NULL}) != 0) { free(procs); return 0; }
+    long result = 0;
+    for (long pid = getppid(); pid > 1; pid = parent_of(procs, pid)) {
+        if (hook_process_alive(pid, harness)) { result = pid; break; }
+    }
+    free(procs);
+    return result;
+}
+
+static void hook_session_identity(long pid, char pane[32], char **socket) {
+    if (pid <= 1) return;
+    const char *dir = getenv("CNTCTR_CLAUDE_SESSIONS_DIR");
+    char path[PATH_MAX];
+    if (dir && *dir) snprintf(path, sizeof path, "%s/%ld.json", dir, pid);
+    else snprintf(path, sizeof path, "%s/.claude/sessions/%ld.json", getenv("HOME") ? getenv("HOME") : "", pid);
+    json_object *session = json_object_from_file(path), *field = NULL;
+    if (session && json_object_object_get_ex(session, "tmux", &field)) {
+        const char *value = json_object_get_string(field), *p = value ? strrchr(value, '%') : NULL;
+        if (p && p[1] && strspn(p + 1, "0123456789") == strlen(p + 1)) snprintf(pane, 32, "%s", p);
+        if (!**socket && value) {
+            const char *colon = strchr(value, ':');
+            if (colon && colon > value) {
+                char *name = strndup(value, (size_t)(colon - value)), *path_out = NULL;
+                if (TMUX(NULL, &path_out, "-L", name, "display", "-p", "#{socket_path}") == 0 && *path_out) {
+                    free(*socket); *socket = path_out; path_out = NULL;
+                    char *tmux = fmt("%s,0,0", *socket); setenv("TMUX", tmux, 1); free(tmux);
+                }
+                free(path_out); free(name);
+            }
+        }
+    }
+    if (session) json_object_put(session);
+}
+
+static void hook_ancestor_pane(char pane[32]) {
+    char *panes = NULL, *procs = NULL;
+    int ok = TMUX(NULL, &panes, "list-panes", "-a", "-F", "#{pane_pid} #{pane_id}") == 0;
+    ok = run(NULL, &procs, (const char *[]){"ps", "-A", "-o", "pid=,ppid=", NULL}) == 0 && ok;
+    for (long pid = getppid(); ok && pid > 1; pid = parent_of(procs, pid))
+        if (match_pane(panes, pid)) { snprintf(pane, 32, "%s", self_pane); break; }
+    free(panes); free(procs);
+}
+
+static int has_hooks(sqlite3 *db, const char *socket, const char *pane) {
+    sqlite3_stmt *st = NULL;
+    int yes = 0;
+    if (sqlite3_prepare_v2(db, "SELECT harness,harness_pid,prompt_seen,stop_seen FROM hook_sessions WHERE socket=?1 AND pane=?2", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, socket, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, pane, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const char *harness = (const char *)sqlite3_column_text(st, 0);
+            long pid = (long)sqlite3_column_int64(st, 1);
+            yes = harness && (!strcmp(harness, "claude") || !strcmp(harness, "agy")) && pid > 1 &&
+                sqlite3_column_int(st, 2) && sqlite3_column_int(st, 3) && hook_process_alive(pid, harness) && pane_alive(pane);
+        }
+    }
+    sqlite3_finalize(st);
+    return yes;
+}
+
+static void record_hook(sqlite3 *db, const char *socket, const char *pane, const char *harness, long pid, const struct hook_event *event) {
+    const char *sql = "INSERT INTO hook_sessions(socket,pane,harness,session_id,harness_pid,last_event,at,prompt_seen,stop_seen) "
+        "VALUES(?1,?2,?3,?4,?5,?6,strftime('%s','now'),?7,?8) "
+        "ON CONFLICT(socket,pane) DO UPDATE SET "
+        "prompt_seen=CASE WHEN ?9 OR hook_sessions.session_id!=excluded.session_id OR hook_sessions.harness!=excluded.harness OR hook_sessions.harness_pid!=excluded.harness_pid THEN excluded.prompt_seen ELSE max(hook_sessions.prompt_seen,excluded.prompt_seen) END,"
+        "stop_seen=CASE WHEN ?9 OR hook_sessions.session_id!=excluded.session_id OR hook_sessions.harness!=excluded.harness OR hook_sessions.harness_pid!=excluded.harness_pid THEN excluded.stop_seen ELSE max(hook_sessions.stop_seen,excluded.stop_seen) END,"
+        "wake_reserved=CASE WHEN ?9 OR hook_sessions.session_id!=excluded.session_id OR hook_sessions.harness!=excluded.harness OR hook_sessions.harness_pid!=excluded.harness_pid THEN 0 ELSE hook_sessions.wake_reserved END,"
+        "wake_at=CASE WHEN ?9 OR hook_sessions.session_id!=excluded.session_id OR hook_sessions.harness!=excluded.harness OR hook_sessions.harness_pid!=excluded.harness_pid THEN NULL ELSE hook_sessions.wake_at END,"
+        "harness=excluded.harness,session_id=excluded.session_id,harness_pid=excluded.harness_pid,last_event=excluded.last_event,at=excluded.at";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return;
+    sqlite3_bind_text(st, 1, socket, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, pane, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, harness, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 4, event->session, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 5, pid);
+    sqlite3_bind_text(st, 6, event->kind, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 7, !strcmp(event->kind, "UserPromptSubmit") || !strcmp(event->kind, "PreInvocation"));
+    sqlite3_bind_int(st, 8, !strcmp(event->kind, "Stop"));
+    sqlite3_bind_int(st, 9, !strcmp(event->kind, "SessionStart"));
+    sqlite3_step(st);
+    sqlite3_finalize(st);
+}
+
+static int hook_cmd(int argc, char **argv) {
+    struct sigaction sa = {0}; sa.sa_handler = hook_alarm; sigemptyset(&sa.sa_mask); sigaction(SIGALRM, &sa, NULL);
+    struct itimerval timer = {{0, 0}, {1, 800000}}; setitimer(ITIMER_REAL, &timer, NULL);
+    char *socket = hook_socket();
+    if (argc == 4 && !strcmp(argv[2], "status")) {
+        char *err = NULL; sqlite3 *db = kb_timed(&err, 1000); free(err);
+        int yes = db && *socket && has_hooks(db, socket, argv[3]);
+        if (db) sqlite3_close(db);
+        free(socket);
+        printf("%s\n", yes ? "yes" : "no");
+        return 0;
+    }
+    if (argc >= 4 && (!strcmp(argv[2], "claude") || !strcmp(argv[2], "agy"))) {
+        char *data = calloc(1, 1048577); size_t n = 0; ssize_t got;
+        if (!data) { free(socket); puts("{}"); return 0; }
+        while (n < 1048576 && (got = read(STDIN_FILENO, data + n, 1048576 - n)) > 0) n += (size_t)got;
+        json_tokener *tokener = json_tokener_new();
+        if (!tokener) { free(data); free(socket); puts("{}"); return 0; }
+        json_object *input = json_tokener_parse_ex(tokener, data, (int)n);
+        size_t end = json_tokener_get_parse_end(tokener);
+        while (end < n && isspace((unsigned char)data[end])) end++;
+        if (n == 1048576 || json_tokener_get_error(tokener) != json_tokener_success || end != n) {
+            if (input) json_object_put(input);
+            input = NULL;
+        }
+        json_tokener_free(tokener);
+        free(data);
+        struct hook_event event = {0};
+        const char *pane = getenv("CNTCTR_PANE");
+        if (!pane || !*pane) pane = getenv("TMUX_PANE");
+        if (input && hook_parse(argv[2], argv[3], input, &event)) {
+            long pid = hook_parent(argv[2]);
+            char found_pane[32] = "";
+            int had_socket = *socket != '\0';
+            if ((!pane || !*pane || !*socket) && !strcmp(argv[2], "claude")) hook_session_identity(pid, found_pane, &socket);
+            if ((!pane || !*pane) && !*found_pane && had_socket) hook_ancestor_pane(found_pane);
+            if (!pane || !*pane) pane = found_pane;
+            if (*pane && *socket) {
+                char *err = NULL; sqlite3 *db = kb_timed(&err, 1000); free(err);
+                if (db) { record_hook(db, socket, pane, argv[2], pid, &event); sqlite3_close(db); }
+            }
+        }
+        if (input) json_object_put(input);
+    }
+    free(socket);
+    json_object *answer = hook_answer(argc > 2 ? argv[2] : "", argc > 3 ? argv[3] : "", HOOK_NEUTRAL, NULL);
+    if (answer) { puts(json_object_to_json_string_ext(answer, JSON_C_TO_STRING_PLAIN)); json_object_put(answer); }
+    else puts("{}");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "--version") == 0) {
         printf("cntctr %s\n", CNTCTR_VERSION);
@@ -3265,6 +3432,11 @@ int main(int argc, char **argv) {
         char *tmux = fmt("%s,0,0", socket);
         setenv("TMUX", tmux, 1);
         free(tmux);
+    }
+    if (argc > 1 && !strcmp(argv[1], "hook")) return hook_cmd(argc, argv);
+    if (argc > 1 && !strcmp(argv[1], "hooks")) {
+        fprintf(stderr, "hook installation is not available in this step\n");
+        return 1;
     }
     const char *delay = getenv("CNTCTR_ENTER_DELAY_MS");
     if (delay) enter_delay_ms = atoi(delay);

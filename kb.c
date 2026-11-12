@@ -33,6 +33,12 @@ static const char SCHEMA[] =
     "CREATE TABLE IF NOT EXISTS mail(post INTEGER PRIMARY KEY, name TEXT NOT NULL, pane TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0);"
     "CREATE TABLE IF NOT EXISTS posts(scope TEXT NOT NULL, sender TEXT NOT NULL, text TEXT NOT NULL, at INTEGER NOT NULL);"
     "CREATE INDEX IF NOT EXISTS posts_scope ON posts(scope);"
+    "CREATE TABLE IF NOT EXISTS hook_sessions("
+    " socket TEXT NOT NULL, pane TEXT NOT NULL, harness TEXT NOT NULL, session_id TEXT NOT NULL,"
+    " harness_pid INTEGER NOT NULL, last_event TEXT NOT NULL, at INTEGER NOT NULL,"
+    " prompt_seen INTEGER NOT NULL DEFAULT 0, stop_seen INTEGER NOT NULL DEFAULT 0,"
+    " wake_reserved INTEGER NOT NULL DEFAULT 0, wake_at INTEGER, PRIMARY KEY(socket,pane));"
+
     "CREATE TABLE IF NOT EXISTS tools(project TEXT NOT NULL, name TEXT NOT NULL, version INTEGER NOT NULL,"
     " status TEXT NOT NULL, author TEXT NOT NULL, author_model TEXT NOT NULL DEFAULT '', description TEXT NOT NULL,"
     " input_schema TEXT NOT NULL, interpreter TEXT NOT NULL, script TEXT NOT NULL, net INTEGER NOT NULL DEFAULT 0,"
@@ -73,14 +79,25 @@ static int exec2(sqlite3 *db, const char *sql, const char *a, const char *b) {
     return rc;
 }
 
-sqlite3 *kb_open(const char *path, char **err) {
+static int ensure_mail_column(sqlite3 *db, const char *name, const char *sql) {
+    sqlite3_stmt *st = NULL;
+    int found = 0, rc = sqlite3_prepare_v2(db, "PRAGMA table_info(mail)", -1, &st, NULL);
+    if (rc != SQLITE_OK) return rc;
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW)
+        if (!strcmp((const char *)sqlite3_column_text(st, 1), name)) found = 1;
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE) return rc;
+    return found ? SQLITE_OK : sqlite3_exec(db, sql, NULL, NULL, NULL);
+}
+
+sqlite3 *kb_open_timeout(const char *path, char **err, int timeout_ms) {
     sqlite3 *db = NULL;
     if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL) != SQLITE_OK) {
         *err = strdup(db ? sqlite3_errmsg(db) : "out of memory");
         sqlite3_close(db);
         return NULL;
     }
-    sqlite3_busy_timeout(db, 5000);
+    sqlite3_busy_timeout(db, timeout_ms);
     sqlite3_exec(db, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
     char host[256] = "host";
     gethostname(host, sizeof host - 1);
@@ -88,6 +105,9 @@ sqlite3 *kb_open(const char *path, char **err) {
     char *machine = sqlite3_mprintf("INSERT OR IGNORE INTO meta VALUES ('machine', '%08x-%q');", arc4random(), host);
     int rc = sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_exec(db, SCHEMA, NULL, NULL, NULL);
+    if (rc == SQLITE_OK) rc = ensure_mail_column(db, "state", "ALTER TABLE mail ADD COLUMN state TEXT NOT NULL DEFAULT 'pending'");
+    if (rc == SQLITE_OK) rc = ensure_mail_column(db, "staged_turn", "ALTER TABLE mail ADD COLUMN staged_turn TEXT");
+    if (rc == SQLITE_OK) rc = ensure_mail_column(db, "presentations", "ALTER TABLE mail ADD COLUMN presentations INTEGER NOT NULL DEFAULT 0");
     if (rc == SQLITE_OK) rc = sqlite3_exec(db, machine, NULL, NULL, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
     sqlite3_free(machine);
@@ -96,6 +116,8 @@ sqlite3 *kb_open(const char *path, char **err) {
     sqlite3_close(db);
     return NULL;
 }
+
+sqlite3 *kb_open(const char *path, char **err) { return kb_open_timeout(path, err, 5000); }
 
 int kb_put(sqlite3 *db, const struct kb_entry *e, char id[64]) {
     char *machine = kb_meta_get(db, "machine");

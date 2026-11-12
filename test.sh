@@ -85,6 +85,11 @@ newpane() {
 }
 
 # Isolated 0.4.0 tests can run while another worktree runs the full suite.
+if [ "${ONLY:-}" = hooks ]; then
+    python3 tests/hooks_step2.py "$BIN" "$TMPD"
+    exit $?
+fi
+
 if [ "${ONLY:-}" = u1 ]; then
     t set-environment -g U1_DIR "$TMPD"
     cat > "$TMPD/bin/headroom" <<'EOF'

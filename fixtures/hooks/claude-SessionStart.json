@@ -1,0 +1,6 @@
+{
+  "session_id": "SESSION-1",
+  "hook_event_name": "SessionStart",
+  "source": "startup",
+  "model": "claude-haiku-5-5"
+}

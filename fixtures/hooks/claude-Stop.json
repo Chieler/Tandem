@@ -1,0 +1,8 @@
+{
+  "session_id": "SESSION-1",
+  "prompt_id": "8f4e53ed-20c9-4797-8349-b8b31957a782",
+  "permission_mode": "auto",
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "..."
+}

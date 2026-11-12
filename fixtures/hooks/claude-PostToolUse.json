@@ -1,0 +1,8 @@
+{
+  "session_id": "SESSION-1",
+  "tool_name": "Bash",
+  "tool_response": {
+    "stdout": "SAPPHIRE_TIGER"
+  },
+  "tool_use_id": "toolu_0167AAT1pqbq5oS79tzGGQqq"
+}

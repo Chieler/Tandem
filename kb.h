@@ -9,6 +9,7 @@ struct kb_entry {
     const char *layer, *scope, *title, *summary, *body, *tags, *refs, *author, *agent, *visibility;
 };
 
+sqlite3 *kb_open_timeout(const char *path, char **err, int timeout_ms);
 sqlite3 *kb_open(const char *path, char **err);   /* creates the schema; *err is malloc'd on failure */
 int kb_put(sqlite3 *db, const struct kb_entry *e, char id[64]);   /* 0, or -1 */
 int kb_lookup(sqlite3 *db, const char *id, char layer[16], long long *mem_id);   /* 0 if found */

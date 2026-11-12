@@ -1,0 +1,7 @@
+{
+  "conversationId": "SESSION-1",
+  "executionNum": 0,
+  "continuationActive": false,
+  "fullyIdle": true,
+  "terminationReason": "USER_CANCELED"
+}

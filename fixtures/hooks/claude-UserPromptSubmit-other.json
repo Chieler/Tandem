@@ -1,0 +1,10 @@
+{
+  "session_id": "SESSION-1",
+  "transcript_path": "/home/u/.claude/projects/-home-u-Programming-cntctr--worktrees--audit-spike-claude/SESSION-1.jsonl",
+  "cwd": "/home/u/Programming/cntctr/.worktrees/_audit/spike-claude",
+  "scratchpad_dir": "/private/tmp/claude-501/-home-u-Programming-cntctr--worktrees--audit-spike-claude/SESSION-1/scratchpad",
+  "prompt_id": "868f6e0e-a52c-4c34-9297-a1bf8d8dcaae",
+  "permission_mode": "auto",
+  "hook_event_name": "UserPromptSubmit",
+  "prompt": "please look at [cntctr mail id=42] body attached; if you see none, call board"
+}
