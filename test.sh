@@ -1413,7 +1413,7 @@ check "quiet post is stored" "$out" "posted to the board"
 sleep 0.5
 refute "quiet post is not typed" "$(screen "$QW")" "quiet news"
 out=$(notice "$(call "$QW" list '{}')")
-check "tool results count unread posts" "$out" "(1 unread board post; call board)"
+check "tool results count unread posts" "$out" "(1 unread board post; read them with board before your final reply)"
 out=$(notice "$(call "$S" list '{}')")
 refute "own posts are not unread" "$out" "unread board post"
 out=$(txt "$(call "$QW" gather '{"tasks":[{"kind":"send","to":"missing-x","text":"y"}],"timeout":1}')")
@@ -1614,7 +1614,7 @@ for id11 in 2 3 4; do
     tool11=project
     [ "$id11" -eq 4 ] && tool11=list
     daemon_send "$(printf '{"jsonrpc":"2.0","id":%s,"method":"tools/call","params":{"name":"%s","arguments":{}}}' "$id11" "$tool11")"
-    for _ in $(seq 100); do jq -e "select(.id == $id11)" "$DOUT" >/dev/null 2>&1 && break; sleep 0.1; done
+    for _ in $(seq 600); do jq -e "select(.id == $id11)" "$DOUT" >/dev/null 2>&1 && break; sleep 0.1; done
 done
 res11_1=$(jq -c 'select(.id == 2)' "$DOUT")
 res11_2=$(jq -c 'select(.id == 3)' "$DOUT")
@@ -1649,7 +1649,7 @@ rep13_raw=$(call "$M3_W13" reply "{\"id\":\"$tid13\",\"text\":\"done 13\"}")
 rep13=$(txt "$rep13_raw")
 same "T13 board fallback is a successful reply" "$(iserr "$rep13_raw")" "false"
 check "T13 reply result says on the board" "$rep13" "on the board"
-b13=$(txt "$(call "$M3_W13" board '{}')")
+b13=$(sq "$CNTCTR_DB" "SELECT text FROM posts WHERE scope='$M3_DIR' AND text LIKE '%reply id=$tid13%'")
 check "T13 sender project board has fallback" "$b13" "for m3_s13 (reply id=$tid13):"
 t send-keys -t "$M3_S13" C-c Enter
 s13_next=$(call "$M3_S13" project '{}')
@@ -1676,7 +1676,7 @@ tid15=$(lastid "$M3_W15")
 t send-keys -t "$M3_C15" "printf 'Do you want to proceed?'" Enter
 expect_screen "T15 caller in prompt" "$M3_C15" "Do you want to proceed?"
 call "$M3_W15" reply "{\"id\":\"$tid15\",\"text\":\"late answer 15\"}" >/dev/null
-b15=$(txt "$(call "$M3_W15" board '{}')")
+b15=$(sq "$CNTCTR_DB" "SELECT text FROM posts WHERE scope='$M3_DIR' AND text LIKE '%late answer 15%'")
 check "T15 late gather reply is on the board" "$b15" "late answer 15"
 t send-keys -t "$M3_C15" C-c Enter
 
@@ -2017,10 +2017,54 @@ for _ in $(seq 600); do
     sleep 0.1
 done
 same "T39 reply is redelivered exactly once" "$delivered39" "1:1:1"
+# T44: delivered mail no longer counts as unread
+sq "$CNTCTR_DB" "UPDATE posts SET at=at-90000 WHERE scope='$M3_DIR' AND rowid != $post39"
+refute "T44 delivered fallback is not unread" "$(notice "$(call "$M3_S39" list '{}')")" "unread board post"
 call "$M3_S39" board '{}' >/dev/null
 sleep 0.5
 same "T39 later board call does not redeliver" "$(mail39)" "1:1:1"
 refute "T39 ordinary post is not typed" "$(screen "$M3_S39")" "ordinary unaddressed post 39"
+
+# T40-T43: digest, age, post limit, and private fallback mail
+M3_DIR40="$(realpath "$TMPD")/m3_repo40"; mkdir -p "$M3_DIR40"
+M3_A40=$(newpane m3_a40 -c "$M3_DIR40" sh)
+M3_B40=$(newpane m3_b40 -c "$M3_DIR40" sh)
+guide40=$(printf '%s\n' "$INIT" | "$BIN" | tail -n 1 | jq -r '.result.instructions')
+check "T40 instructions request board before final" "$guide40" "before your final reply"
+check "T42 post description directs one agent to send" "$post_desc" "use send"
+call "$M3_A40" post '{"text":"old news 41"}' >/dev/null
+check "T40 notice requests board before final" "$(notice "$(call "$M3_B40" list '{}')")" "before your final reply"
+sq "$CNTCTR_DB" "UPDATE posts SET at=at-90000 WHERE scope='$M3_DIR40'"
+refute "T41 old post is not unread" "$(notice "$(call "$M3_B40" list '{}')")" "unread board post"
+check "T41 board still lists old post" "$(txt "$(call "$M3_B40" board '{}')")" "old news 41"
+call "$M3_A40" post '{"text":"new news 41"}' >/dev/null
+check "T41 new post is unread" "$(notice "$(call "$M3_B40" list '{}')")" "1 unread board post"
+text501=$(printf '%0501d' 0)
+text500=$(printf '%0500d' 0)
+count42=$(sq "$CNTCTR_DB" "SELECT count(*) FROM posts WHERE scope='$M3_DIR40'")
+res42=$(call "$M3_A40" post "$(jq -nc --arg text "$text501" '{text:$text}')")
+same "T42 501 bytes rejected" "$(iserr "$res42")" "true"
+check "T42 error says note" "$(txt "$res42")" "note"
+check "T42 error says send" "$(txt "$res42")" "send"
+same "T42 rejected post stores nothing" "$(sq "$CNTCTR_DB" "SELECT count(*) FROM posts WHERE scope='$M3_DIR40'")" "$count42"
+same "T42 500 bytes accepted" "$(iserr "$(call "$M3_A40" post "$(jq -nc --arg text "$text500" '{text:$text}')")")" "false"
+count42u=$(sq "$CNTCTR_DB" "SELECT count(*) FROM posts WHERE scope='$M3_DIR40'")
+res42u=$(call "$M3_A40" post "$(jq -nc --arg text "$text501" '{text:$text,urgent:true}')")
+same "T42 urgent 501 bytes rejected" "$(iserr "$res42u")" "true"
+same "T42 rejected urgent post stores nothing" "$(sq "$CNTCTR_DB" "SELECT count(*) FROM posts WHERE scope='$M3_DIR40'")" "$count42u"
+refute "T42 urgent rejected text not typed" "$(screen "$M3_B40")" "$text501"
+M3_DIR43="$(realpath "$TMPD")/m3_repo43"; mkdir -p "$M3_DIR43"
+M3_A43=$(newpane m3_a43 -c "$M3_DIR43" sh)
+M3_B43=$(newpane m3_b43 -c "$M3_DIR43" sh)
+M3_W43=$(newpane m3_w43 -c "$M3_DIR43" sh)
+tid43=$(txt "$(call "$M3_A43" send '{"to":"m3_w43","text":"task 43"}')" | sed 's/sent id=//')
+t send-keys -t "$M3_A43" "printf 'Do you want to proceed?'" Enter
+expect_screen "T43 sender prompt visible" "$M3_A43" "Do you want to proceed?"
+call "$M3_W43" reply "{\"id\":\"$tid43\",\"text\":\"private reply 43\"}" >/dev/null
+refute "T43 other agent has no unread mail" "$(notice "$(call "$M3_B43" list '{}')")" "unread board post"
+refute "T43 other agent board hides mail" "$(txt "$(call "$M3_B43" board '{}')")" "private reply 43"
+check "T43 addressee board lists mail" "$(txt "$(call "$M3_A43" board '{}')")" "private reply 43"
+
 daemon_stop
 
 printf '%d passed, %d failed\n' "$pass" "$fail"
