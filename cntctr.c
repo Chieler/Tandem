@@ -1088,16 +1088,38 @@ static int start_send(json_object *a, int wait, char id[9], char **pane_out, cha
     char *rerr, *pane = resolve_target(to, &rerr);
     if (!pane) return fail(res, rerr);
     char *env, *err;
-    new_id(id);
-    track(id, wait);
-    track_to(id, pane);
+    const char *re = sarg(a, "re");
+    if (re && *re) {
+        char opt[64];
+        snprintf(opt, sizeof opt, "@cntctr_from_%s", re);
+        char *sender = sopt_get(opt);
+        snprintf(opt, sizeof opt, "@cntctr_to_%s", re);
+        char *target = sopt_get(opt);
+        int valid = strlen(re) == 8 && strspn(re, "0123456789abcdef") == 8 && sender && target &&
+                    !strcmp(sender, caller_pane) && !strcmp(target, pane);
+        free(sender), free(target);
+        if (!valid) {
+            free(pane);
+            return fail(res, fmt("unknown open task %s for this sender and agent; omit re for a new task", re));
+        }
+        snprintf(id, 9, "%s", re);
+    } else {
+        new_id(id);
+        track(id, wait);
+        track_to(id, pane);
+    }
     char *tname = pane_name(pane);   /* the real name, not the alias "parent" */
     const char *label = tname ? tname : to;
     env = envelope(id, text, label);
+    if (re && *re) {
+        char *add = fmt("[cntctr from=%s id=%s addendum]%s", caller_name, id, strchr(env, '\n'));
+        free(env);
+        env = add;
+    }
     err = inject(pane, label, env);
     free(env);
     if (err) {
-        untrack(id);
+        if (!re || !*re) untrack(id);
         free(pane);
         free(tname);
         return fail(res, err);
