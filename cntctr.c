@@ -2743,7 +2743,10 @@ static void learn_mail_identity(const char *pane, const char *name) {
     snprintf(mail_pane, sizeof mail_pane, "%s", pane);
     snprintf(mail_name, sizeof mail_name, "%s", name);
     pthread_mutex_unlock(&mail_mu);
-    if (changed) notify_all();
+    if (changed && *fifo_path) {
+        int fd = open(fifo_path, O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd >= 0) { write(fd, "m", 1); close(fd); }
+    }
 }
 
 /* Turn any bytes in our FIFO into one list_changed; a burst is one notification. */
@@ -2758,11 +2761,16 @@ static void *fifo_watch(void *arg) {
             return NULL;
         }
         if (!ready) { pending = redeliver_mail(); continue; }
-        while (read(pf.fd, buf, sizeof buf) > 0) {}   /* until EAGAIN: our own keepalive writer means never EOF */
+        int tools_changed = 0;
+        ssize_t n;
+        while ((n = read(pf.fd, buf, sizeof buf)) > 0)
+            if (memchr(buf, 'x', (size_t)n)) tools_changed = 1;
+        if (tools_changed) {
         json_object *m = json_object_new_object();
         json_object_object_add(m, "jsonrpc", json_object_new_string("2.0"));
         json_object_object_add(m, "method", json_object_new_string("notifications/tools/list_changed"));
         emit(m);
+        }
         pending = redeliver_mail();
     }
 }
