@@ -85,6 +85,103 @@ newpane() {
 }
 
 # Isolated 0.4.0 tests can run while another worktree runs the full suite.
+if [ "${ONLY:-}" = u1 ]; then
+    t set-environment -g U1_DIR "$TMPD"
+    cat > "$TMPD/bin/headroom" <<'EOF'
+#!/bin/sh
+tool=$2; shift 2
+[ "$1" = -- ] && shift
+exec "$tool" "$@"
+EOF
+    cat > "$TMPD/bin/claude" <<'EOF'
+#!/usr/bin/env python3
+import json, os, subprocess, time
+root=os.environ['U1_DIR']
+with open(root+'/u1.env','w') as f: json.dump({k:os.environ.get(k) for k in ('CNTCTR_PANE','CNTCTR_TMUX','CNTCTR_NAME')},f)
+p=subprocess.Popen([os.environ['BIN']],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
+def call(i, method, params):
+    p.stdin.write(json.dumps({'jsonrpc':'2.0','id':i,'method':method,'params':params})+'\n'); p.stdin.flush()
+    while True:
+        row=json.loads(p.stdout.readline())
+        if row.get('id')==i: return row
+init={'protocolVersion':'2025-06-18','clientInfo':{'name':'fake'}}
+call(1,'initialize',init)
+with open(root+'/u1.first','w') as f: json.dump(call(2,'tools/call',{'name':'list','arguments':{}}),f)
+while not os.path.exists(root+'/u1.go'): time.sleep(.05)
+with open(root+'/u1.post','w') as f: json.dump(call(3,'tools/call',{'name':'post','arguments':{'text':'identity after rename'}}),f)
+with open(root+'/u1.second','w') as f: json.dump(call(4,'tools/call',{'name':'list','arguments':{}}),f)
+p.stdin.close(); p.wait()
+EOF
+    chmod +x "$TMPD/bin/headroom" "$TMPD/bin/claude"
+    U_P=$(newpane u1_parent)
+    spawn1=$(txt "$(call "$U_P" spawn '{"harness":"claude","name":"u1_worker","task":"identity test"}')")
+    U_A=$(printf '%s' "$spawn1" | sed -n 's/.* in \(%[0-9]*\) .*/\1/p')
+    for _ in $(seq 100); do [ -s "$TMPD/u1.first" ] && break; sleep 0.1; done
+    same "U1 pane is supplied at spawn" "$(jq -r '.CNTCTR_PANE // ""' "$TMPD/u1.env")" "$U_A"
+    same "U1 socket is supplied at spawn" "$(jq -r '.CNTCTR_TMUX // ""' "$TMPD/u1.env")" "$(t display -p '#{socket_path}')"
+    same "U1 name is supplied at spawn" "$(jq -r '.CNTCTR_NAME // ""' "$TMPD/u1.env")" u1_worker
+    check "U1 spawned server lists agent without from" "$(jq -r '.result.content[0].text' "$TMPD/u1.first")" "u1_worker"
+    t set -p -t "$U_A" @cntctr_name u1_renamed
+    touch "$TMPD/u1.go"
+    for _ in $(seq 100); do [ -s "$TMPD/u1.second" ] && break; sleep 0.1; done
+    check "U1 renamed agent listed" "$(jq -r '.result.content[0].text' "$TMPD/u1.second")" "u1_renamed"
+    check "U1 posts under current pane name" "$(txt "$(call "$U_P" board '{}')")" "u1_renamed: identity after rename"
+    cat > "$TMPD/bin/codex" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$@" > "$U1_DIR/u1.codex"
+exec cat
+EOF
+    chmod +x "$TMPD/bin/codex"
+    call "$U_P" spawn '{"harness":"codex","name":"u1_codex","task":"identity test"}' >/dev/null
+    for _ in $(seq 100); do [ -s "$TMPD/u1.codex" ] && break; sleep 0.1; done
+    check "U1 codex forwards identity to its MCP server" "$(cat "$TMPD/u1.codex")" 'mcp_servers.cntctr.env_vars=["CNTCTR_PANE","CNTCTR_TMUX","CNTCTR_NAME"]'
+    printf '%d passed, %d failed\n' "$pass" "$fail"; [ "$fail" -eq 0 ]; exit $?
+fi
+
+if [ "${ONLY:-}" = u2 ]; then
+    mkdir -p "$TMPD/sessions"
+    export CNTCTR_CLAUDE_SESSIONS_DIR="$TMPD/sessions"
+    cat > "$TMPD/claude.c" <<'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    char path[4096];
+    snprintf(path, sizeof path, "%s/%ld.json", argv[1], argc > 3 ? 99999999L : (long)getpid());
+    FILE *f = fopen(path, "w");
+    if (!f) return 2;
+    fprintf(f, "{\"tmux\":\"cntctr:@1.%s\"}", argv[2]); fclose(f);
+    pid_t child = fork();
+    if (!child) { unsetenv("TMUX_PANE"); unsetenv("CNTCTR_PANE"); unsetenv("CNTCTR_NAME"); execl(getenv("BIN"), getenv("BIN"), (char *)0); _exit(127); }
+    int status; waitpid(child, &status, 0); return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
+EOF
+    cc -o "$TMPD/bin/claude" "$TMPD/claude.c"
+    U_A=$(newpane u2_agent)
+    python3 - "$TMPD/bin/claude" "$TMPD/sessions" "$U_A" "$TMPD" <<'EOF'
+import json, subprocess, sys
+exe, directory, pane, root = sys.argv[1:]
+def probe(dead):
+    p=subprocess.Popen([exe,directory,pane]+(['dead'] if dead else []),stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
+    def call(i,method,params):
+        p.stdin.write(json.dumps({'jsonrpc':'2.0','id':i,'method':method,'params':params})+'\n');p.stdin.flush()
+        while True:
+            v=json.loads(p.stdout.readline())
+            if v.get('id')==i:return v
+    call(1,'initialize',{'protocolVersion':'2025-06-18','clientInfo':{'name':'fake'}})
+    result=call(2,'tools/call',{'name':'post','arguments':{'text':'session ancestor'}})
+    p.stdin.close();p.wait()
+    return result
+open(root+'/u2.live','w').write(json.dumps(probe(False)))
+open(root+'/u2.dead','w').write(json.dumps(probe(True)))
+EOF
+    same "U2 live claude ancestor identifies pane" "$(jq -r '.result.isError' "$TMPD/u2.live")" false
+    same "U2 dead session cannot identify pane" "$(jq -r '.result.isError' "$TMPD/u2.dead")" true
+    check "U2 live session posted as agent" "$(txt "$(call "$U_A" board '{}')")" "u2_agent: session ancestor"
+    printf '%d passed, %d failed\n' "$pass" "$fail"; [ "$fail" -eq 0 ]; exit $?
+fi
+
 if [ "${ONLY:-}" = u25 ] || [ "${ONLY:-}" = u26 ]; then
     export CNTCTR_PASTE_WAIT_MS=100
     U_P=$(newpane u_sender)
@@ -132,9 +229,9 @@ fi
 if [ "${ONLY:-}" = u27 ]; then
     cat > "$TMPD/bin/headroom" <<'EOF'
 #!/bin/sh
-shift 2
+tool=$2; shift 2
 [ "$1" = -- ] && shift
-exec "$@"
+exec "$tool" "$@"
 EOF
     cat > "$TMPD/bin/codex" <<'EOF'
 #!/bin/sh
@@ -597,13 +694,13 @@ expect_screen "review gets the review model" "$(pane_of "$out")" "flags:  --mode
 out=$(call "$L" spawn '{"harness":"claude","name":"r4","task":"Design the architecture for cross-machine sync; find the race conditions."}')
 expect_screen "hard task gets the strongest model" "$(pane_of "$out")" "flags:  --model claude-opus-5-5 --effort high"
 out=$(call "$L" spawn '{"harness":"codex","name":"r5","task":"rename foo to bar in kb.c"}')
-expect_screen "codex light task" "$(pane_of "$out")" "flags:  -m gpt-6-luna -c model_reasoning_effort=\"low\""
+expect_screen "codex light task" "$(pane_of "$out")" "flags:  -m gpt-6.1-terra -c model_reasoning_effort=\"low\""
 out=$(call "$L" spawn '{"harness":"codex","name":"r5s","task":"Implement the retry loop."}')
 expect_screen "codex standard task" "$(pane_of "$out")" "flags:  -m gpt-6.1-terra -c model_reasoning_effort=\"medium\""
 out=$(call "$L" spawn '{"harness":"codex","name":"r5r","task":"Review the retry loop."}')
-expect_screen "codex review task" "$(pane_of "$out")" "flags:  -m gpt-6.1-sol -c model_reasoning_effort=\"medium\""
+expect_screen "codex review task" "$(pane_of "$out")" "flags:  -m gpt-6.1-sol -c model_reasoning_effort=\"high\""
 out=$(call "$L" spawn '{"harness":"codex","name":"r5h","task":"Design the architecture for cross-machine sync."}')
-expect_screen "codex hard task" "$(pane_of "$out")" "flags:  -m gpt-6.1-sol -c model_reasoning_effort=\"high\""
+expect_screen "codex hard task" "$(pane_of "$out")" "flags:  -m gpt-6.1-terra -c model_reasoning_effort=\"high\""
 out=$(call "$L" spawn '{"harness":"agy","name":"r6b","task":"rename foo to bar"}')
 expect_screen "agy light task stays on medium" "$(pane_of "$out")" "flags:  --model gemini-3.8-flash-medium --effort medium"
 out=$(call "$L" spawn '{"harness":"agy","name":"r6","task":"Design the architecture for the new sync layer."}')

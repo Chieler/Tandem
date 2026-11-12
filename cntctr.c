@@ -257,14 +257,39 @@ static long parent_of(const char *procs, long pid) {
  * the pane's tag, tagging an untagged pane (e.g. a leader the user started by
  * hand) as <client>-<pane number>. */
 static void find_self(void) {
-    const char *env = getenv("TMUX_PANE");
+    const char *env = getenv("CNTCTR_PANE");
+    if (!env || !*env) env = getenv("TMUX_PANE");
     if (env && *env) {
         snprintf(self_pane, sizeof self_pane, "%s", env);
     } else {
         char *panes, *procs;
         int found = TMUX(NULL, &panes, "list-panes", "-a", "-F", "#{pane_pid} #{pane_id}") == 0;
         found = run(NULL, &procs, (const char *[]){"ps", "-A", "-o", "pid=,ppid=", NULL}) == 0 && found;
-        for (long pid = getpid(); found && pid > 1 && !match_pane(panes, pid); pid = parent_of(procs, pid)) {}
+        for (long pid = getpid(); found && pid > 1; pid = parent_of(procs, pid)) {
+            if (match_pane(panes, pid)) break;
+            char pid_text[32], *command = NULL;
+            snprintf(pid_text, sizeof pid_text, "%ld", pid);
+            if (run(NULL, &command, (const char *[]){"ps", "-p", pid_text, "-o", "comm=", NULL}) == 0) {
+                const char *base = strrchr(command, '/');
+                base = base ? base + 1 : command;
+                if (!strcmp(base, "claude") && kill((pid_t)pid, 0) == 0) {
+                    const char *dir = getenv("CNTCTR_CLAUDE_SESSIONS_DIR");
+                    char path[PATH_MAX];
+                    if (dir && *dir) snprintf(path, sizeof path, "%s/%ld.json", dir, pid);
+                    else snprintf(path, sizeof path, "%s/.claude/sessions/%ld.json", getenv("HOME") ? getenv("HOME") : "", pid);
+                    json_object *session = json_object_from_file(path), *field = NULL;
+                    if (session && json_object_object_get_ex(session, "tmux", &field)) {
+                        const char *value = json_object_get_string(field);
+                        const char *pane = value ? strrchr(value, '%') : NULL;
+                        if (pane && pane[1] && strspn(pane + 1, "0123456789") == strlen(pane + 1))
+                            snprintf(self_pane, sizeof self_pane, "%s", pane);
+                    }
+                    if (session) json_object_put(session);
+                }
+            }
+            free(command);
+            if (*self_pane) break;
+        }
         free(panes);
         free(procs);
     }
@@ -274,7 +299,9 @@ static void find_self(void) {
     if (TMUX(NULL, &name, "show", "-pqv", "-t", self_pane, "@cntctr_name") == 0 && *name) {
         snprintf(self_name, sizeof self_name, "%s", name);
     } else {
-        snprintf(self_name, sizeof self_name, "%s-%s", client_name, self_pane + 1);
+        const char *fallback = getenv("CNTCTR_NAME");
+        if (fallback && *fallback) snprintf(self_name, sizeof self_name, "%s", fallback);
+        else snprintf(self_name, sizeof self_name, "%s-%s", client_name, self_pane + 1);
         free(TMUXE(NULL, "set", "-p", "-t", self_pane, "@cntctr_name", self_name));
         free(TMUXE(NULL, "set", "-p", "-t", self_pane, "@cntctr_harness", client_name));
     }
@@ -1357,17 +1384,28 @@ static int spawn_locked(json_object *a, int wait, char id[9], char **pane_out,
         trust = strdup(json_object_to_json_string_ext(st, JSON_C_TO_STRING_PLAIN | JSON_C_TO_STRING_NOSLASHESCAPE));
         json_object_put(st);
     }
-    const char *argv[24] = {"tmux", "new-window", "-d", "-n", name, "-c", cwd, "-P", "-F", "#{pane_id}"};
-    n = 10;
+    char *socket_path = NULL;
+    if (TMUX(NULL, &socket_path, "display", "-p", "#{socket_path}") != 0) {
+        free(ceffort); free(trust); free(env); untrack(id);
+        return fail(res, socket_path);
+    }
+    char *name_env = fmt("CNTCTR_NAME=%s", name), *socket_env = fmt("CNTCTR_TMUX=%s", socket_path);
+    free(socket_path);
+    const char *argv[40] = {"tmux", "new-window", "-d", "-n", name, "-c", cwd, "-P", "-F", "#{pane_id}",
+        "-e", name_env, "-e", socket_env, "sh", "-c",
+        "export CNTCTR_PANE=\"$TMUX_PANE\"; tmux set -p -t \"$CNTCTR_PANE\" @cntctr_name \"$CNTCTR_NAME\"; exec \"$@\"", "cntctr-start"};
+    n = 18;
     if (!agy) argv[n++] = "headroom", argv[n++] = "wrap";   /* route claude and codex API calls through headroom */
     argv[n++] = harness;
     if (!agy) argv[n++] = "--";
     if (model) argv[n++] = codex ? "-m" : "--model", argv[n++] = model;
     if (effort) argv[n++] = codex ? "-c" : "--effort", argv[n++] = codex ? ceffort : effort;
+    if (codex) argv[n++] = "-c", argv[n++] = "mcp_servers.cntctr.env_vars=[\"CNTCTR_PANE\",\"CNTCTR_TMUX\",\"CNTCTR_NAME\"]";
     if (agy) argv[n++] = "--settings", argv[n++] = trust;
     if (agy) argv[n++] = "-i";
     argv[n++] = env;
     int rc = run(NULL, &pane, argv);
+    free(name_env); free(socket_env);
     free(ceffort);
     free(trust);
     free(env);
@@ -2480,7 +2518,9 @@ static char *resolve_from(const char *from) {
 /* Make caller_* ours, or whoever `from` names. Returns an error or NULL. */
 static char *set_caller(json_object *args) {
     snprintf(caller_pane, sizeof caller_pane, "%s", self_pane);
-    snprintf(caller_name, sizeof caller_name, "%s", self_name);
+    char *current = *self_pane ? pane_name(self_pane) : NULL;
+    snprintf(caller_name, sizeof caller_name, "%s", current && *current ? current : self_name);
+    free(current);
     const char *from = sarg(args, "from");
     return from && *from ? resolve_from(from) : NULL;
 }
@@ -3220,6 +3260,12 @@ int main(int argc, char **argv) {
         return 2;
     }
     signal(SIGPIPE, SIG_IGN);
+    const char *socket = getenv("CNTCTR_TMUX");
+    if (socket && *socket) {
+        char *tmux = fmt("%s,0,0", socket);
+        setenv("TMUX", tmux, 1);
+        free(tmux);
+    }
     const char *delay = getenv("CNTCTR_ENTER_DELAY_MS");
     if (delay) enter_delay_ms = atoi(delay);
     regcomp(&name_re, "^[a-z][a-z0-9_]{1,40}$", REG_EXTENDED | REG_NOSUB);
