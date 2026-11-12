@@ -682,10 +682,15 @@ static char *inject(const char *pane, const char *who, const char *text) {
         err = fmt("%s awaiting permission prompt; retry later", who);
         goto done;
     }
-    size_t n = strlen(text);
-    /* Claude reads backslash + Enter as "new line", not "submit". */
-    char *body = n && text[n - 1] == '\\' ? fmt("%s\n", text) : NULL;
-    err = paste(pane, body ? body : text, 1);
+    const char *id = strstr(text, "id="), *nl = strchr(text, '\n');
+    char fresh[9];
+    if (!id || (nl && id > nl)) {
+        snprintf(fresh, sizeof fresh, "%08x", arc4random());
+        id = fresh;
+    } else id += 3;
+    size_t n = strcspn(id, "]): \n");
+    char *body = fmt("%s\n[cntctr end id=%.*s]", text, (int)n, id);
+    err = paste(pane, body, 1);
     free(body);
     if (err) goto done;
     struct timespec pause = {enter_delay_ms / 1000, (enter_delay_ms % 1000) * 1000000L};
@@ -2668,7 +2673,8 @@ static const char GUIDE[] =
     "or a skill with note (for a procedure). Before starting such work, check tools/list and recall. "
     "When a note goes stale, write the replacement with note supersedes=[old id], or forget it; recall hides both. "
     "Workers reach the agent that spawned them with to=\"parent\". Board posts are read with board; tool results show an unread count. "
-    "Pass urgent=true only when every agent must see a post now.";
+    "Pass urgent=true only when every agent must see a post now. "
+    "An end line [cntctr end id=...] without its header means the start was lost; reply to that id asking for a resend.";
 
 /* Usage guide plus the knowledge index: our project's and global entries, or only
  * global ones for a server outside any pane (Codex), capped at 40 lines and 4 KB. */
