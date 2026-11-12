@@ -65,6 +65,7 @@ static char self_name[128];              /* our agent name (the pane's @cntctr_n
 /* Who the current tool call is from: self_*, or the `from` argument when one shared
  * server (Codex) serves many panes. Set per call in dispatch. */
 static _Thread_local char caller_pane[32], caller_name[128];
+static _Thread_local int call_unread;
 static _Thread_local int fleet_depth;   /* fleet tools running above this call; at most 3 */
 static _Thread_local long long fleet_deadline;   /* deadline of the outermost running tool; nested runs get no more */
 static pthread_mutex_t fork_mu = PTHREAD_MUTEX_INITIALIZER;   /* held from pipe() to fork() */
@@ -2320,6 +2321,7 @@ static int review_unbound(sqlite3 *db, const char *key, const char *tool) {
 
 /* Resolve `name` for the caller and run it in a sandbox. `args` may be NULL. */
 static int use_tool(const char *name, json_object *args, char **res) {
+    if (!fleet_depth && *caller_pane && *caller_name) call_unread = unread_count(caller_pane, caller_name);
     if (fleet_depth >= 3) return fail(res, fmt("fleet tools nested too deep"));
     expire_reviews();
     if (!*caller_pane)
@@ -2882,6 +2884,7 @@ static void *call_thread(void *arg) {
     json_object_array_add(content, item);
     if (*caller_pane && *caller_name) {
         int unread = unread_count(caller_pane, caller_name);
+        if (call_unread > unread) unread = call_unread;
         pthread_mutex_lock(&out_mu);
         int report = unread != last_unread || (tool && strcmp(tool, "list") == 0);
         last_unread = unread;
