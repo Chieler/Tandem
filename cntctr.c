@@ -969,6 +969,7 @@ static int deliver_buffer(const char *buf, const char *id, const char *agent) {
 struct gathered {
     const char *kind, *agent, *status;   /* status: NULL while pending */
     char id[9], *pane, *text, *resets;
+    int on_board;                        /* the send took the board fallback */
 };
 
 static void unwait(const char *id) {
@@ -1487,7 +1488,7 @@ static int tool_gather(json_object *a, char **res) {
         } else if (cancelled()) {
             item->text = strdup("gather cancelled before dispatch");
         } else if (item->kind && strcmp(item->kind, "send") == 0) {
-            start_send(task, wait, item->id, &item->pane, NULL, &item->text);
+            start_send(task, wait, item->id, &item->pane, &item->on_board, &item->text);
         } else if (item->kind && strcmp(item->kind, "spawn") == 0) {
             start_spawn(task, wait, item->id, &item->pane, NULL, &item->text);
         } else {
@@ -1498,7 +1499,7 @@ static int tool_gather(json_object *a, char **res) {
 
     if (!wait) {
         for (size_t i = 0; i < count; i++)
-            if (!items[i].status) items[i].status = "sent";
+            if (!items[i].status) items[i].status = items[i].on_board ? "sent on board" : "sent";
     } else {
         wait_tasks(items, count, deadline);
         finish_pending(items, count);

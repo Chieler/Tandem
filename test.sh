@@ -90,6 +90,21 @@ if [ "${ONLY:-}" = hooks ]; then
     exit $?
 fi
 
+# gather wait=false must say when a send took the board fallback
+gboard_run() {
+    local sender target r
+    sender=$(newpane gb_sender); target=$(newpane gb_off)
+    t select-pane -d -t "$target"
+    r=$(txt "$(call "$sender" gather '{"tasks":[{"kind":"send","to":"gb_off","text":"gather input off"}],"wait":false}')")
+    same "gather wait=false names the board fallback" "$(printf '%s' "$r" | jq -r '.results[0].status')" "sent on board"
+    check "gather wait=false board send is stored" "$(txt "$(call "$target" board '{}')")" "gather input off"
+}
+if [ "${ONLY:-}" = gboard ]; then
+    gboard_run
+    printf '%d passed, %d failed\n' "$pass" "$fail"
+    [ "$fail" -eq 0 ]; exit $?
+fi
+
 if [ "${ONLY:-}" = u1 ]; then
     t set-environment -g U1_DIR "$TMPD"
     cat > "$TMPD/bin/headroom" <<'EOF'
@@ -528,6 +543,7 @@ same "async gather is not complete" "$(printf '%s' "$gather" | jq -r '.complete'
 expect_screen "async gather dispatched" "$GA" "async one"
 call "$GA" reply "{\"id\":\"$(lastid "$GA")\",\"text\":\"async answer\"}" >/dev/null
 expect_screen "async gather answer reaches pane" "$S" "async answer"
+gboard_run
 
 # a worker that dies ends its task as dead
 GD=$(newpane gd sh -c 'sleep 6')
