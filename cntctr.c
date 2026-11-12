@@ -707,7 +707,10 @@ static char *inject(const char *pane, const char *who, const char *text) {
         id = fresh;
     } else id += 3;
     size_t n = strcspn(id, "]): \n");
-    char *body = fmt("%s\n[cntctr end id=%.*s]", text, (int)n, id);
+    char *ending = fmt("[cntctr end id=%.*s]", (int)n, id);
+    size_t len = strlen(text), endlen = strlen(ending);
+    char *body = len >= endlen && !strcmp(text + len - endlen, ending) ? strdup(text) : fmt("%s\n%s", text, ending);
+    free(ending);
     err = paste(pane, body, 1);
     free(body);
     if (err) goto done;
@@ -783,8 +786,8 @@ static char *envelope(const char *id, const char *text, const char *you) {
     char *hints = knowledge_hints(text);
     char *env = fmt("[cntctr from=%s id=%s]\n%s\n%s[when done: call the reply tool of the cntctr MCP server with id=%s and your answer, "
                     "plus insights=[...] with durable facts other agents should know; it is an MCP tool, not a shell command. "
-                    "Your agent name is %s: pass from=%s on every cntctr call]",
-                    caller_name, id, text, hints, id, you, you);
+                    "Your agent name is %s: pass from=%s on every cntctr call]\n[cntctr end id=%s]",
+                    caller_name, id, text, hints, id, you, you, id);
     free(hints);
     return env;
 }
