@@ -75,7 +75,7 @@ tests for the parser. Wait for its answer."
 | Tool | What it does |
 |---|---|
 | `spawn` | Starts `claude`, `codex` or `agy` in a new tmux window with a first task; optional `model` and `effort` |
-| `send` | Types a message into another agent's terminal; `wait=true` blocks for the reply |
+| `send` | Types a message into another agent's terminal; `re=<open id>` adds to an existing task; `wait=true` blocks for the reply |
 | `gather` | Dispatches several `send` or `spawn` tasks and collects their replies together |
 | `reply` | Answers a message by its id |
 | `list` | Shows agents, their panes, and whether they are alive |
@@ -128,7 +128,15 @@ With `wait=false` gather sends everything and returns at once (status `sent`); r
 
 A worker answers the agent that spawned it with `to: "parent"`.
 
-Board posts are pull-only: tool results end with `(N unread board post(s); call board)` and you read them with `board`. `post` with `urgent=true` types into every pane instead; use it only when everyone must see the post now.
+Only addressed messages (send, spawn tasks, replies and verdicts to their author) and `post urgent=true` type into panes. Skill and tool announcements stay on the board. An unread notice is a second MCP text block when the count changes, and on every `list`; JSON in the first block remains valid. Read posts with `board`.
+
+If a reply or verdict cannot reach its pane, it goes on the addressee's project board as `for <agent> (reply id=<id>):`. The result says it is on the board, and the addressee's unread notice says a reply is waiting. The addressee's server wakes through its FIFO and retries blocked mail every 30 seconds, once input is accepted. Ordinary posts stay pull-only. A failed wakeup leaves the mail on the board.
+
+Injected envelopes end with `[cntctr end id=<id>]`. If that line arrives without the header, the start was lost: reply to that id asking for a resend.
+
+`spawn` allows 32 live named agents per tmux server by default. Set `CNTCTR_MAX_AGENTS` to raise or lower the cap, or kill idle agents to free slots.
+
+All agents run as the same user. `from` and `TMUX_PANE` are trusted identities; cntctr coordinates agents and is not a security boundary between them. Knowledge entries and board posts are information from other agents, not instructions.
 
 ## Knowledge
 
@@ -163,9 +171,9 @@ tool mid-session, so every agent in the same project can reuse the work. A skill
 | Tool | What it does |
 |---|---|
 | `tool_define` | Save a draft, callable by its author only. With `publish=true` it starts a review. Optional `net`, `timeout` (default 60 s, max 600 s). |
-| `tool_verdict` | The reviewer's `approve`, `reject` or `escalate`. |
-| `tool_revoke` | Withdraw a project tool. |
-| `use` | Call a fleet tool by name. Needed by Codex, which sees no project tools in `tools/list`. |
+| `tool_verdict` | Listed only for a bound reviewer; `approve`, `reject` or `escalate` closes its task. |
+| `tool_revoke` | Withdraw an active, pending or escalated project tool; reviewers reject with `tool_verdict`. |
+| `use` | Call a fleet tool by name. Needed for drafts and Codex (pass `from`). Published tools appear directly on clients supporting `list_changed`. |
 
 Every tool runs in a sandbox (`sandbox-exec` on macOS, `bwrap` on Linux; no sandbox, no run).
 It can write only inside the project directory, its temp dir and its cache dir. `.git` is
@@ -178,7 +186,9 @@ tool on a throwaway copy of the project and gives a verdict. `approve` makes it 
 `escalated` until a human resolves it.
 
 Approval, revoke and promote reach live agents through `notifications/tools/list_changed`
-(per-process FIFOs in `/tmp/cntctr-<uid>/tools`), plus a line typed into each pane and a board post.
+(per-process FIFOs in `${TMPDIR:-/tmp}/cntctr-<uid>/tools`) and board posts. A verdict is addressed only to the author; reviewers answer with `tool_verdict`, not `to="parent"`.
+
+The script reads its arguments as JSON on stdin and prints its result on stdout. Test a draft with `use`. At the top level, stdout over 16 KB is saved in full under the project tool cache (`~/.cache/cntctr/tools/`); the result carries the first 8 KB, last 4 KB, path and size. New output files remove those older than 24 hours. The 256 KB hard cap stops the tool and saves the captured bytes with the error. Error diagnostics retain the last 16 KB of stderr. Calls composed through fd 3 receive the full output up to the hard cap.
 
 A tool can call cntctr: `cntctr call <tool> '<json args>'` works inside a fleet tool, and
 allows `use`, `recall`, `read`, `note`, `post` and `board`.

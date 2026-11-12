@@ -3,7 +3,7 @@
 Releases:
 - `v0.1.0`: tag on main, before fleet tools.
 - `0.2.0`: on main, tag `v0.2.0` (2026-11-08); live in all harnesses as `~/.local/bin/cntctr-0.2.0`.
-- `0.3.0`: branch feat/fleet-tools, rebased onto 0.2.0 after it ships.
+- `0.3.0`: merged 0.2.0 and fleet tools on merge/0.3.0; release review pending.
 Source: orchestrator feedback, 2026-11-07, ranked by cost.
 
 ## 0.2.0
@@ -29,7 +29,26 @@ Source: orchestrator feedback, 2026-11-07, ranked by cost.
 - kb_unread builds a text list nobody reads; replace with one SELECT max(rowid), sum(sender != me)
 
 ## 0.3.0
-- [ ] Rebase feat/fleet-tools onto 0.2.0
+- [x] Merge 0.2.0 and fleet tools with one version and isolated test sockets
+- [x] Addressed or urgent delivery only; announcements stay on the board
+- [x] Separate unread result blocks; durable reply fallback and FIFO redelivery
+- [x] End markers and `send re=<open id>` addenda
+- [x] Complete large-output cache files and stderr tails
+- [x] Reviewer-only verdict listing, review task closure, dynamic fences and visibility notifications
+- [x] Board truncation counts, tab-safe agent lists, private FIFO directories, board index, word routing and agent cap
+- [x] macOS hard-link and Unix-socket sandbox restrictions
+- [x] Tool wording, argument examples and capped knowledge index
+
+### Open after 0.3.0
+
+- Bind identity to the connection instead of trusting `from` or `TMUX_PANE`; agents currently share one user and trust each other.
+- Kill fleet tools on client disconnect; their timeout currently bounds execution.
+- Anchor permission detection to the active dialog after collecting real screen samples; board fallback protects false positives.
+- Protect against hard links already present before the sandbox starts; creating them requires an actor outside the sandbox.
+- Verify bwrap Unix-socket isolation and hard-link behavior on Linux (not testable on macOS).
+- Detect wait-graph deadlocks; all waits currently have finite timeouts.
+- Reproduce the root cause of truncated pastes with a real Claude Code pane during adversarial review.
+- Clean stale review findings from shared insights against the released code.
 - [ ] Shared resource claims for rate-limited APIs (maybe a fleet tool, not core)
 
 ## Done
