@@ -2246,7 +2246,7 @@ static int tool_verdict(json_object *a, char **res) {
         free(announce(db, p.key, caller_name, text, pane, 0));   /* the board keeps the reason if the author's pane is gone */
     } else {
         needs_human(db, p.key, name, version, reason && *reason ? reason : "the reviewer could not decide");
-        text = fmt("fleet tool %s v%d escalated: %s", name, version, reason ? reason : "");
+        text = fmt("fleet tool %s v%d needs a human: %s", name, version, reason ? reason : "");
         char *vid = fmt("%s-v%d", name, version);
         delivery = deliver(pane, author ? author : "?", p.key, vid, text);
         free(vid);
@@ -2263,7 +2263,7 @@ static int tool_verdict(json_object *a, char **res) {
     free(author);
     free(root);
     return delivery < 0 ? fail(res, fmt("verdict committed but delivery failed"))
-                        : ok(res, fmt(delivery ? "verdict is on the board" : "ok"));
+                        : ok(res, fmt(delivery ? "ok; verdict is on the board" : "ok"));
 }
 
 static int tool_revoke(json_object *a, char **res) {
