@@ -84,6 +84,38 @@ newpane() {
     echo "$pane"
 }
 
+# Isolated 0.4.0 tests can run while another worktree runs the full suite.
+if [ "${ONLY:-}" = u27 ]; then
+    cat > "$TMPD/bin/headroom" <<'EOF'
+#!/bin/sh
+shift 2
+[ "$1" = -- ] && shift
+exec "$@"
+EOF
+    cat > "$TMPD/bin/codex" <<'EOF'
+#!/bin/sh
+exec cat
+EOF
+    chmod +x "$TMPD/bin/headroom" "$TMPD/bin/codex"
+    U27_P=$(newpane u27_parent)
+    u27=$(txt "$(call "$U27_P" spawn '{"harness":"codex","name":"u27_hard","task":"implement the migration design"}')")
+    check "U27 hard codex routes terra high" "$u27" "gpt-6.1-terra high"
+    u27=$(txt "$(call "$U27_P" spawn '{"harness":"codex","name":"u27_review","task":"adversarial review"}')")
+    check "U27 review codex routes sol high" "$u27" "gpt-6.1-sol high"
+    u27=$(txt "$(call "$U27_P" spawn '{"harness":"codex","name":"u27_adversarial","task":"adversarial"}')")
+    check "U27 adversarial whole word routes review" "$u27" "review: gpt-6.1-sol high"
+    u27=$(txt "$(call "$U27_P" spawn '{"harness":"codex","name":"u27_redteam","task":"red team"}')")
+    check "U27 red team whole words route review" "$u27" "review: gpt-6.1-sol high"
+    u27=$(txt "$(call "$U27_P" spawn '{"harness":"codex","name":"u27_partial","task":"misadversarially"}')")
+    check "U27 partial adversarial does not route review" "$u27" "standard: gpt-6.1-terra medium"
+    u27=$(txt "$(call "$U27_P" spawn '{"harness":"codex","name":"u27_model","task":"adversarial","model":"chosen-model"}')")
+    check "U27 explicit model wins" "$u27" "chosen-model"
+    u27=$(txt "$(call "$U27_P" spawn '{"harness":"codex","name":"u27_tier","task":"adversarial","tier":"light"}')")
+    check "U27 explicit tier wins" "$u27" "light: gpt-6.1-terra low"
+    printf '%d passed, %d failed\n' "$pass" "$fail"
+    [ "$fail" -eq 0 ]; exit $?
+fi
+
 if [ "${ONLY:-}" != "m3" ]; then
 
 # ---- MCP protocol ----
