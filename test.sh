@@ -71,11 +71,14 @@ session() {
     }
     rm -f "$fifo"
 }
-# Since F9 the shared call lists with all=true: the tests are about something else. STRICT=1 (see scall) sends the arguments as given; the F9 tests use it.
+# Fixture panes mostly have no parent, so since F9 the shared call sends with cross=true and lists with all=true: the tests are about
+# something else. STRICT=1 (see scall) sends the arguments as given; the F9 tests use it.
 call_args() {
     [ -n "${STRICT:-}" ] && { printf '%s' "$2"; return; }
     printf '%s' "$2" | jq -c --arg tool "$1" '
         if $tool == "list" then . + {all: true}
+        elif $tool == "send" or $tool == "kill" then . + {cross: true}
+        elif $tool == "gather" and (.tasks | type) == "array" then .tasks |= map(if type == "object" and .kind == "send" then . + {cross: true} else . end)
         else . end' 2>/dev/null || printf '%s' "$2"
 }
 call_raw() {
@@ -139,7 +142,7 @@ u28_run() {
     pass=$((pass + p)); fail=$((fail + f))
 }
 # F9: agents only task agents they own. list shows owner and directory, and by default only the caller, its workers, parent and siblings;
-# Run alone with ONLY=f9.
+# send, gather and kill refuse any other agent unless cross=true. Run alone with ONLY=f9.
 has_pane() { t list-panes -a -F '#{pane_id}' | grep -qx "$1"; }
 f9_run() {
     local C W PAR SIB USR OW dirs out txt_ before after n all_n vis_n
@@ -174,6 +177,60 @@ f9_run() {
     check "F9.4 and the count line" "$out" "other agents (list all=true shows them)"
     out=$(txt "$(scall "" list "{\"from\":\"f9_me\"}")")
     check "F9.4 list from= a pane works from that pane" "$out" "f9_w "
+    # send, gather and kill refused outside the caller's own agents
+    stored() { sq "$CNTCTR_DB" "SELECT (SELECT count(*) FROM mail)||'/'||(SELECT count(*) FROM posts)||'/'||(SELECT count(*) FROM entries)"; }
+    stored_opts() { t show -s | grep -c '@cntctr_to_'; }
+    before="$(stored) $(stored_opts)"
+    for n in f9_user f9_ow; do
+        out=$(scall "$C" send "{\"to\":\"$n\",\"text\":\"f9 refused send $n\"}")
+        same "F9.5 send to $n is an error" "$(iserr "$out")" true
+        check "F9.5 send to $n says why" "$(txt "$out")" "$n is not yours: owner="
+        check "F9.5 and tells what to do" "$(txt "$out")" "Spawn your own agent with spawn cwd=<your dir>, or use post for the board. Pass cross=true only if the user asked you to message this agent."
+    done
+    check "F9.5 the error names the owner and directory" "$(txt "$(scall "$C" send '{"to":"f9_user","text":"f9 refused send"}')")" "f9_user is not yours: owner=user dir=$dirs/elsewhere. Spawn"
+    out=$(scall "$C" gather '{"wait":false,"tasks":[{"kind":"send","to":"f9_user","text":"f9 refused gather"},{"kind":"send","to":"f9_ow","text":"f9 refused gather"}]}')
+    check "F9.6 gather refuses a user session" "$(txt "$out")" "f9_user is not yours"
+    check "F9.6 gather refuses another agent's worker" "$(txt "$out")" "f9_ow is not yours"
+    out=$(scall "$C" kill '{"name":"f9_user"}'); same "F9.7 kill of a user session is an error" "$(iserr "$out")" true
+    check "F9.7 kill says why" "$(txt "$out")" "f9_user is not yours"
+    out=$(scall "$C" kill '{"name":"f9_ow"}'); same "F9.7 kill of another agent's worker is an error" "$(iserr "$out")" true
+    has_pane "$USR" && ok_ || bad "F9.7 the user session pane is still there"
+    has_pane "$OW" && ok_ || bad "F9.7 the other worker's pane is still there"
+    sleep 0.3
+    refute "F9.5 nothing was typed into the user session" "$(screen "$USR")" "f9 refused"
+    refute "F9.5 nothing was typed into the other worker" "$(screen "$OW")" "f9 refused"
+    same "F9.5 nothing was stored" "$(stored) $(stored_opts)" "$before"
+    # in scope: worker, parent (and the alias), sibling
+    for n in f9_w f9_par f9_sib parent; do
+        out=$(scall "$C" send "{\"to\":\"$n\",\"text\":\"f9 ok send $n\"}")
+        same "F9.8 send to $n works" "$(iserr "$out")" false
+    done
+    expect_screen "F9.8 the worker got it" "$W" "f9 ok send f9_w"
+    expect_screen "F9.8 the parent got it" "$PAR" "f9 ok send f9_par"
+    expect_screen "F9.8 the sibling got it" "$SIB" "f9 ok send f9_sib"
+    expect_screen "F9.8 parent alias reached the parent" "$PAR" "f9 ok send parent"
+    out=$(scall "$C" gather '{"wait":false,"tasks":[{"kind":"send","to":"f9_w","text":"f9 ok gather"}]}')
+    check "F9.8 gather to a worker works" "$(txt "$out")" '"status":"sent"'
+    # cross=true goes through
+    out=$(scall "$C" send '{"to":"f9_user","text":"f9 cross send","cross":true}')
+    same "F9.9 send with cross=true works" "$(iserr "$out")" false
+    expect_screen "F9.9 and is typed" "$USR" "f9 cross send"
+    out=$(scall "$C" gather '{"wait":false,"tasks":[{"kind":"send","to":"f9_ow","text":"f9 cross gather","cross":true},{"kind":"send","to":"f9_user","text":"f9 no cross gather"}]}')
+    expect_screen "F9.9 gather cross=true on one task works" "$OW" "f9 cross gather"
+    check "F9.9 and the task without cross is refused" "$(txt "$out")" "f9_user is not yours"
+    refute "F9.9 and not typed" "$(screen "$USR")" "f9 no cross gather"
+    out=$(scall "$C" kill '{"name":"f9_ow","cross":true}'); same "F9.9 kill with cross=true works" "$(iserr "$out")" false
+    for _ in $(seq 30); do has_pane "$OW" || break; sleep 0.1; done
+    has_pane "$OW" && bad "F9.9 the pane is gone" || ok_
+    # the Codex path: no pane, `from` names one
+    out=$(scall "" send "{\"from\":\"f9_me\",\"to\":\"f9_user\",\"text\":\"f9 codex refused\"}")
+    check "F9.10 from= send to a user session is refused" "$(txt "$out")" "f9_user is not yours"
+    out=$(scall "" send "{\"from\":\"f9_me\",\"to\":\"f9_w\",\"text\":\"f9 codex ok\"}")
+    same "F9.10 from= send to its worker works" "$(iserr "$out")" false
+    out=$(scall "" send "{\"from\":\"$USR\",\"to\":\"f9_sib\",\"text\":\"f9 codex user refused\"}")
+    check "F9.10 from= a user session pane id is refused for another agent" "$(txt "$out")" "f9_sib is not yours"
+    sleep 0.3
+    refute "F9.10 nothing was typed for the refused one" "$(screen "$USR")" "f9 codex refused"
 }
 gboard_run() {
     local sender target r
@@ -1900,8 +1957,8 @@ expect_screen "late reply text" "$S" "late answer"
 
 C=$(newpane c)
 session "$S" 3 "$INIT" \
-    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send","arguments":{"to":"b","text":"first of two","wait":true,"timeout":10}}}' \
-    '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"send","arguments":{"to":"c","text":"second of two","wait":true,"timeout":10}}}' \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send","arguments":{"to":"b","text":"first of two","wait":true,"timeout":10,"cross":true}}}' \
+    '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"send","arguments":{"to":"c","text":"second of two","wait":true,"timeout":10,"cross":true}}}' \
     > "$TMPD/pair" &
 expect_screen "first concurrent send delivered" "$B" "first of two"
 expect_screen "second concurrent send delivered" "$C" "second of two"
@@ -1970,7 +2027,7 @@ t kill-pane -t "$GL"
 
 # cancel: an answer claimed before the cancel and one arriving after both reach the caller's pane
 daemon_start "$S"
-daemon_send '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"gather","arguments":{"tasks":[{"kind":"send","to":"ga","text":"cancel one"},{"kind":"send","to":"gb","text":"cancel two"}],"timeout":30}}}'
+daemon_send '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"gather","arguments":{"tasks":[{"kind":"send","to":"ga","text":"cancel one","cross":true},{"kind":"send","to":"gb","text":"cancel two","cross":true}],"timeout":30}}}'
 expect_screen "cancel gather sent to ga" "$GA" "cancel one"
 expect_screen "cancel gather sent to gb" "$GB" "cancel two"
 call "$GA" reply "{\"id\":\"$(lastid "$GA")\",\"text\":\"before cancel\"}" >/dev/null
@@ -2008,7 +2065,7 @@ t kill-pane -t "$GL"
 t kill-pane -t "$GD"
 
 R=$(newpane r)
-{ printf '%s\n' "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send","arguments":{"to":"b","text":"cancel me","wait":true,"timeout":30}}}'
+{ printf '%s\n' "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send","arguments":{"to":"b","text":"cancel me","wait":true,"timeout":30,"cross":true}}}'
   sleep 1
   printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":2}}'
   sleep 1
@@ -2019,7 +2076,7 @@ call "$B" reply "{\"id\":\"$(lastid "$B")\",\"text\":\"answer after cancel\"}" >
 wait
 expect_screen "reply to cancelled send lands in sender pane" "$R" "answer after cancel"
 
-printf '%s\n' "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send","arguments":{"to":"b","text":"leader leaves","wait":true,"timeout":30}}}' |
+printf '%s\n' "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"send","arguments":{"to":"b","text":"leader leaves","wait":true,"timeout":30,"cross":true}}}' |
     TMUX_PANE=$R "$BIN" >/dev/null &
 expect_screen "send before leader exit delivered" "$B" "leader leaves"
 start=$SECONDS

@@ -1352,6 +1352,30 @@ static char *show_dir(const char *path) {
     return strdup(path);
 }
 
+/* NULL if the caller may task `pane` (named `name`): its own, parent or sibling, or cross=true.
+ * Otherwise the error text, which says whose agent it is. Caller frees. */
+static char *scope_error(json_object *a, const char *pane, const char *name) {
+    char cpar[32], *pp = NULL, *dir = NULL, *ppname, *owner, *shown, *err;
+    if (barg(a, "cross")) return NULL;
+    caller_parent(cpar);
+    if (TMUX(NULL, &pp, "show", "-pqv", "-t", pane, "@cntctr_parent") != 0) {
+        free(pp);
+        pp = strdup("");
+    }
+    if (in_scope(pane, pp, cpar)) {
+        free(pp);
+        return NULL;
+    }
+    if (TMUX(NULL, &dir, "display", "-p", "-t", pane, "#{pane_current_path}") != 0) *dir = '\0';
+    ppname = *pp ? pane_name(pp) : NULL;
+    owner = owner_of(pane, pp, cpar, ppname);
+    shown = show_dir(dir);
+    err = fmt("%s is not yours: owner=%s dir=%s. Spawn your own agent with spawn cwd=<your dir>, or use post for the board. "
+              "Pass cross=true only if the user asked you to message this agent.", name, owner, shown);
+    free(pp), free(dir), free(ppname), free(owner), free(shown);
+    return err;
+}
+
 static int tool_list(json_object *args, char **res) {
     char *out;
     if (TMUX(NULL, &out, "list-panes", "-a", "-F",
@@ -1457,6 +1481,10 @@ static int start_send(json_object *a, int wait, char id[9], char **pane_out, int
     const char *to = sarg(a, "to"), *text = sarg(a, "text");
     char *rerr, *pane = resolve_target(to, &rerr);
     if (!pane) return fail(res, rerr);
+    if ((rerr = scope_error(a, pane, to))) {
+        free(pane);
+        return fail(res, rerr);
+    }
     char *env, *err;
     int add_wait = 0;
     const char *re = sarg(a, "re");
@@ -1808,6 +1836,10 @@ static int tool_kill(json_object *a, char **res) {
     if (strcmp(pane, caller_pane) == 0) {
         free(pane);
         return fail(res, fmt("cannot kill yourself"));
+    }
+    if ((err = scope_error(a, pane, name))) {
+        free(pane);
+        return fail(res, err);
     }
     err = TMUXE(NULL, "kill-pane", "-t", pane);
     free(pane);
@@ -2920,10 +2952,11 @@ static const char TOOLS[] =
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
     "\"to\":{\"type\":\"string\",\"description\":\"Agent name, or \\\"parent\\\" for the agent that spawned you\"},\"text\":{\"type\":\"string\"},\"wait\":{\"type\":\"boolean\"},"
     "\"re\":{\"type\":\"string\",\"description\":\"Add to this open task id; the worker replies once\"},"
+    "\"cross\":{\"type\":\"boolean\",\"description\":\"Only if the user asked you to message this agent: allows an agent that is not your worker, parent or sibling\"},"
     "\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"},"
     "\"timeout\":{\"type\":\"integer\",\"description\":\"Seconds to block when wait=true (default 600)\"}},"
     "\"required\":[\"to\",\"text\"]}},"
-    "{\"name\":\"gather\",\"description\":\"Dispatch delegated send or spawn tasks, then return one JSON result when all answer or the shared deadline expires. Check complete before deciding. Task item fields: kind=send takes to,text,re; kind=spawn takes harness,name,task,cwd,tier,model,effort. wait and timeout are top-level only. Each result has a status: answered, timed_out, dead, limited (with resets), failed, or sent when wait=false. Replies that arrive after a timeout or cancel are typed into your pane.\","
+    "{\"name\":\"gather\",\"description\":\"Dispatch delegated send or spawn tasks, then return one JSON result when all answer or the shared deadline expires. Check complete before deciding. Task item fields: kind=send takes to,text,re,cross; kind=spawn takes harness,name,task,cwd,tier,model,effort. wait and timeout are top-level only. Each result has a status: answered, timed_out, dead, limited (with resets), failed, or sent when wait=false. Replies that arrive after a timeout or cancel are typed into your pane.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
     "\"wait\":{\"type\":\"boolean\",\"description\":\"Default true. false: send every task and return their ids at once; replies arrive in your pane as they come\"},"
     "\"tasks\":{\"type\":\"array\",\"minItems\":1,\"items\":{\"type\":\"object\",\"properties\":{"
@@ -2932,6 +2965,7 @@ static const char TOOLS[] =
     "\"harness\":{\"type\":\"string\",\"enum\":[\"claude\",\"codex\",\"agy\"]},"
     "\"name\":{\"type\":\"string\"},\"task\":{\"type\":\"string\"},"
     "\"cwd\":{\"type\":\"string\"},\"tier\":{\"type\":\"string\"},"
+    "\"cross\":{\"type\":\"boolean\",\"description\":\"Only if the user asked you to message this agent: allows an agent that is not your worker, parent or sibling\"},"
     "\"model\":{\"type\":\"string\"},\"effort\":{\"type\":\"string\"}},"
     "\"required\":[\"kind\"]}},"
     "\"timeout\":{\"type\":\"integer\",\"description\":\"Shared deadline in seconds (default 600)\"},"
@@ -2946,7 +2980,7 @@ static const char TOOLS[] =
     "{\"name\":\"list\",\"description\":\"List agents: name, harness, pane, alive or dead, state (idle, busy, permission, limited, dead), open task ids, seconds since the screen last changed, limit reset time, owner and directory. By default only you, your workers, your parent and your siblings; all=true shows every agent of the tmux server.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"all\":{\"type\":\"boolean\",\"description\":\"Show every agent of the tmux server, not only yours\"}," KFROM "}}},"
     "{\"name\":\"kill\",\"description\":\"Close an agent's tmux pane.\","
-    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"}},\"required\":[\"name\"]}}"
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"cross\":{\"type\":\"boolean\",\"description\":\"Only if the user asked you to message this agent: allows an agent that is not your worker, parent or sibling\"},\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"}},\"required\":[\"name\"]}}"
     ",{\"name\":\"note\",\"description\":\"Store durable knowledge for all agents: insight (a 1-5 line fact or decision), "
     "skill (a reusable how-to) or doc (long text). Facts must stay true after the task; use reply.insights when answering one. "
     "To replace or merge entries, pass their ids in supersedes. When an entry goes stale, write its replacement with supersedes=[old id]; recall hides superseded and forgotten entries.\","
