@@ -3723,7 +3723,7 @@ check "T36 board result mentions 2 older unread posts" "$b36" "2 older unread po
 
 # T37a: list with from=%pane of an untagged live pane shows it alive
 U37=$(t new-window -d -c "$M3_DIR" -P -F '#{pane_id}' sh)
-out37a=$(txt "$(call "$M3_P" list "{\"from\":\"$U37\"}")")
+out37a=$(txt "$(call "" list "{\"from\":\"$U37\"}")")   # from= is for a caller without a pane (Codex); with a pane it is ignored
 check "T37a untagged live pane shows alive" "$out37a" "$U37 alive idle"
 t kill-pane -t "$U37" 2>/dev/null
 
