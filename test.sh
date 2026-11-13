@@ -1201,27 +1201,31 @@ t2() { tmux -L "$SOCKET-2" -f /dev/null "$@"; }
 f6_1() {
     local W S U U2 A m m2 ans sock2 n out task start
     S=$(newpane f6_snd)
-    # (a) two private servers, the same pane id: the other server's session is not held with this worker's mail
+    # (a) two private servers, the same pane id: the other server's session is not held with this worker's mail.
+    # A real send records the mail's socket; the mail for the other server's pane is stored by hand, as a send to a worker
+    # on this server whose pane id is the other server's first pane (%0) would store it.
     W=$(hk_agent claude f6_w1)
+    out=$(txt "$(call "$S" send '{"to":"f6_w1","text":"mail for the worker on the first server"}')")
+    task=${out#sent id=}; m=$(mailid "$task")
+    same "F1a the mail records its tmux socket" "$(sqx "$CNTCTR_DB" "SELECT socket FROM mail WHERE post=$m")" "$(t display -p '#{socket_path}')"
     t2 kill-server 2>/dev/null
     t2 new-session -d -s two -x 200 -y 50 cat
     sock2=$(t2 display -p '#{socket_path}')
-    n=0; until [ "$(t2 new-window -d -P -F '#{pane_id}' cat)" = "$W" ] || [ $((n += 1)) -gt 3000 ]; do :; done
-    same "F1a the second server has a pane with the worker's id" "$(t2 display -p -t "$W" '#{pane_id}' 2>/dev/null)" "$W"
+    U=$(t2 display -p '#{pane_id}')
     rm -f "$TMPD/hk_claude2_in" "$TMPD/hk_claude2_out"; mkfifo "$TMPD/hk_claude2_in" "$TMPD/hk_claude2_out"
     TMUX="$sock2,0,0" "$TMPD/hook_harness/claude" "$BIN" claude < "$TMPD/hk_claude2_in" > "$TMPD/hk_claude2_out" & HK_PID_c2=$!
     exec 24> "$TMPD/hk_claude2_in" 25< "$TMPD/hk_claude2_out"
     read -r n <&25
-    hk claude2 SessionStart "$W" '{"session_id":"S1","hook_event_name":"SessionStart","source":"startup"}' >/dev/null
+    hk claude2 SessionStart "$U" '{"session_id":"S1","hook_event_name":"SessionStart","source":"startup"}' >/dev/null
     sleep 1
-    out=$(txt "$(call "$S" send '{"to":"f6_w1","text":"mail for the worker on the first server"}')")
-    task=${out#sent id=}; m=$(mailid "$task")
-    same "F1a the mail records its tmux socket" "$(sqx "$CNTCTR_DB" "SELECT socket FROM mail WHERE post=$m")" "$(t display -p '#{socket_path}')"
-    hk claude2 UserPromptSubmit "$W" '{"session_id":"S1","hook_event_name":"UserPromptSubmit","prompt":"my own question"}' >/dev/null
-    ans=$(hk claude2 Stop "$W" '{"session_id":"S1","hook_event_name":"Stop","stop_hook_active":false}')
+    mail_text f6a00001 'mail for a pane of the first server that has the second server pane id' > "$TMPD/f6_a_text"
+    sqx "$CNTCTR_DB" "INSERT INTO posts(scope,sender,text,at) VALUES('$U5_SCOPE','sender',CAST(readfile('$TMPD/f6_a_text') AS TEXT),strftime('%s','now')); INSERT INTO mail(post,name,pane,task,hooked,presentations,socket) VALUES(last_insert_rowid(),'f6_gone','$U','f6a00001',1,0,'$(t display -p '#{socket_path}')')"
+    m=$(sqx "$CNTCTR_DB" "SELECT max(post) FROM mail")
+    hk claude2 UserPromptSubmit "$U" '{"session_id":"S1","hook_event_name":"UserPromptSubmit","prompt":"my own question"}' >/dev/null
+    ans=$(hk claude2 Stop "$U" '{"session_id":"S1","hook_event_name":"Stop","stop_hook_active":false}')
     emptyans "$ans" && ok_ || bad "F1a a session on another tmux server is not held with this worker's mail" "  got: $ans"
-    refute "F1a and the mail is not shown to it" "$ans" "mail for the worker on the first server"
-    same "F1a the worker's mail is untouched" "$(mstate "$m")" "pending/1/0"
+    refute "F1a and the mail is not shown to it" "$ans" "second server pane id"
+    same "F1a the mail is untouched" "$(mstate "$m")" "pending/0/0"
     exec 24>&- 25<&-; kill "$HK_PID_c2" 2>/dev/null; wait "$HK_PID_c2" 2>/dev/null
     t2 kill-server 2>/dev/null
 
