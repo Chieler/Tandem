@@ -597,6 +597,10 @@ hk_boot() {
     local ready
     read -r ready <&21; read -r ready <&23
     sleep 1   # mail counts only when posted after the tmux server's start second
+    local p0
+    p0=$(newpane u5_scope)
+    U5_SCOPE=$(txt "$(call "$p0" project '{}')" | sed -n 's/^project \(.*\) (root .*/\1/p')   # the board scope of every fake agent here
+    t kill-window -t "$p0"
 }
 hk_stop() {
     exec 20>&- 21<&- 22>&- 23<&-
@@ -635,7 +639,7 @@ mailput() {
     local f="$TMPD/mail_text" name
     name=$(t display -p -t "$1" '#{@cntctr_name}')
     printf '%s' "$3" > "$f"
-    sqx "$CNTCTR_DB" "INSERT INTO posts(scope,sender,text,at) VALUES('u5','sender',CAST(readfile('$f') AS TEXT),strftime('%s','now')); INSERT INTO mail(post,name,pane,task,hooked,presentations) VALUES(last_insert_rowid(),'$name','$1','$2',1,${4:-0}); SELECT last_insert_rowid();"
+    sqx "$CNTCTR_DB" "INSERT INTO posts(scope,sender,text,at) VALUES('$U5_SCOPE','sender',CAST(readfile('$f') AS TEXT),strftime('%s','now')); INSERT INTO mail(post,name,pane,task,hooked,presentations) VALUES(last_insert_rowid(),'$name','$1','$2',1,${4:-0}); SELECT last_insert_rowid();"
 }
 mstate() { sqx "$CNTCTR_DB" "SELECT state||'/'||presentations||'/'||delivered FROM mail WHERE post=$1"; }
 pointer() { printf '[cntctr mail id=%s] body attached; if you see none, call board' "$1"; }
@@ -746,15 +750,113 @@ u5p1_run() {
     same "U9 the staged mail is not counted again" "$(mstate "$m1")" "staged/1/0"
 }
 
+
+# undelivered <mail id>: the mail is not delivered (it may be staged or pending)
+undelivered() { [ "$(sqx "$CNTCTR_DB" "SELECT delivered FROM mail WHERE post=$1")" = 0 ]; }
+
+u5p2_run() {
+    local P S Q m m2 ans out
+    P=$(hk_agent claude u5_d1)
+    S=$(newpane u5_d1_sender)
+    # U7: a normal Stop of the staging turn delivers
+    m=$(mailput "$P" d1000001 "$(mail_text d1000001 'normal stop mail')" 1)
+    c_prompt "$P" "$(pointer "$m")" >/dev/null
+    same "U7 attached mail is staged first" "$(mstate "$m")" "staged/1/0"
+    ans=$(c_stop "$P")
+    emptyans "$ans" && ok_ || bad "U7 a normal Stop with nothing else pending passes" "  got: $ans"
+    same "U7 a normal Stop of the staging turn delivers" "$(mstate "$m")" "delivered/1/1"
+    # U7: reply to the mail's task id delivers
+    t set -s @cntctr_from_d1000002 "$S"; t set -s @cntctr_to_d1000002 "$P"; t set -s @cntctr_sender_d1000002 u5_d1_sender
+    m=$(mailput "$P" d1000002 "$(mail_text d1000002 'reply me')" 1)
+    c_prompt "$P" "$(pointer "$m")" >/dev/null
+    same "U7 mail to be answered is staged" "$(mstate "$m")" "staged/1/0"
+    call "$P" reply '{"id":"d1000002","text":"my answer"}' >/dev/null
+    same "U7 reply to the mail's id delivers" "$(mstate "$m")" "delivered/1/1"
+    # U7: board returning the body delivers
+    m=$(mailput "$P" d1000003 "$(mail_text d1000003 'board me')" 1)
+    c_prompt "$P" "$(pointer "$m")" >/dev/null
+    out=$(txt "$(call "$P" board '{}')")
+    check "U7 board returns the body" "$out" "board me"
+    same "U7 board returning the body delivers" "$(mstate "$m")" "delivered/1/1"
+    # U7: list, recall, post, note and a send deliver nothing
+    m=$(mailput "$P" d1000004 "$(mail_text d1000004 'not by other tools')" 1)
+    c_prompt "$P" "$(pointer "$m")" >/dev/null
+    call "$P" list '{}' >/dev/null
+    call "$P" recall '{"query":"anything"}' >/dev/null
+    call "$P" post '{"text":"news from u5_d1"}' >/dev/null
+    call "$P" note '{"layer":"insight","title":"u5 note","summary":"u5 note"}' >/dev/null
+    call "$P" send '{"to":"u5_d1_sender","text":"hello sender"}' >/dev/null
+    same "U7 list, recall, post, note and send deliver nothing" "$(mstate "$m")" "staged/1/0"
+    c_stop "$P" >/dev/null
+    # U7: an agy Stop after an error or a cancel delivers nothing; a normal one does
+    Q=$(hk_agent agy u5_d2)
+    m=$(mailput "$Q" d2000001 "$(mail_text d2000001 'agy error mail')" 1)
+    a_pre "$Q" 0 "$(pointer "$m")" >/dev/null
+    same "U7 agy mail is staged" "$(mstate "$m")" "staged/1/0"
+    a_stop "$Q" ERROR >/dev/null
+    undelivered "$m" && ok_ || bad "U7 a Stop with terminationReason ERROR does not deliver" "  got: $(mstate "$m")"
+    m2=$(mailput "$Q" d2000002 "$(mail_text d2000002 'agy cancel mail')" 1)
+    a_pre "$Q" 0 "$(pointer "$m2")" >/dev/null
+    a_stop "$Q" USER_CANCELED >/dev/null
+    undelivered "$m2" && ok_ || bad "U7 a Stop with terminationReason USER_CANCELED does not deliver" "  got: $(mstate "$m2")"
+    a_pre "$Q" 0 "$(pointer "$m2")" >/dev/null
+    a_stop "$Q" NO_TOOL_CALL >/dev/null
+    same "U7 an agy Stop that ends normally delivers" "$(mstate "$m2")" "delivered/1/1"
+
+    # U8: staged mail and a new prompt with no Stop in between: pending again; shown again with a repeat note
+    P=$(hk_agent claude u5_d3)
+    m=$(mailput "$P" d3000001 "$(mail_text d3000001 'maybe seen mail')" 1)
+    c_prompt "$P" "$(pointer "$m")" >/dev/null
+    same "U8 mail is staged in the first turn" "$(mstate "$m")" "staged/1/0"
+    c_prompt "$P" "an unrelated question" >/dev/null
+    same "U8 a new turn with no delivery makes staged mail pending again" "$(mstate "$m")" "pending/1/0"
+    sqx "$CNTCTR_DB" "UPDATE mail SET presentations=2 WHERE post=$m" # a second line was typed for it
+    ans=$(c_prompt "$P" "$(pointer "$m")")
+    check "U8 the mail comes again" "$(ctx_c "$ans")" "maybe seen mail"
+    check "U8 and says it may be a repeat" "$(ctx_c "$ans")" "(may be a repeat)"
+    same "U8 the repeat is staged, still counted twice" "$(mstate "$m")" "staged/2/0"
+    c_stop "$P" >/dev/null
+    same "U8 the repeat is delivered by the Stop" "$(mstate "$m")" "delivered/2/1"
+    # U8: the same for agy
+    Q=$(hk_agent agy u5_d4)
+    m=$(mailput "$Q" d4000001 "$(mail_text d4000001 'agy maybe seen')" 1)
+    a_pre "$Q" 0 "$(pointer "$m")" >/dev/null
+    a_pre "$Q" 0 "an unrelated question" >/dev/null
+    same "U8 agy: a new turn with no delivery makes staged mail pending again" "$(mstate "$m")" "pending/1/0"
+
+    # U10: mail staged by the prompt hook is not presented again by the Stop of the same turn
+    P=$(hk_agent claude u5_d5)
+    m=$(mailput "$P" d5000001 "$(mail_text d5000001 'first in the turn')" 1)
+    c_prompt "$P" "$(pointer "$m")" >/dev/null
+    m2=$(mailput "$P" d5000002 "$(mail_text d5000002 'arrived during the turn')" 0)
+    ans=$(c_stop "$P")
+    same "U10 the Stop holds the agent for the mail that was not staged" "$(printf '%s' "$ans" | jq -r '.decision')" block
+    check "U10 the hold carries the new mail" "$(printf '%s' "$ans" | jq -r '.reason')" "arrived during the turn"
+    refute "U10 the hold does not repeat the staged mail" "$(printf '%s' "$ans" | jq -r '.reason')" "first in the turn"
+    same "U10 the staged mail is delivered by that Stop" "$(mstate "$m")" "delivered/1/1"
+    same "U10 the held mail is staged and counted once" "$(mstate "$m2")" "staged/1/0"
+    ans=$(c_stop "$P" true)
+    emptyans "$ans" && ok_ || bad "U10 the second Stop of the turn is never held" "  got: $ans"
+    same "U10 the second Stop delivers the held mail" "$(mstate "$m2")" "delivered/1/1"
+    # U10: a Stop of a turn that ended abnormally for agy does not hold either
+    Q=$(hk_agent agy u5_d6)
+    m=$(mailput "$Q" d6000001 "$(mail_text d6000001 'agy pending at error')" 0)
+    ans=$(a_stop "$Q" ERROR)
+    emptyans "$ans" && ok_ || bad "U10 a Stop after an error is never held" "  got: $ans"
+    same "U10 the mail stays pending" "$(mstate "$m")" "pending/0/0"
+}
+
 u5_run() {
     hk_boot
     u5p1_run
+    u5p2_run
     hk_stop
 }
-if [ "${ONLY:-}" = u5 ] || [ "${ONLY:-}" = u5p1 ]; then
+if [ "${ONLY:-}" = u5 ] || [ "${ONLY:-}" = u5p1 ] || [ "${ONLY:-}" = u5p2 ]; then
     case $ONLY in
         u5) u5_run ;;
         u5p1) hk_boot; u5p1_run; hk_stop ;;
+        u5p2) hk_boot; u5p2_run; hk_stop ;;
     esac
     printf '%d passed, %d failed\n' "$pass" "$fail"
     [ "$fail" -eq 0 ]; exit $?

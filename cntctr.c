@@ -1441,6 +1441,23 @@ static void remember_reply(const char *id, const char *to, const char *sender, c
     free(title);
 }
 
+/* The agent in `pane` answered task `task`: its staged or pending mail for that task is delivered. */
+static void mail_answered(const char *task, const char *pane) {
+    if (!pane || !*pane) return;
+    char *err = NULL;
+    sqlite3 *db = kb(&err);
+    free(err);
+    if (!db) return;
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "UPDATE mail SET delivered=1, state='delivered' WHERE task=?1 AND pane=?2 AND hooked=1 AND delivered=0", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, task, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, pane, -1, SQLITE_TRANSIENT);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+}
+
 static int tool_reply(json_object *a, char **res) {
     const char *id = sarg(a, "id"), *text = sarg(a, "text");
     if (need(res, a, "reply", (const char *const[]){"id", "text", NULL}, "{\"id\":\"1a2b3c4d\",\"text\":\"done\"}")) return 1;
@@ -1450,6 +1467,7 @@ static int tool_reply(json_object *a, char **res) {
         return fail(res, fmt("unknown id %s", id));
     snprintf(opt, sizeof opt, "@cntctr_to_%s", id);
     to = sopt_get(opt);
+    mail_answered(id, to);
     remember_reply(id, to, sender, text, a);
 
     /* Write the buffer before checking the wait flag; wait_tasks clears the flag
@@ -2000,11 +2018,19 @@ static int tool_board(json_object *a, char **res) {
     int unseen = 0;
     free(kb_unread(db, p.key, caller_name, caller_pane, server_start, after, &newest, &unseen));
     int omitted = kb_omitted(db, p.key, caller_name, caller_pane, server_start, after, limit);
+    char *shown = kb_board_mail(db, p.key, caller_name, caller_pane, server_start, limit);
     if (sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
         free(out);
+        free(shown);
         sqlite3_close(db);
         return fail(res, fmt("cannot read board snapshot"));
     }
+    if (*shown) {   /* a mail whose body this board result returned is delivered */
+        char *sql = fmt("UPDATE mail SET delivered=1, state='delivered' WHERE delivered=0 AND hooked=1 AND post IN (%s)", shown);
+        sqlite3_exec(db, sql, NULL, NULL, NULL);
+        free(sql);
+    }
+    free(shown);
     if (*caller_name) set_seen(caller_name, newest);
     if (omitted > 0) {
         char *more = fmt("%s\n%d older unread posts were not shown", out, omitted);
@@ -2955,6 +2981,8 @@ static void notify_all(void) {
     if (d) closedir(d);
 }
 
+static int has_hooks(sqlite3 *db, const char *socket, const char *pane);
+
 /* Only the FIFO watcher retries mail, sleeping indefinitely when its queue is empty. */
 static int redeliver_for(const char *pane, const char *name) {
     char *err = NULL;
@@ -2965,7 +2993,14 @@ static int redeliver_for(const char *pane, const char *name) {
     resolve_project(db, pane, &p);
     sqlite3_stmt *st = NULL;
     int pending = 0;
-    if (sqlite3_prepare_v2(db, "SELECT post FROM mail JOIN posts ON posts.rowid=mail.post WHERE (name=?1 OR (pane=?3 AND posts.at>?4 AND ?3 != '')) AND scope=?2 AND delivered=0", -1, &st, NULL) == SQLITE_OK) {
+    char *socket = hook_socket();
+    int hooked = *socket && has_hooks(db, socket, pane);
+    free(socket);
+    if (hooked) {   /* a hook presents this agent's mail; the paste path below is for agents without hooks */
+        sqlite3_close(db);
+        return mail_waiting(pane, name);
+    }
+    if (sqlite3_prepare_v2(db, "SELECT post FROM mail JOIN posts ON posts.rowid=mail.post WHERE (name=?1 OR (pane=?3 AND posts.at>?4 AND ?3 != '')) AND scope=?2 AND delivered=0 AND state IN ('pending','staged')", -1, &st, NULL) == SQLITE_OK) {
         sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 2, p.key, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 3, pane, -1, SQLITE_TRANSIENT);
@@ -2987,7 +3022,7 @@ static int redeliver_for(const char *pane, const char *name) {
             if (lock < 0) { pending = 1; continue; }
             /* Reserve the DB write before typing, so another writer cannot prevent the delivered mark. */
             int rc = sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
-            if (rc == SQLITE_OK && sqlite3_prepare_v2(db, "SELECT text FROM posts JOIN mail ON posts.rowid=mail.post WHERE post=?1 AND delivered=0", -1, &st, NULL) == SQLITE_OK) {
+            if (rc == SQLITE_OK && sqlite3_prepare_v2(db, "SELECT text FROM posts JOIN mail ON posts.rowid=mail.post WHERE post=?1 AND delivered=0 AND state IN ('pending','staged')", -1, &st, NULL) == SQLITE_OK) {
                 sqlite3_bind_int64(st, 1, id);
                 step = sqlite3_step(st);
                 char *body = step == SQLITE_ROW ? strdup((const char *)sqlite3_column_text(st, 0)) : NULL;
@@ -2997,7 +3032,7 @@ static int redeliver_for(const char *pane, const char *name) {
                 if (body) {
                     char *message = strchr(body, '\n');
                     err = inject(pane, name, message ? message + 1 : body);
-                    rc = err ? SQLITE_ERROR : sqlite3_prepare_v2(db, "UPDATE mail SET delivered=1 WHERE post=?1", -1, &st, NULL);
+                    rc = err ? SQLITE_ERROR : sqlite3_prepare_v2(db, "UPDATE mail SET delivered=1, state='delivered' WHERE post=?1", -1, &st, NULL);
                     if (rc == SQLITE_OK) {
                         sqlite3_bind_int64(st, 1, id);
                         rc = sqlite3_step(st) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
@@ -3668,6 +3703,48 @@ static json_object *hook_attach(sqlite3 *db, const char *harness, const char *ev
     return answer;
 }
 
+/* A Stop the harness reports as a normal end of the turn. Claude Code runs its Stop hook only then; agy says so in terminationReason. */
+static int stop_normal(const char *harness, const struct hook_event *event) {
+    return !strcmp(harness, "claude") || !strcmp(event->reason, "NO_TOOL_CALL");
+}
+
+/* The Stop hook: mail staged in this turn is delivered by a normal end (and goes back to pending after any other),
+ * and mail that was not staged in this turn holds the agent once, never at a second Stop of the turn. */
+static json_object *hook_stop(sqlite3 *db, const char *socket, const char *pane, const char *harness, const struct hook_event *event, const char *token, long long server_start) {
+    int normal = stop_normal(harness, event);
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "UPDATE mail SET state=?3, delivered=?4 WHERE pane=?1 AND state='staged' AND staged_turn=?2 AND delivered=0", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, pane, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, token, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 3, normal ? "delivered" : "pending", -1, SQLITE_STATIC);
+        sqlite3_bind_int(st, 4, normal);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    json_object *answer = NULL;
+    if (normal && !event->loop && sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK) {
+        struct mrow rows[MAIL_ROWS];
+        int n = pending_rows(db, pane, server_start, 0, rows, MAIL_ROWS), taken = 0;
+        char *text = n ? fit_mail(harness, event->kind, HOOK_BLOCK, rows, n, NULL, &taken) : NULL;
+        if (taken) {
+            stage_rows(db, rows, taken, 0, token);
+            st = NULL;
+            if (sqlite3_prepare_v2(db, "UPDATE hook_sessions SET stop_blocked=1 WHERE socket=?1 AND pane=?2", -1, &st, NULL) == SQLITE_OK) {
+                sqlite3_bind_text(st, 1, socket, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(st, 2, pane, -1, SQLITE_TRANSIENT);
+                sqlite3_step(st);
+            }
+            sqlite3_finalize(st);
+        }
+        if (sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK) {
+            if (taken) answer = hook_answer(harness, event->kind, HOOK_BLOCK, text);
+        } else sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+        for (int i = 0; i < n; i++) free(rows[i].text);
+        free(text);
+    }
+    return answer;
+}
+
 /* After the event is recorded: what the hook prints, or NULL for the neutral answer. */
 static json_object *hook_decide(sqlite3 *db, const char *socket, const char *pane, const char *harness, const struct hook_event *event) {
     sqlite3_stmt *st = NULL;
@@ -3685,6 +3762,13 @@ static json_object *hook_decide(sqlite3 *db, const char *socket, const char *pan
     if (!token) return NULL;
     json_object *answer = NULL;
     if (!strcmp(event->kind, "UserPromptSubmit") || !strcmp(event->kind, "PreInvocation")) {
+        /* mail staged in an earlier turn and never delivered: pending again, shown with a repeat note */
+        if (sqlite3_prepare_v2(db, "UPDATE mail SET state='pending' WHERE pane=?1 AND state='staged' AND delivered=0 AND staged_turn IS NOT ?2", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, pane, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(st, 2, token, -1, SQLITE_TRANSIENT);
+            sqlite3_step(st);
+        }
+        sqlite3_finalize(st);
         long long own = pointer_id(event->prompt);
         st = NULL;
         int mine = 0;
@@ -3697,6 +3781,7 @@ static json_object *hook_decide(sqlite3 *db, const char *socket, const char *pan
         /* agy calls this before every model step: only the first call of a turn attaches */
         if (mine && !event->loop) answer = hook_attach(db, harness, event->kind, pane, token, server_start, own);
     }
+    if (!strcmp(event->kind, "Stop")) answer = hook_stop(db, socket, pane, harness, event, token, server_start);
     free(token);
     return answer;
 }

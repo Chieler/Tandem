@@ -316,6 +316,23 @@ char *kb_board(sqlite3 *db, const char *scope, const char *me, const char *pane,
     return lines(st);
 }
 
+/* Post ids ("3,7"), among the posts kb_board lists, of `me`'s undelivered mail that a hook presented: "" if none. */
+char *kb_board_mail(sqlite3 *db, const char *scope, const char *me, const char *pane, long long server_start, int limit) {
+    sqlite3_stmt *st = prep(db,
+        "SELECT group_concat(post) FROM mail JOIN posts ON posts.rowid = mail.post WHERE mail.hooked = 1 AND mail.delivered = 0"
+        " AND (mail.name = ?3 OR (mail.pane = ?4 AND posts.at > ?5 AND ?4 != ''))"
+        " AND mail.post IN (SELECT rowid FROM (SELECT rowid FROM posts WHERE scope = ?1 AND NOT EXISTS (SELECT 1 FROM mail m2 WHERE m2.post = posts.rowid"
+        " AND (m2.name != ?3 AND (m2.pane != ?4 OR posts.at <= ?5 OR ?4 = ''))) ORDER BY rowid DESC LIMIT ?2))");
+    sqlite3_bind_text(st, 1, scope, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 2, limit);
+    sqlite3_bind_text(st, 3, me, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 4, pane, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 5, server_start);
+    char *ids = sqlite3_step(st) == SQLITE_ROW ? strdup(col(st, 0)) : strdup("");
+    sqlite3_finalize(st);
+    return ids;
+}
+
 /* ---- fleet tools ---- */
 
 void kb_tool_free(struct kb_tool *t) {

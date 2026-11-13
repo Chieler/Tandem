@@ -27,6 +27,7 @@ char *kb_project_get(sqlite3 *db, const char *root);
 void kb_project_set(sqlite3 *db, const char *root, const char *key);   /* an empty key removes the override */
 int kb_post(sqlite3 *db, const char *scope, const char *sender, const char *text);   /* 0, or -1 */
 char *kb_tool_projects(sqlite3 *db);   /* every project with a tool row, one per line (not global) */
+char *kb_board_mail(sqlite3 *db, const char *scope, const char *me, const char *pane, long long server_start, int limit);
 char *kb_board(sqlite3 *db, const char *scope, const char *me, const char *pane, long long server_start, int limit);   /* "<UTC time> <sender>: <text>" lines, oldest first */
 
 /* Fleet tools: script-backed MCP tools. Drafts are private to their author; see the spec's "Resolving a name". */
