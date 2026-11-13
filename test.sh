@@ -1620,12 +1620,24 @@ f8_2() {
     # ponytail: release_unended's COMMIT cannot be made to fail with the transaction still open from outside (a rolled-back one makes ROLLBACK a no-op), so that check has no test
 }
 
+# f8_4: a database migrated from the oldest schema has the same tables and columns as a new one (a column added to SCHEMA and not to MIGRATIONS shows up here)
+f8_4() {
+    local old="$TMPD/f8_4_old.db" fresh="$TMPD/f8_4_new.db" sockpath cols='SELECT m.name||"."||p.name FROM sqlite_master m, pragma_table_info(m.name) p WHERE m.type="table" ORDER BY 1'
+    sockpath=$(t display -p '#{socket_path}')
+    rm -f "$old" "$old-wal" "$old-shm" "$fresh" "$fresh-wal" "$fresh-shm"
+    sqlite3 "$old" < tests/schema_v0.1.0.sql   # what a 0.1.0 database holds
+    CNTCTR_DB=$old TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null   # opening migrates it
+    CNTCTR_DB=$fresh TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
+    same "F8.4 the migrated database has the tables and columns of a new one" "$(sqx "$old" "$cols")" "$(sqx "$fresh" "$cols")"
+    check "F8.4 (and the list is not empty)" "$(sqx "$fresh" "$cols")" "mail.socket"
+}
+
 u5p6_run() {
     export CNTCTR_PASTE_WAIT_MS=100
     local f
     for f in ${F6:-1 2 3 4 5 6 7 8 9}; do declare -F "f6_$f" >/dev/null && "f6_$f"; done
     for f in ${F7:-1 2 3 4 5 6}; do declare -F "f7_$f" >/dev/null && "f7_$f"; done
-    for f in ${F8:-1 2}; do declare -F "f8_$f" >/dev/null && "f8_$f"; done
+    for f in ${F8:-1 2 3 4}; do declare -F "f8_$f" >/dev/null && "f8_$f"; done
     unset CNTCTR_PASTE_WAIT_MS
 }
 
