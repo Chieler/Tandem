@@ -99,6 +99,11 @@ static int ensure_mail_column(sqlite3 *db, const char *name, const char *sql) {
     return ensure_column(db, "mail", name, sql);
 }
 
+/* PRAGMA user_version of a database that has this file's SCHEMA and every column added below. Raise it with each new table
+ * or column, or databases that already carry the old number keep missing it. */
+#define KB_SCHEMA_VERSION 1
+#define KB_SCHEMA_VERSION_SQL "1"
+
 sqlite3 *kb_open_timeout(const char *path, char **err, int timeout_ms) {
     sqlite3 *db = NULL;
     if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL) != SQLITE_OK) {
@@ -108,6 +113,13 @@ sqlite3 *kb_open_timeout(const char *path, char **err, int timeout_ms) {
     }
     sqlite3_busy_timeout(db, timeout_ms);
     sqlite3_exec(db, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
+    {   /* a database at the current schema needs no schema script, column checks or meta row: every hook event opens it */
+        sqlite3_stmt *v = NULL;
+        int current = sqlite3_prepare_v2(db, "PRAGMA user_version", -1, &v, NULL) == SQLITE_OK && sqlite3_step(v) == SQLITE_ROW
+                      && sqlite3_column_int(v, 0) == KB_SCHEMA_VERSION;
+        sqlite3_finalize(v);
+        if (current) return db;
+    }
     char host[256] = "host";
     gethostname(host, sizeof host - 1);
     host[strcspn(host, ".")] = '\0';
@@ -128,6 +140,7 @@ sqlite3 *kb_open_timeout(const char *path, char **err, int timeout_ms) {
     if (rc == SQLITE_OK) rc = ensure_column(db, "hook_sessions", "server_start", "ALTER TABLE hook_sessions ADD COLUMN server_start INTEGER NOT NULL DEFAULT 0");
     if (rc == SQLITE_OK) rc = ensure_column(db, "task_gate", "answered", "ALTER TABLE task_gate ADD COLUMN answered INTEGER NOT NULL DEFAULT 0");
     if (rc == SQLITE_OK) rc = sqlite3_exec(db, machine, NULL, NULL, NULL);
+    if (rc == SQLITE_OK) rc = sqlite3_exec(db, "PRAGMA user_version=" KB_SCHEMA_VERSION_SQL, NULL, NULL, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
     sqlite3_free(machine);
     if (rc == SQLITE_OK) return db;

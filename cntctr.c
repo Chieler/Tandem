@@ -3478,6 +3478,12 @@ static void hook_alarm(int sig) {
     _exit(0);
 }
 
+/* An answer that attaches or holds is committed (mail staged): from here the 1.8 s alarm must not replace it with {}. */
+static void hook_disarm(void) {
+    struct itimerval off = {{0, 0}, {0, 0}};
+    setitimer(ITIMER_REAL, &off, NULL);
+}
+
 /* The harness process that sent this event; *procs is the process table ("pid ppid comm"), the caller frees it. */
 static long hook_parent(const char *harness, char **procs) {
     *procs = NULL;
@@ -3774,10 +3780,12 @@ static int wake_agent(sqlite3 *db, const char *socket, const char *pane, const c
     if (st != P_IDLE && now - r.at <= (max_age ? atoi(max_age) : 120)) return 0;   /* busy or waiting for permission: type nothing; an old event is left to the screen */
     sqlite3_stmt *q = NULL;
     int reserved = 0;
-    if (sqlite3_prepare_v2(db, "UPDATE hook_sessions SET wake_reserved=1, wake_at=?3 WHERE socket=?1 AND pane=?2 AND wake_reserved=0", -1, &q, NULL) == SQLITE_OK) {
+    if (sqlite3_prepare_v2(db, "UPDATE hook_sessions SET wake_reserved=1, wake_at=?3 WHERE socket=?1 AND pane=?2 AND wake_reserved=0 "
+                               "AND ((last_event NOT IN ('UserPromptSubmit','PreInvocation','PostToolUse','PermissionRequest') AND (last_event!='Stop' OR stop_blocked=0)) OR at<?4)", -1, &q, NULL) == SQLITE_OK) {
         sqlite3_bind_text(q, 1, socket, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(q, 2, pane, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(q, 3, now);
+        sqlite3_bind_int64(q, 4, (long long)now - (max_age ? atoi(max_age) : 120));   /* idle by the last event, or an event so old that the screen decides */
         reserved = sqlite3_step(q) == SQLITE_DONE && sqlite3_changes(db) == 1;
     }
     sqlite3_finalize(q);
@@ -4119,7 +4127,7 @@ static json_object *hook_attach(sqlite3 *db, const char *harness, const char *ev
     char *text = n ? fit_mail(harness, event, HOOK_ATTACH, rows, n, NULL, &taken) : NULL;
     if (taken) stage_rows(db, rows, taken, own, token);
     if (sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK) {
-        if (taken) answer = hook_answer(harness, event, HOOK_ATTACH, text);
+        if (taken) { answer = hook_answer(harness, event, HOOK_ATTACH, text); hook_disarm(); }
     } else sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
     for (int i = 0; i < n; i++) free(rows[i].text);
     free(text);
@@ -4321,12 +4329,13 @@ static json_object *hook_stop(sqlite3 *db, const char *socket, const char *pane,
             sqlite3_finalize(st);
         }
         if (sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK) {
-            if (taken || named) answer = hook_answer(harness, event->kind, HOOK_BLOCK, text);
+            if (taken || named) { answer = hook_answer(harness, event->kind, HOOK_BLOCK, text); hook_disarm(); }
         } else sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
         for (int i = 0; i < n; i++) free(rows[i].text);
         free(text), free(extra);
     }
-    if (!answer && worker && g.ntasks) {
+    if (!answer && worker && g.ntasks && (normal || !strcmp(event->reason, "ERROR") || !strcmp(event->reason, "USER_CANCELED"))) {
+        /* an agy end that is none of these (a reason this code does not know) gave no reminder and tells the parent nothing */
         const char *r = event->reason;
         tell_parent(db, &g, pane, !strcmp(r, "ERROR") || !strcmp(r, "USER_CANCELED") ? r : "no reply after one reminder");
     }

@@ -1411,6 +1411,38 @@ f6_5() {
     unset CNTCTR_WAKE_SEC
 }
 
+# f6_8: an agy end of turn with a terminationReason this code does not know gave no reminder: the mail goes back to pending, the parent is told nothing
+f6_8() {
+    local PAR AW out T id ans
+    PAR=$(newpane f6_par8)
+    AW=$(hk_agent agy f6_w8); t set -p -t "$AW" @cntctr_parent "$PAR"
+    out=$(txt "$(call "$PAR" send '{"to":"f6_w8","text":"a job that ends in a strange way"}')")
+    T=${out#sent id=}; id=$(mailid "$T")
+    ans=$(a_pre "$AW" 0 "$(pointer "$id")")
+    check "F8 the mail is attached" "$(ctx_a "$ans")" "a job that ends in a strange way"
+    ans=$(a_stop "$AW" MAX_STEPS)
+    emptyans "$ans" && ok_ || bad "F8 a Stop with an unknown terminationReason passes" "  got: $ans"
+    same "F8 its mail is back to pending" "$(mstate "$id")" "pending/1/0"
+    same "F8 the parent is not told 'no reply after one reminder'" "$(stopped "$T")" 0
+}
+
+# f6_9: a database at the current schema version is opened without the schema script (user_version), an older one is migrated
+f6_9() {
+    local d="$TMPD/f6_9.db" sockpath
+    sockpath=$(t display -p '#{socket_path}')
+    rm -f "$d" "$d-wal" "$d-shm"
+    CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
+    same "F9 a new database carries a schema version" "$(sqx "$d" 'PRAGMA user_version')" 1
+    same "F9 and the machine row" "$(sqx "$d" "SELECT count(*) FROM meta WHERE k='machine'")" 1
+    sqx "$d" "DELETE FROM meta WHERE k='machine'"
+    CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
+    same "F9 opening a current database runs no schema script and writes no meta row" "$(sqx "$d" "SELECT count(*) FROM meta WHERE k='machine'")" 0
+    sqx "$d" "ALTER TABLE mail DROP COLUMN socket; ALTER TABLE task_gate DROP COLUMN answered; PRAGMA user_version=0"
+    CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
+    same "F9 an older database gets its columns back" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")$(sqx "$d" "SELECT count(*) FROM pragma_table_info('task_gate') WHERE name='answered'")" 11
+    same "F9 and the current version" "$(sqx "$d" 'PRAGMA user_version')" 1
+}
+
 u5p6_run() {
     export CNTCTR_PASTE_WAIT_MS=100
     local f
