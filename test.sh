@@ -1396,7 +1396,7 @@ f6_4() {
 # f6_5: mail staged in a turn that never ends with a Stop (cancel, API failure) is presented again; the third presentation stalls it
 f6_5() {
     local S P out task id ans lines
-    export CNTCTR_WAKE_SEC=2
+    export CNTCTR_WAKE_SEC=3   # a prompt must follow each wake within it (a 2 s window expired under full-suite load); the release needs it short
     S=$(newpane f6_snd5)
     P=$(hk_agent claude f6_nostop); t set -p -t "$P" @cntctr_parent "$S"   # a spawned worker: only those are released
     daemon_start "$P"
@@ -1518,7 +1518,6 @@ f7_2() {
 # f7_3: staged mail is released after a cancelled turn only for a spawned worker; a user's own session is left to its next prompt event
 f7_3() {
     local S P out task id ans
-    export CNTCTR_WAKE_SEC=2
     S=$(newpane f7_snd3)
     P=$(hk_agent claude f7_user3)   # no @cntctr_parent
     daemon_start "$P"
@@ -1529,6 +1528,10 @@ f7_3() {
     ans=$(c_prompt "$P" "$(pointer "$id")")
     check "F7.3 the prompt attaches the mail" "$(ctx_c "$ans")" "mail for a session of the user"
     same "F7.3 the mail is staged" "$(mstate "$id")" "staged/1/0"
+    daemon_stop
+    export CNTCTR_WAKE_SEC=2   # the short window is for the release below only: with it, a slow prompt under load would find the wake expired
+    daemon_start "$P"
+    daemon_hello
     sleep 7   # three wake windows, no event, an idle screen
     same "F7.3 with no Stop it stays staged for a session with no parent" "$(mstate "$id")" "staged/1/0"
     same "F7.3 and nothing more was typed" "$(screen "$P" | grep -c '\[cntctr mail id=')" 2   # cat shows each typed line twice
