@@ -1497,6 +1497,21 @@ f7_1() {
     same "F7.1 served: the Stop delivers it" "$(mstate "$id2")" "delivered/1/1"
 }
 
+# f7_2: a database stamped at a higher schema version (a newer build wrote it) is opened as it is and never stamped down
+f7_2() {
+    local d="$TMPD/f7_2.db" sockpath
+    sockpath=$(t display -p '#{socket_path}')
+    rm -f "$d" "$d-wal" "$d-shm"
+    CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
+    sqx "$d" "ALTER TABLE mail DROP COLUMN socket; PRAGMA user_version=7"
+    CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
+    same "F7.2 a newer database keeps its higher stamp" "$(sqx "$d" 'PRAGMA user_version')" 7
+    same "F7.2 and is not migrated by this build" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")" 0
+    sqx "$d" "PRAGMA user_version=0"
+    CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
+    same "F7.2 an older database is migrated and stamped" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")$(sqx "$d" 'PRAGMA user_version')" 11
+}
+
 u5p6_run() {
     export CNTCTR_PASTE_WAIT_MS=100
     local f

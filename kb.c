@@ -82,9 +82,10 @@ static int exec2(sqlite3 *db, const char *sql, const char *a, const char *b) {
     return rc;
 }
 
-static int ensure_column(sqlite3 *db, const char *table, const char *name, const char *sql) {
+/* Add the column when the table lacks it. `def` is its type and default. */
+static int ensure_column(sqlite3 *db, const char *table, const char *name, const char *def) {
     sqlite3_stmt *st = NULL;
-    char query[128];
+    char query[512];
     snprintf(query, sizeof query, "PRAGMA table_info(%s)", table);
     int found = 0, rc = sqlite3_prepare_v2(db, query, -1, &st, NULL);
     if (rc != SQLITE_OK) return rc;
@@ -92,17 +93,32 @@ static int ensure_column(sqlite3 *db, const char *table, const char *name, const
         if (!strcmp((const char *)sqlite3_column_text(st, 1), name)) found = 1;
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) return rc;
-    return found ? SQLITE_OK : sqlite3_exec(db, sql, NULL, NULL, NULL);
+    snprintf(query, sizeof query, "ALTER TABLE %s ADD COLUMN %s %s", table, name, def);
+    return found ? SQLITE_OK : sqlite3_exec(db, query, NULL, NULL, NULL);
 }
 
-static int ensure_mail_column(sqlite3 *db, const char *name, const char *sql) {
-    return ensure_column(db, "mail", name, sql);
-}
+/* Columns added to the tables of SCHEMA since the first 0.4.0 databases, in order. Add a column here and only here: the stamp
+ * below follows the length of this list, so a database that lacks the column is migrated and never skipped. */
+static const struct { const char *table, *name, *def; } MIGRATIONS[] = {
+    {"mail", "state", "TEXT NOT NULL DEFAULT 'pending'"},
+    {"mail", "staged_turn", "TEXT"},
+    {"mail", "presentations", "INTEGER NOT NULL DEFAULT 0"},
+    {"hook_sessions", "stop_blocked", "INTEGER NOT NULL DEFAULT 0"},
+    {"mail", "task", "TEXT NOT NULL DEFAULT ''"},
+    {"mail", "hooked", "INTEGER NOT NULL DEFAULT 0"},
+    {"mail", "from_pane", "TEXT NOT NULL DEFAULT ''"},
+    {"mail", "from_scope", "TEXT NOT NULL DEFAULT ''"},
+    {"mail", "socket", "TEXT NOT NULL DEFAULT ''"},   /* the tmux server of `pane`; rows from before 0.4.0 have none */
+    {"hook_sessions", "turn", "INTEGER NOT NULL DEFAULT 0"},
+    {"hook_sessions", "broken", "INTEGER NOT NULL DEFAULT 0"},
+    {"hook_sessions", "server_start", "INTEGER NOT NULL DEFAULT 0"},
+    {"task_gate", "answered", "INTEGER NOT NULL DEFAULT 0"},
+};
 
-/* PRAGMA user_version of a database that has this file's SCHEMA and every column added below. Raise it with each new table
- * or column, or databases that already carry the old number keep missing it. */
-#define KB_SCHEMA_VERSION 1
-#define KB_SCHEMA_VERSION_SQL "1"
+/* PRAGMA user_version of a database that has this file's SCHEMA and every column of MIGRATIONS: 1 for the 13 columns above, one
+ * more for each column added later. A database stamped at or above it is opened as is and is never stamped down. A new table
+ * in SCHEMA has no entry in MIGRATIONS: lower the 12 below by one for it, or databases stamped before it never get the table. */
+#define KB_SCHEMA_VERSION ((int)(sizeof MIGRATIONS / sizeof *MIGRATIONS) - 12)
 
 sqlite3 *kb_open_timeout(const char *path, char **err, int timeout_ms) {
     sqlite3 *db = NULL;
@@ -116,7 +132,7 @@ sqlite3 *kb_open_timeout(const char *path, char **err, int timeout_ms) {
     {   /* a database at the current schema needs no schema script, column checks or meta row: every hook event opens it */
         sqlite3_stmt *v = NULL;
         int current = sqlite3_prepare_v2(db, "PRAGMA user_version", -1, &v, NULL) == SQLITE_OK && sqlite3_step(v) == SQLITE_ROW
-                      && sqlite3_column_int(v, 0) == KB_SCHEMA_VERSION;
+                      && sqlite3_column_int(v, 0) >= KB_SCHEMA_VERSION;
         sqlite3_finalize(v);
         if (current) return db;
     }
@@ -126,21 +142,14 @@ sqlite3 *kb_open_timeout(const char *path, char **err, int timeout_ms) {
     char *machine = sqlite3_mprintf("INSERT OR IGNORE INTO meta VALUES ('machine', '%08x-%q');", arc4random(), host);
     int rc = sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_exec(db, SCHEMA, NULL, NULL, NULL);
-    if (rc == SQLITE_OK) rc = ensure_mail_column(db, "state", "ALTER TABLE mail ADD COLUMN state TEXT NOT NULL DEFAULT 'pending'");
-    if (rc == SQLITE_OK) rc = ensure_mail_column(db, "staged_turn", "ALTER TABLE mail ADD COLUMN staged_turn TEXT");
-    if (rc == SQLITE_OK) rc = ensure_mail_column(db, "presentations", "ALTER TABLE mail ADD COLUMN presentations INTEGER NOT NULL DEFAULT 0");
-    if (rc == SQLITE_OK) rc = ensure_column(db, "hook_sessions", "stop_blocked", "ALTER TABLE hook_sessions ADD COLUMN stop_blocked INTEGER NOT NULL DEFAULT 0");
-    if (rc == SQLITE_OK) rc = ensure_mail_column(db, "task", "ALTER TABLE mail ADD COLUMN task TEXT NOT NULL DEFAULT ''");
-    if (rc == SQLITE_OK) rc = ensure_mail_column(db, "hooked", "ALTER TABLE mail ADD COLUMN hooked INTEGER NOT NULL DEFAULT 0");
-    if (rc == SQLITE_OK) rc = ensure_mail_column(db, "from_pane", "ALTER TABLE mail ADD COLUMN from_pane TEXT NOT NULL DEFAULT ''");
-    if (rc == SQLITE_OK) rc = ensure_mail_column(db, "from_scope", "ALTER TABLE mail ADD COLUMN from_scope TEXT NOT NULL DEFAULT ''");
-    if (rc == SQLITE_OK) rc = ensure_mail_column(db, "socket", "ALTER TABLE mail ADD COLUMN socket TEXT NOT NULL DEFAULT ''");   /* the tmux server of `pane`; rows from before 0.4.0 have none */
-    if (rc == SQLITE_OK) rc = ensure_column(db, "hook_sessions", "turn", "ALTER TABLE hook_sessions ADD COLUMN turn INTEGER NOT NULL DEFAULT 0");
-    if (rc == SQLITE_OK) rc = ensure_column(db, "hook_sessions", "broken", "ALTER TABLE hook_sessions ADD COLUMN broken INTEGER NOT NULL DEFAULT 0");
-    if (rc == SQLITE_OK) rc = ensure_column(db, "hook_sessions", "server_start", "ALTER TABLE hook_sessions ADD COLUMN server_start INTEGER NOT NULL DEFAULT 0");
-    if (rc == SQLITE_OK) rc = ensure_column(db, "task_gate", "answered", "ALTER TABLE task_gate ADD COLUMN answered INTEGER NOT NULL DEFAULT 0");
+    for (size_t i = 0; rc == SQLITE_OK && i < sizeof MIGRATIONS / sizeof *MIGRATIONS; i++)
+        rc = ensure_column(db, MIGRATIONS[i].table, MIGRATIONS[i].name, MIGRATIONS[i].def);
     if (rc == SQLITE_OK) rc = sqlite3_exec(db, machine, NULL, NULL, NULL);
-    if (rc == SQLITE_OK) rc = sqlite3_exec(db, "PRAGMA user_version=" KB_SCHEMA_VERSION_SQL, NULL, NULL, NULL);
+    if (rc == SQLITE_OK) {
+        char stamp[48];
+        snprintf(stamp, sizeof stamp, "PRAGMA user_version=%d", KB_SCHEMA_VERSION);
+        rc = sqlite3_exec(db, stamp, NULL, NULL, NULL);
+    }
     if (rc == SQLITE_OK) rc = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
     sqlite3_free(machine);
     if (rc == SQLITE_OK) return db;
