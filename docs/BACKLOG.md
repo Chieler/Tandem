@@ -3,7 +3,7 @@
 Releases:
 - `v0.1.0`: tag on main, before fleet tools.
 - `0.2.0`: on main, tag `v0.2.0` (2026-11-08); live in all harnesses as `~/.local/bin/cntctr-0.2.0`.
-- `0.3.0`: merged 0.2.0 and fleet tools on merge/0.3.0; release review pending.
+- `0.3.0`: on main, tag `v0.3.0` (2026-11-12); live in all harnesses as `~/.local/bin/cntctr-0.3.0`.
 Source: orchestrator feedback, 2026-11-07, ranked by cost.
 
 ## 0.2.0
