@@ -1318,26 +1318,37 @@ static char *row_field(const char *rows, const char *pane, int field) {
     return NULL;
 }
 
-/* Pane of the caller's own parent, "" if it has none or runs in no pane. */
-static void caller_parent(char out[32]) {
-    char *p = NULL;
-    *out = '\0';
-    if (*caller_pane && TMUX(NULL, &p, "show", "-pqv", "-t", caller_pane, "@cntctr_parent") == 0) snprintf(out, 32, "%s", p);
+/* One row per pane: name, harness, pane id, alive, activity, parent, path, root. */
+#define ROW_FMT "#{@cntctr_name}\t#{@cntctr_harness}\t#{pane_id}\t#{?pane_dead,dead,alive}\t#{window_activity}" \
+                "\t#{@cntctr_parent}\t#{pane_current_path}\t#{@cntctr_root}"
+
+/* Root of `pane` from the rows: its @cntctr_root, else itself (a session started by hand is its own root). Caller frees. */
+static char *row_root(const char *rows, const char *pane) {
+    char *r = row_field(rows, pane, 7);
+    if (r && *r) return r;
+    free(r);
+    return strdup(pane);
+}
+
+/* Pane of the caller's own parent from the rows, "" if it has none or runs in no pane. */
+static void caller_parent(const char *rows, char out[32]) {
+    char *p = *caller_pane ? row_field(rows, caller_pane, 5) : NULL;
+    snprintf(out, 32, "%s", p ? p : "");
     free(p);
 }
 
-/* Whether the caller may task `pane`, whose parent pane is `pp`: itself, its worker, its parent or a sibling. */
-static int in_scope(const char *pane, const char *pp, const char *cpar) {
-    return (*caller_pane && (strcmp(pane, caller_pane) == 0 || strcmp(pp, caller_pane) == 0)) ||
-           (*cpar && (strcmp(pane, cpar) == 0 || strcmp(pp, cpar) == 0));
+/* Whether the caller may task a pane with root `root`: any pane of its own spawn tree, itself included. `croot` is the caller's root. */
+static int in_scope(const char *root, const char *croot) {
+    return *croot && strcmp(root, croot) == 0;
 }
 
-/* Who owns `pane` as the caller sees it: you, parent, user (started by hand), or its parent's name. Caller frees. */
+/* Who owns `pane` as the caller sees it: you, parent, user (started by hand), its parent's name, or <pane id> (gone). Caller frees. */
 static char *owner_of(const char *pane, const char *pp, const char *cpar, const char *ppname) {
     if (*cpar && strcmp(pane, cpar) == 0) return strdup("parent");
     if (*caller_pane && strcmp(pp, caller_pane) == 0) return strdup("you");
     if (!*pp) return strdup("user");
-    return strdup(ppname && *ppname ? ppname : pp);
+    if (!ppname) return fmt("%s (gone)", pp);
+    return strdup(*ppname ? ppname : pp);
 }
 
 /* `path` with $HOME shown as ~. Caller frees. */
@@ -1352,39 +1363,41 @@ static char *show_dir(const char *path) {
     return strdup(path);
 }
 
-/* NULL if the caller may task `pane` (named `name`): its own, parent or sibling, or cross=true.
+/* NULL if the caller may task `pane` (named `name`): one in its own spawn tree, or cross=true.
  * Otherwise the error text, which says whose agent it is. Caller frees. */
 static char *scope_error(json_object *a, const char *pane, const char *name) {
-    char cpar[32], *pp = NULL, *dir = NULL, *ppname, *owner, *shown, *err;
+    char cpar[32], *rows = NULL, *root, *croot, *err;
     if (barg(a, "cross")) return NULL;
-    caller_parent(cpar);
-    if (TMUX(NULL, &pp, "show", "-pqv", "-t", pane, "@cntctr_parent") != 0) {
-        free(pp);
-        pp = strdup("");
+    if (TMUX(NULL, &rows, "list-panes", "-a", "-F", ROW_FMT) != 0) {
+        free(rows);
+        rows = strdup("");
     }
-    if (in_scope(pane, pp, cpar)) {
-        free(pp);
-        return NULL;
+    caller_parent(rows, cpar);
+    root = row_root(rows, pane);
+    croot = *caller_pane ? row_root(rows, caller_pane) : strdup("");
+    if (in_scope(root, croot)) {
+        err = NULL;
+    } else {
+        char *pp = row_field(rows, pane, 5), *dir = row_field(rows, pane, 6);
+        if (!pp) pp = strdup("");
+        if (!dir) dir = strdup("");
+        char *ppname = *pp ? row_field(rows, pp, 0) : NULL, *owner = owner_of(pane, pp, cpar, ppname), *shown = show_dir(dir);
+        err = fmt("%s is not yours: owner=%s dir=%s. Spawn your own agent with spawn cwd=<your dir>, or use post for the board. "
+                  "Pass cross=true only if the user asked you to message this agent.", name, owner, shown);
+        free(pp), free(dir), free(ppname), free(owner), free(shown);
     }
-    if (TMUX(NULL, &dir, "display", "-p", "-t", pane, "#{pane_current_path}") != 0) *dir = '\0';
-    ppname = *pp ? pane_name(pp) : NULL;
-    owner = owner_of(pane, pp, cpar, ppname);
-    shown = show_dir(dir);
-    err = fmt("%s is not yours: owner=%s dir=%s. Spawn your own agent with spawn cwd=<your dir>, or use post for the board. "
-              "Pass cross=true only if the user asked you to message this agent.", name, owner, shown);
-    free(pp), free(dir), free(ppname), free(owner), free(shown);
+    free(rows), free(root), free(croot);
     return err;
 }
 
 static int tool_list(json_object *args, char **res) {
     char *out;
-    if (TMUX(NULL, &out, "list-panes", "-a", "-F",
-             "#{@cntctr_name}\t#{@cntctr_harness}\t#{pane_id}\t#{?pane_dead,dead,alive}\t#{window_activity}"
-             "\t#{@cntctr_parent}\t#{pane_current_path}") != 0)
+    if (TMUX(NULL, &out, "list-panes", "-a", "-F", ROW_FMT) != 0)
         return fail(res, out);
     int all = barg(args, "all"), hidden = 0;
     char cpar[32], *rows = strdup(out);   /* rows stays whole; strtok_r cuts `out` */
-    caller_parent(cpar);
+    caller_parent(rows, cpar);
+    char *croot = *caller_pane ? row_root(rows, caller_pane) : strdup("");
     char *opts = server_opts(), *list = strdup(""), *save;
     time_t now = time(NULL);
     char *db_err = NULL;
@@ -1414,9 +1427,10 @@ static int tool_list(json_object *args, char **res) {
         char *activity = alive ? strchr(alive + 1, '\t') : NULL;
         char *parent = activity ? strchr(activity + 1, '\t') : NULL;
         char *path = parent ? strchr(parent + 1, '\t') : NULL;
-        if (!path || harness == name) continue;
-        *harness++ = *pane++ = *alive++ = *activity++ = *parent++ = *path++ = '\0';
-        if (!all && !in_scope(pane, parent, cpar)) {
+        char *root = path ? strchr(path + 1, '\t') : NULL;
+        if (!root || harness == name) continue;
+        *harness++ = *pane++ = *alive++ = *activity++ = *parent++ = *path++ = *root++ = '\0';
+        if (!all && !in_scope(*root ? root : pane, croot)) {
             hidden++;
             continue;
         }
@@ -1462,6 +1476,7 @@ static int tool_list(json_object *args, char **res) {
     free(sock);
     free(out);
     free(rows);
+    free(croot);
     free(opts);
     if (hidden) {
         char *t = fmt("%s+%d other agents (list all=true shows them)\n", list, hidden);
@@ -1742,7 +1757,13 @@ static int spawn_locked(json_object *a, int wait, char id[9], char **pane_out,
     free(TMUXE(NULL, "set", "-p", "-t", pane, "@cntctr_name", name));
     free(TMUXE(NULL, "set", "-p", "-t", pane, "@cntctr_harness", harness));
     free(TMUXE(NULL, "set", "-p", "-t", pane, "@cntctr_model", model));
-    if (*caller_pane) free(TMUXE(NULL, "set", "-p", "-t", pane, "@cntctr_parent", caller_pane));
+    if (*caller_pane) {   /* the whole spawn tree shares one root: the caller's own, else the caller itself */
+        char *croot = NULL;
+        free(TMUXE(NULL, "set", "-p", "-t", pane, "@cntctr_parent", caller_pane));
+        if (TMUX(NULL, &croot, "show", "-pqv", "-t", caller_pane, "@cntctr_root") != 0) *croot = '\0';
+        free(TMUXE(NULL, "set", "-p", "-t", pane, "@cntctr_root", *croot ? croot : caller_pane));
+        free(croot);
+    }
     char *title = fmt("task %s %s→%s", id, caller_name, name);
     log_history(caller_pane, title, task);
     free(title);
@@ -2563,7 +2584,6 @@ static char *start_review(sqlite3 *db, const struct project *p, const char *name
         free(res);
     } else {
         untrack(sid);   /* the reviewer answers with tool_verdict, not reply */
-        free(TMUXE(NULL, "set", "-pu", "-t", pane, "@cntctr_parent"));
         const char *hold = getenv("CNTCTR_TEST_HOLD_BIND");
         if (hold) sleep((unsigned)atoi(hold));
         if (kb_tool_bind(db, p->key, name, version, pane, ROUTES[h][tier][0], path) != 1) {
@@ -2953,7 +2973,7 @@ static const char TOOLS[] =
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
     "\"to\":{\"type\":\"string\",\"description\":\"Agent name, or \\\"parent\\\" for the agent that spawned you\"},\"text\":{\"type\":\"string\"},\"wait\":{\"type\":\"boolean\"},"
     "\"re\":{\"type\":\"string\",\"description\":\"Add to this open task id; the worker replies once\"},"
-    "\"cross\":{\"type\":\"boolean\",\"description\":\"Only if the user asked you to message this agent: allows an agent that is not your worker, parent or sibling\"},"
+    "\"cross\":{\"type\":\"boolean\",\"description\":\"Only if the user asked you to message this agent: allows an agent outside your own spawn tree\"},"
     "\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"},"
     "\"timeout\":{\"type\":\"integer\",\"description\":\"Seconds to block when wait=true (default 600)\"}},"
     "\"required\":[\"to\",\"text\"]}},"
@@ -2966,7 +2986,7 @@ static const char TOOLS[] =
     "\"harness\":{\"type\":\"string\",\"enum\":[\"claude\",\"codex\",\"agy\"]},"
     "\"name\":{\"type\":\"string\"},\"task\":{\"type\":\"string\"},"
     "\"cwd\":{\"type\":\"string\"},\"tier\":{\"type\":\"string\"},"
-    "\"cross\":{\"type\":\"boolean\",\"description\":\"Only if the user asked you to message this agent: allows an agent that is not your worker, parent or sibling\"},"
+    "\"cross\":{\"type\":\"boolean\",\"description\":\"Only if the user asked you to message this agent: allows an agent outside your own spawn tree\"},"
     "\"model\":{\"type\":\"string\"},\"effort\":{\"type\":\"string\"}},"
     "\"required\":[\"kind\"]}},"
     "\"timeout\":{\"type\":\"integer\",\"description\":\"Shared deadline in seconds (default 600)\"},"
@@ -2978,10 +2998,10 @@ static const char TOOLS[] =
     "\"insights\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Facts that stay true after the task, not status or findings that will be fixed; use here instead of a separate note\"},"
     KFROM "},"
     "\"required\":[\"id\",\"text\"]}},"
-    "{\"name\":\"list\",\"description\":\"List your own agents (you, your workers, your parent, your siblings): name, harness, pane, alive or dead, state (idle, busy, permission, limited, dead), open task ids, seconds since the screen last changed, limit reset time, owner and directory. all=true adds every other agent of the tmux server, which may be a session the user runs for other work: idle does not mean free to use.\","
+    "{\"name\":\"list\",\"description\":\"List your own agents (you and every agent spawned in your own tree): name, harness, pane, alive or dead, state (idle, busy, permission, limited, dead), open task ids, seconds since the screen last changed, limit reset time, owner and directory. all=true adds every other agent of the tmux server, which may be a session the user runs for other work: idle does not mean free to use.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"all\":{\"type\":\"boolean\",\"description\":\"Show every agent of the tmux server, not only yours\"}," KFROM "}}},"
     "{\"name\":\"kill\",\"description\":\"Close an agent's tmux pane.\","
-    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"cross\":{\"type\":\"boolean\",\"description\":\"Only if the user asked you to message this agent: allows an agent that is not your worker, parent or sibling\"},\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"}},\"required\":[\"name\"]}}"
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"cross\":{\"type\":\"boolean\",\"description\":\"Only if the user asked you to message this agent: allows an agent outside your own spawn tree\"},\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"}},\"required\":[\"name\"]}}"
     ",{\"name\":\"note\",\"description\":\"Store durable knowledge for all agents: insight (a 1-5 line fact or decision), "
     "skill (a reusable how-to) or doc (long text). Facts must stay true after the task; use reply.insights when answering one. "
     "To replace or merge entries, pass their ids in supersedes. When an entry goes stale, write its replacement with supersedes=[old id]; recall hides superseded and forgotten entries.\","

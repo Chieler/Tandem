@@ -141,7 +141,7 @@ u28_run() {
     case $out in *' passed, '*) p=$(printf '%s\n' "$out" | sed -n 's/^\([0-9]*\) passed.*/\1/p'); f=$(printf '%s\n' "$out" | sed -n 's/.* \([0-9]*\) failed$/\1/p') ;; *) f=1 ;; esac
     pass=$((pass + p)); fail=$((fail + f))
 }
-# F9: agents only task agents they own. list shows owner and directory, and by default only the caller, its workers, parent and siblings;
+# F9: agents only task agents they own. list shows owner and directory, and by default only the caller's own spawn tree (root);
 # send, gather and kill refuse any other agent unless cross=true. Run alone with ONLY=f9.
 has_pane() { t list-panes -a -F '#{pane_id}' | grep -qx "$1"; }
 f9_run() {
@@ -151,6 +151,8 @@ f9_run() {
     SIB=$(newpane f9_sib); USR=$(newpane f9_user -c "$dirs/elsewhere"); OW=$(newpane f9_ow)
     t set -p -t "$C" @cntctr_parent "$PAR"; t set -p -t "$W" @cntctr_parent "$C"
     t set -p -t "$SIB" @cntctr_parent "$PAR"; t set -p -t "$OW" @cntctr_parent "$USR"
+    # a spawn also sets the tree's root (see F10); scope is the same root
+    t set -p -t "$C" @cntctr_root "$PAR"; t set -p -t "$W" @cntctr_root "$PAR"; t set -p -t "$SIB" @cntctr_root "$PAR"; t set -p -t "$OW" @cntctr_root "$USR"
     # list: scope and fields
     out=$(txt "$(scall "$C" list '{}')")
     check "F9.1 list shows the caller, owned by its parent" "$(printf '%s\n' "$out" | grep '^f9_me ')" "owner=f9_par"
