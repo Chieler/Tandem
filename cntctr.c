@@ -2881,7 +2881,7 @@ static char *set_caller(json_object *args) {
     snprintf(caller_name, sizeof caller_name, "%s", current && *current ? current : self_name);
     free(current);
     const char *from = sarg(args, "from");
-    return from && *from ? resolve_from(from) : NULL;
+    return from && *from && !*self_pane ? resolve_from(from) : NULL;   /* a caller with a pane of its own is that pane; from= is for Codex, which has none */
 }
 
 static const char *nul_argument(json_object *value, const char *key) {
