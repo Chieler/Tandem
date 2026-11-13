@@ -319,7 +319,7 @@ char *kb_board(sqlite3 *db, const char *scope, const char *me, const char *pane,
 /* Post ids ("3,7"), among the posts kb_board lists, of `me`'s undelivered mail that a hook presented: "" if none. */
 char *kb_board_mail(sqlite3 *db, const char *scope, const char *me, const char *pane, long long server_start, int limit) {
     sqlite3_stmt *st = prep(db,
-        "SELECT group_concat(post) FROM mail JOIN posts ON posts.rowid = mail.post WHERE mail.hooked = 1 AND mail.delivered = 0"
+        "SELECT group_concat(post) FROM mail JOIN posts ON posts.rowid = mail.post WHERE (mail.hooked = 1 OR mail.presentations > 0) AND mail.delivered = 0"
         " AND (mail.name = ?3 OR (mail.pane = ?4 AND posts.at > ?5 AND ?4 != ''))"
         " AND mail.post IN (SELECT rowid FROM (SELECT rowid FROM posts WHERE scope = ?1 AND NOT EXISTS (SELECT 1 FROM mail m2 WHERE m2.post = posts.rowid"
         " AND (m2.name != ?3 AND (m2.pane != ?4 OR posts.at <= ?5 OR ?4 = ''))) ORDER BY rowid DESC LIMIT ?2))");

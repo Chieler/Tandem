@@ -625,8 +625,10 @@ a_pre() { hk agy PreInvocation "$1" "$(jq -nc --arg p "$3" --argjson n "${2:-0}"
 a_stop() { hk agy Stop "$1" "{\"conversationId\":\"S1\",\"executionNum\":${3:-0},\"fullyIdle\":true,\"terminationReason\":\"${2:-NO_TOOL_CALL}\"}"; }
 # hk_agent <claude|agy> <name>: a fake agent pane whose hook events are on record and whose last event is a passing Stop
 hk_agent() {
-    local p
-    p=$(newpane "$2")
+    local p h=$1 n=$2
+    shift 2
+    p=$(newpane "$n" "$@")
+    set -- "$h"
     t set -p -t "$p" @cntctr_harness "$1"
     if [ "$1" = claude ]; then c_start "$p"; c_prompt "$p" hello; c_stop "$p"
     else a_start "$p"; a_pre "$p" 0 hello; a_stop "$p"; fi >/dev/null
@@ -850,7 +852,7 @@ u5p2_run() {
 screen_lines() { screen "$1" | sed 's/\^\[\[20[01]~//g' | grep -v '^[[:space:]]*$' | sort -u; }
 # wait_mstate <description> <mail id> <state/presentations/delivered>: pass once the mail has that state (waits up to 5 s)
 wait_mstate() {
-    for _ in $(seq 50); do [ "$(mstate "$2")" = "$3" ] && { ok_; return; }; sleep 0.1; done
+    for _ in $(seq 100); do [ "$(mstate "$2")" = "$3" ] && { ok_; return; }; sleep 0.1; done
     bad "$1" "  want: $3" "  got:  $(mstate "$2")"
 }
 # mailid <task>: the mail id stored for a task
@@ -1028,19 +1030,96 @@ u5p3_run() {
     daemon_stop
 }
 
-u5_run() {
+# list_call: the long-lived server (daemon_start) learns its agent's identity, which starts its mail retry thread
+daemon_hello() { daemon_send '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list","arguments":{}}}'; }
+notices() { sqx "$CNTCTR_DB" "SELECT count(*) FROM posts WHERE text LIKE '%undelivered after 3 attempts: $1 to %'"; }
+
+u5p4_run() {
+    local S Q P id task out i before ans lines
+    export CNTCTR_PASTE_WAIT_MS=100
+    S=$(newpane u5_snd4)
+
+    # U11: a mail presented three times without delivery is stalled, and its sender is told once
+    Q=$(hk_agent agy u5_k1)
+    daemon_start "$Q"
+    daemon_hello
+    out=$(txt "$(call "$S" send '{"to":"u5_k1","text":"mail that is never delivered"}')")
+    task=${out#sent id=}; id=$(mailid "$task")
+    wait_mstate "U11 the first line is typed and counted" "$id" "pending/1/0"
+    for i in 1 2 3; do
+        ans=$(a_pre "$Q" 0 "$(pointer "$id")")
+        check "U11 presentation $i attaches the mail" "$(ctx_a "$ans")" "mail that is never delivered"
+        same "U11 presentation $i is staged" "$(mstate "$id")" "staged/$i/0"
+        a_stop "$Q" ERROR >/dev/null
+        if [ "$i" -lt 3 ]; then wait_mstate "U11 after an error Stop the retry thread types the line again" "$id" "pending/$((i + 1))/0"; fi
+    done
+    wait_mstate "U11 the third presentation went unanswered: stalled" "$id" "stalled/3/0"
+    before=$(screen "$Q")
+    ans=$(a_pre "$Q" 0 "$(pointer "$id")")
+    emptyans "$ans" && ok_ || bad "U11 the fourth event attaches nothing" "  got: $ans"
+    sleep 3
+    same "U11 the retry thread types nothing for a stalled mail" "$(screen "$Q")" "$before"
+    same "U11 the sender has one undelivered mail" "$(notices "$id")" 1
+    check "U11 it names the mail and the addressee" "$(txt "$(call "$S" board '{}')")" "undelivered after 3 attempts: $id to u5_k1"
+    # a server restart does not reset the count and does not tell the sender again
+    daemon_stop
+    daemon_start "$Q"
+    daemon_hello
+    sleep 3
+    same "U11 after a server restart the mail is still stalled" "$(mstate "$id")" "stalled/3/0"
+    same "U11 after a server restart the sender is not told again" "$(notices "$id")" 1
+    same "U11 after a server restart nothing is typed" "$(screen "$Q")" "$before"
+    check "U11 the addressee's board lists the stalled mail" "$(txt "$(call "$Q" board '{}')")" "mail that is never delivered"
+    check "U11 and its unread notice counted it before the read" "$(sqx "$CNTCTR_DB" "SELECT count(*) FROM mail WHERE pane='$Q'")" 1
+    daemon_stop
+
+    # U11b: the hook command stops running: after the wake window (1 s here, 30 s by default) the mail is pasted as a full envelope
+    export CNTCTR_WAKE_SEC=1
+    P=$(hk_agent claude u5_l1)
+    daemon_start "$P"
+    daemon_hello
+    out=$(txt "$(call "$S" send '{"to":"u5_l1","text":"mail when the hook is gone"}')")
+    task=${out#sent id=}; id=$(mailid "$task")
+    expect_screen "U11b the pointer line is typed first" "$P" "[cntctr mail id=$id]"
+    expect_screen "U11b with no hook event, the full envelope is pasted after the wake window" "$P" "[cntctr end id=$task]"
+    check "U11b with the text" "$(screen "$P")" "mail when the hook is gone"
+    wait_mstate "U11b that paste delivers the mail" "$id" "delivered/1/1"
+    same "U11b the agent has no hooks until its next prompt event" "$(sqx "$CNTCTR_DB" "SELECT broken FROM hook_sessions WHERE pane='$P'")" 1
+    out=$(txt "$(call "$S" send '{"to":"u5_l1","text":"second mail while the hook is gone"}')")
+    task=${out#sent id=}
+    expect_screen "U11b a send now pastes the full envelope at once" "$P" "[cntctr end id=$task]"
+    c_prompt "$P" "I am back" >/dev/null
+    same "U11b the next prompt event gives the hooks back" "$(sqx "$CNTCTR_DB" "SELECT broken FROM hook_sessions WHERE pane='$P'")" 0
+    daemon_stop
+
+    # U11b: with the full paste failing as well, the pointer is typed three times at most, then the mail is stalled
+    P=$(hk_agent claude u5_l2 sh -c 'exec /bin/cat')   # no bracketed paste: a multi-line paste is refused, one line is not
+    daemon_start "$P"
+    daemon_hello
+    out=$(txt "$(call "$S" send '{"to":"u5_l2","text":"mail that cannot be pasted"}')")
+    task=${out#sent id=}; id=$(mailid "$task")
+    wait_mstate "U11b the mail is stalled after three pointers" "$id" "stalled/3/0"
+    lines=$(screen "$P" | grep -c '\[cntctr mail id=')   # cat shows each typed line twice
+    same "U11b the pointer was typed three times" "$lines" 6
+    refute "U11b the text itself was never typed" "$(screen "$P")" "mail that cannot be pasted"
+    same "U11b the sender has the undelivered mail, once" "$(notices "$id")" 1
+    daemon_stop
+    unset CNTCTR_WAKE_SEC CNTCTR_PASTE_WAIT_MS
+}
+
+u5_run() {   # U5PARTS="p3 p4" runs just those parts, in that order
     hk_boot
-    u5p1_run
-    u5p2_run
-    u5p3_run
+    local part
+    for part in ${U5PARTS:-p1 p2 p3 p4}; do "u5${part}_run"; done
     hk_stop
 }
-if [ "${ONLY:-}" = u5 ] || [ "${ONLY:-}" = u5p1 ] || [ "${ONLY:-}" = u5p2 ] || [ "${ONLY:-}" = u5p3 ]; then
+if [ "${ONLY:-}" = u5 ] || [ "${ONLY:-}" = u5p1 ] || [ "${ONLY:-}" = u5p2 ] || [ "${ONLY:-}" = u5p3 ] || [ "${ONLY:-}" = u5p4 ]; then
     case $ONLY in
         u5) u5_run ;;
         u5p1) hk_boot; u5p1_run; hk_stop ;;
         u5p2) hk_boot; u5p2_run; hk_stop ;;
         u5p3) hk_boot; u5p3_run; hk_stop ;;
+        u5p4) hk_boot; u5p4_run; hk_stop ;;
     esac
     printf '%d passed, %d failed\n' "$pass" "$fail"
     [ "$fail" -eq 0 ]; exit $?
