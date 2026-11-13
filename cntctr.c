@@ -1298,12 +1298,69 @@ static int agent_hook_state(sqlite3_stmt *st, struct proc_cache *cache, int *cac
     return 1;
 }
 
+/* ---- ownership: which agents a caller may task ---- */
+
+/* Field `n` of a tab-separated line (up to \n or the end), caller frees. */
+static char *tsv_field(const char *line, int n) {
+    for (; n > 0 && *line && *line != '\n'; line++)
+        if (*line == '\t') n--;
+    return strndup(line, strcspn(line, "\t\n"));
+}
+
+/* Field `field` of the row whose third field is `pane`, caller frees, or NULL. */
+static char *row_field(const char *rows, const char *pane, int field) {
+    for (const char *l = rows; *l; l += strcspn(l, "\n") + (l[strcspn(l, "\n")] == '\n')) {
+        char *p = tsv_field(l, 2);
+        int hit = strcmp(p, pane) == 0;
+        free(p);
+        if (hit) return tsv_field(l, field);
+    }
+    return NULL;
+}
+
+/* Pane of the caller's own parent, "" if it has none or runs in no pane. */
+static void caller_parent(char out[32]) {
+    char *p = NULL;
+    *out = '\0';
+    if (*caller_pane && TMUX(NULL, &p, "show", "-pqv", "-t", caller_pane, "@cntctr_parent") == 0) snprintf(out, 32, "%s", p);
+    free(p);
+}
+
+/* Whether the caller may task `pane`, whose parent pane is `pp`: itself, its worker, its parent or a sibling. */
+static int in_scope(const char *pane, const char *pp, const char *cpar) {
+    return (*caller_pane && (strcmp(pane, caller_pane) == 0 || strcmp(pp, caller_pane) == 0)) ||
+           (*cpar && (strcmp(pane, cpar) == 0 || strcmp(pp, cpar) == 0));
+}
+
+/* Who owns `pane` as the caller sees it: you, parent, user (started by hand), or its parent's name. Caller frees. */
+static char *owner_of(const char *pane, const char *pp, const char *cpar, const char *ppname) {
+    if (*cpar && strcmp(pane, cpar) == 0) return strdup("parent");
+    if (*caller_pane && strcmp(pp, caller_pane) == 0) return strdup("you");
+    if (!*pp) return strdup("user");
+    return strdup(ppname && *ppname ? ppname : pp);
+}
+
+/* `path` with $HOME shown as ~. Caller frees. */
+static char *show_dir(const char *path) {
+    const char *home = getenv("HOME");
+    char real[PATH_MAX];
+    for (int i = 0; home && *home && i < 2; i++) {
+        const char *h = i ? (realpath(home, real) ? real : NULL) : home;
+        size_t n = h ? strlen(h) : 0;
+        if (n > 1 && strncmp(path, h, n) == 0 && (!path[n] || path[n] == '/')) return fmt("~%s", path + n);
+    }
+    return strdup(path);
+}
+
 static int tool_list(json_object *args, char **res) {
-    (void)args;
     char *out;
     if (TMUX(NULL, &out, "list-panes", "-a", "-F",
-             "#{@cntctr_name}\t#{@cntctr_harness}\t#{pane_id}\t#{?pane_dead,dead,alive}\t#{window_activity}") != 0)
+             "#{@cntctr_name}\t#{@cntctr_harness}\t#{pane_id}\t#{?pane_dead,dead,alive}\t#{window_activity}"
+             "\t#{@cntctr_parent}\t#{pane_current_path}") != 0)
         return fail(res, out);
+    int all = barg(args, "all"), hidden = 0;
+    char cpar[32], *rows = strdup(out);   /* rows stays whole; strtok_r cuts `out` */
+    caller_parent(cpar);
     char *opts = server_opts(), *list = strdup(""), *save;
     time_t now = time(NULL);
     char *db_err = NULL;
@@ -1331,8 +1388,14 @@ static int tool_list(json_object *args, char **res) {
         char *pane = harness ? strchr(harness + 1, '\t') : NULL;
         char *alive = pane ? strchr(pane + 1, '\t') : NULL;
         char *activity = alive ? strchr(alive + 1, '\t') : NULL;
-        if (!activity || harness == name) continue;
-        *harness++ = *pane++ = *alive++ = *activity++ = '\0';
+        char *parent = activity ? strchr(activity + 1, '\t') : NULL;
+        char *path = parent ? strchr(parent + 1, '\t') : NULL;
+        if (!path || harness == name) continue;
+        *harness++ = *pane++ = *alive++ = *activity++ = *parent++ = *path++ = '\0';
+        if (!all && !in_scope(pane, parent, cpar)) {
+            hidden++;
+            continue;
+        }
         long long act = atoll(activity);
         char *resets = NULL, *tasks = strdup("");
         enum pstate st = P_IDLE;
@@ -1360,11 +1423,13 @@ static int tool_list(json_object *args, char **res) {
                 tasks = t;
             }
         }
-        char *t = fmt("%s%s %s %s %s %s%s%s idle=%llds%s%s%s\n", list, name, harness, pane, alive, PSTATE[st],
+        char *ppname = *parent ? row_field(rows, parent, 0) : NULL, *owner = owner_of(pane, parent, cpar, ppname), *dir = show_dir(path);
+        char *t = fmt("%s%s %s %s %s %s%s%s idle=%llds%s%s%s owner=%s dir=%s\n", list, name, harness, pane, alive, PSTATE[st],
                       *tasks ? " tasks=" : "", tasks, act ? (long long)now - act : 0LL,
-                      resets ? " resets=\"" : "", resets ? resets : "", resets ? "\"" : "");
+                      resets ? " resets=\"" : "", resets ? resets : "", resets ? "\"" : "", owner, dir);
         free(list);
         list = t;
+        free(ppname), free(owner), free(dir);
         free(resets);
         free(tasks);
     }
@@ -1372,7 +1437,13 @@ static int tool_list(json_object *args, char **res) {
     if (db) sqlite3_close(db);
     free(sock);
     free(out);
+    free(rows);
     free(opts);
+    if (hidden) {
+        char *t = fmt("%s+%d other agents (list all=true shows them)\n", list, hidden);
+        free(list);
+        list = t;
+    }
     if (!*list) {
         free(list);
         return ok(res, fmt("no agents"));
@@ -2872,8 +2943,8 @@ static const char TOOLS[] =
     "\"insights\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Facts that stay true after the task, not status or findings that will be fixed; use here instead of a separate note\"},"
     KFROM "},"
     "\"required\":[\"id\",\"text\"]}},"
-    "{\"name\":\"list\",\"description\":\"List agents: name, harness, pane, alive or dead, state (idle, busy, permission, limited, dead), open task ids, seconds since the screen last changed, and limit reset time.\","
-    "\"inputSchema\":{\"type\":\"object\",\"properties\":{" KFROM "}}},"
+    "{\"name\":\"list\",\"description\":\"List agents: name, harness, pane, alive or dead, state (idle, busy, permission, limited, dead), open task ids, seconds since the screen last changed, limit reset time, owner and directory. By default only you, your workers, your parent and your siblings; all=true shows every agent of the tmux server.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"all\":{\"type\":\"boolean\",\"description\":\"Show every agent of the tmux server, not only yours\"}," KFROM "}}},"
     "{\"name\":\"kill\",\"description\":\"Close an agent's tmux pane.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"}},\"required\":[\"name\"]}}"
     ",{\"name\":\"note\",\"description\":\"Store durable knowledge for all agents: insight (a 1-5 line fact or decision), "

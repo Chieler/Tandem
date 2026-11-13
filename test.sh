@@ -71,9 +71,17 @@ session() {
     }
     rm -f "$fifo"
 }
-call_raw() {
-    SKIP=1 session "$1" 2 "$INIT" "$(printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"%s","arguments":%s}}' "$2" "$3")" | tail -n 1
+# Since F9 the shared call lists with all=true: the tests are about something else. STRICT=1 (see scall) sends the arguments as given; the F9 tests use it.
+call_args() {
+    [ -n "${STRICT:-}" ] && { printf '%s' "$2"; return; }
+    printf '%s' "$2" | jq -c --arg tool "$1" '
+        if $tool == "list" then . + {all: true}
+        else . end' 2>/dev/null || printf '%s' "$2"
 }
+call_raw() {
+    SKIP=1 session "$1" 2 "$INIT" "$(printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"%s","arguments":%s}}' "$2" "$(call_args "$2" "$3")")" | tail -n 1
+}
+scall() { STRICT=1 call "$@"; }
 call() {
     # a one-call session stands in for the agent's long-lived MCP server: it sets @cntctr_srv to its own pid and exits, so the pane is put back to the test shell's pid
     local out
@@ -130,6 +138,43 @@ u28_run() {
     case $out in *' passed, '*) p=$(printf '%s\n' "$out" | sed -n 's/^\([0-9]*\) passed.*/\1/p'); f=$(printf '%s\n' "$out" | sed -n 's/.* \([0-9]*\) failed$/\1/p') ;; *) f=1 ;; esac
     pass=$((pass + p)); fail=$((fail + f))
 }
+# F9: agents only task agents they own. list shows owner and directory, and by default only the caller, its workers, parent and siblings;
+# Run alone with ONLY=f9.
+has_pane() { t list-panes -a -F '#{pane_id}' | grep -qx "$1"; }
+f9_run() {
+    local C W PAR SIB USR OW dirs out txt_ before after n all_n vis_n
+    dirs="$(realpath "$TMPD")"; mkdir -p "$HOME/proj" "$dirs/elsewhere"
+    PAR=$(newpane f9_par -c "$dirs/elsewhere"); C=$(newpane f9_me -c "$HOME"); W=$(newpane f9_w -c "$HOME/proj")
+    SIB=$(newpane f9_sib); USR=$(newpane f9_user -c "$dirs/elsewhere"); OW=$(newpane f9_ow)
+    t set -p -t "$C" @cntctr_parent "$PAR"; t set -p -t "$W" @cntctr_parent "$C"
+    t set -p -t "$SIB" @cntctr_parent "$PAR"; t set -p -t "$OW" @cntctr_parent "$USR"
+    # list: scope and fields
+    out=$(txt "$(scall "$C" list '{}')")
+    check "F9.1 list shows the caller, owned by its parent" "$(printf '%s\n' "$out" | grep '^f9_me ')" "owner=f9_par"
+    check "F9.1 list shows a worker as owner=you" "$(printf '%s\n' "$out" | grep '^f9_w ')" "owner=you"
+    check "F9.1 a worker's dir shows \$HOME as ~" "$(printf '%s\n' "$out" | grep '^f9_w ')" " dir=~/proj"
+    check "F9.1 list shows the parent as owner=parent" "$(printf '%s\n' "$out" | grep '^f9_par ')" "owner=parent"
+    check "F9.1 the parent's dir" "$(printf '%s\n' "$out" | grep '^f9_par ')" " dir=$dirs/elsewhere"
+    check "F9.1 list shows a sibling owned by the parent's name" "$(printf '%s\n' "$out" | grep '^f9_sib ')" "owner=f9_par"
+    refute "F9.1 list hides a user session" "$out" "f9_user "
+    refute "F9.1 list hides another agent's worker" "$out" "f9_ow "
+    all_n=$(txt "$(scall "$C" list '{"all":true}')" | grep -c ' alive \| dead ')
+    vis_n=$(printf '%s\n' "$out" | grep -c ' alive \| dead ')
+    check "F9.1 the last line counts the hidden agents" "$(printf '%s\n' "$out" | tail -n 1)" "+$((all_n - vis_n)) other agents (list all=true shows them)"
+    out=$(txt "$(scall "$C" list '{"all":true}')")
+    check "F9.2 all=true shows a user session as owner=user" "$(printf '%s\n' "$out" | grep '^f9_user ')" "owner=user"
+    check "F9.2 all=true shows another agent's worker owned by its parent's name" "$(printf '%s\n' "$out" | grep '^f9_ow ')" "owner=f9_user"
+    refute "F9.2 all=true has no count line" "$out" "other agents"
+    out=$(txt "$(scall "$USR" list '{}')")
+    check "F9.3 a user session sees itself as owner=user" "$(printf '%s\n' "$out" | grep '^f9_user ')" "owner=user"
+    check "F9.3 and its worker as owner=you" "$(printf '%s\n' "$out" | grep '^f9_ow ')" "owner=you"
+    refute "F9.3 and not the other session's workers" "$out" "f9_w "
+    out=$(txt "$(scall "" list '{}')")
+    refute "F9.4 a caller without a pane sees no agents by default" "$out" "f9_w "
+    check "F9.4 and the count line" "$out" "other agents (list all=true shows them)"
+    out=$(txt "$(scall "" list "{\"from\":\"f9_me\"}")")
+    check "F9.4 list from= a pane works from that pane" "$out" "f9_w "
+}
 gboard_run() {
     local sender target r
     sender=$(newpane gb_sender); target=$(newpane gb_off)
@@ -138,9 +183,9 @@ gboard_run() {
     same "gather wait=false names the board fallback" "$(printf '%s' "$r" | jq -r '.results[0].status')" "sent on board"
     check "gather wait=false board send is stored" "$(txt "$(call "$target" board '{}')")" "gather input off"
 }
-if [ "${ONLY:-}" = u28 ] || [ "${ONLY:-}" = gboard ]; then
+if [ "${ONLY:-}" = u28 ] || [ "${ONLY:-}" = gboard ] || [ "${ONLY:-}" = f9 ]; then
     export CNTCTR_PASTE_WAIT_MS=100
-    if [ "$ONLY" = u28 ]; then u28_run; else gboard_run; fi
+    case $ONLY in u28) u28_run ;; f9) f9_run ;; *) gboard_run ;; esac
     printf '%d passed, %d failed\n' "$pass" "$fail"
     [ "$fail" -eq 0 ]; exit $?
 fi
@@ -1800,7 +1845,7 @@ check "send outside tmux says to pass from" "$(txt "$out")" "pass from="
 
 # ---- from: a shared server (Codex) names its caller ----
 # nopane <tool> <args-json>: run a tool from a process that is in no pane
-nopane() { rpc "$INIT" "$(printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"%s","arguments":%s}}' "$1" "$2")" | tail -n 1; }
+nopane() { rpc "$INIT" "$(printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"%s","arguments":%s}}' "$1" "$(call_args "$1" "$2")")" | tail -n 1; }
 F=$(newpane fromer)
 out=$(nopane send '{"to":"b","text":"via name","from":"fromer"}')
 check "send with from=<agent name> succeeds" "$(txt "$out")" "sent id="
@@ -1947,6 +1992,7 @@ expect_screen "async gather dispatched" "$GA" "async one"
 call "$GA" reply "{\"id\":\"$(lastid "$GA")\",\"text\":\"async answer\"}" >/dev/null
 expect_screen "async gather answer reaches pane" "$S" "async answer"
 gboard_run
+f9_run
 
 # a worker that dies ends its task as dead
 GD=$(newpane gd sh -c 'sleep 6')
