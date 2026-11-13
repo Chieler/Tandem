@@ -4010,8 +4010,156 @@ static int stop_normal(const char *harness, const struct hook_event *event) {
     return !strcmp(harness, "claude") || !strcmp(event->reason, "NO_TOOL_CALL");
 }
 
-/* The Stop hook: mail staged in this turn is delivered by a normal end (and goes back to pending after any other),
- * and mail that was not staged in this turn holds the agent once, never at a second Stop of the turn. */
+/* ---- the Stop gate (H5): what tmux knows about this agent, read in one invocation ---- */
+
+struct gate {
+    char name[128], parent[32], parent_name[128], path[4096], parent_path[4096];
+    struct { char id[16], sender[128]; } task[16];   /* open tasks given to this pane */
+    int ntasks;
+    long long seen;
+};
+
+static void unquote_value(char *v) {
+    char *q = v + (*v == '"');
+    q[strcspn(q, "\"")] = '\0';
+    memmove(v, q, strlen(q) + 1);
+}
+
+/* One tmux call (list-panes and show -s together). 0 when tmux could not be read. */
+static int gate_snapshot(const char *pane, struct gate *g) {
+    char *out = NULL;
+    memset(g, 0, sizeof *g);
+    if (TMUX(NULL, &out, "list-panes", "-a", "-F", "#{pane_id}\t#{@cntctr_name}\t#{@cntctr_parent}\t#{pane_current_path}", ";", "show", "-s") != 0) {
+        free(out);
+        return 0;
+    }
+    char *pristine = out, *save = NULL;   /* strtok cuts its input, so each pass reads its own copy */
+    char *pass1 = strdup(pristine), *pass2 = strdup(pristine), *pass3 = strdup(pristine);
+    for (char *line = strtok_r(pass1, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {   /* this pane */
+        char *name = strchr(line, '\t'), *parent = name ? strchr(name + 1, '\t') : NULL, *path = parent ? strchr(parent + 1, '\t') : NULL;
+        if (line[0] != '%' || !path) continue;
+        *name++ = *parent++ = *path++ = '\0';
+        if (!strcmp(line, pane)) {
+            snprintf(g->name, sizeof g->name, "%s", name);
+            snprintf(g->parent, sizeof g->parent, "%s", parent);
+            snprintf(g->path, sizeof g->path, "%s", path);
+        }
+    }
+    for (char *line = strtok_r(pass2, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {   /* its parent */
+        char *name = strchr(line, '\t'), *parent = name ? strchr(name + 1, '\t') : NULL, *path = parent ? strchr(parent + 1, '\t') : NULL;
+        if (line[0] != '%' || !path) continue;
+        *name++ = *parent++ = *path++ = '\0';
+        if (*g->parent && !strcmp(line, g->parent)) {
+            snprintf(g->parent_name, sizeof g->parent_name, "%s", name);
+            snprintf(g->parent_path, sizeof g->parent_path, "%s", path);
+        }
+    }
+    char seen_key[160];
+    snprintf(seen_key, sizeof seen_key, "@cntctr_seen_%s ", g->name);
+    for (char *line = strtok_r(pass3, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {   /* server options */
+        char id[9], val[128];
+        if (sscanf(line, "@cntctr_to_%8[0-9a-f] %127s", id, val) == 2 && g->ntasks < 16) {
+            unquote_value(val);
+            if (strcmp(val, pane)) continue;
+            snprintf(g->task[g->ntasks].id, sizeof g->task[0].id, "%s", id);
+            g->ntasks++;
+        } else if (*g->name && !strncmp(line, seen_key, strlen(seen_key))) g->seen = atoll(line + strlen(seen_key));
+    }
+    free(pass1), free(pass2), free(pass3);
+    char *copy = pristine;
+    for (int i = 0; i < g->ntasks; i++) {   /* who gave each task */
+        char key[48];
+        snprintf(key, sizeof key, "@cntctr_sender_%s ", g->task[i].id);
+        const char *at = strstr(copy, key);
+        if (at && (at == copy || at[-1] == '\n')) {
+            snprintf(g->task[i].sender, sizeof g->task[i].sender, "%.*s", (int)strcspn(at + strlen(key), "\n"), at + strlen(key));
+            unquote_value(g->task[i].sender);
+        }
+    }
+    free(pristine);
+    return 1;
+}
+
+/* task_gate: has this task been reminded of, and has its parent been told it was dropped? */
+static int task_gate_flag(sqlite3 *db, const char *task, const char *column) {
+    char *sql = fmt("SELECT %s FROM task_gate WHERE task=?1", column);
+    sqlite3_stmt *st = NULL;
+    int v = 0;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, task, -1, SQLITE_TRANSIENT);
+        v = sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    free(sql);
+    return v;
+}
+
+/* Set a task_gate flag; 1 when this call changed it (the claim). */
+static int task_gate_set(sqlite3 *db, const char *task, const char *column) {
+    char *sql = fmt("INSERT OR IGNORE INTO task_gate(task) VALUES(?1)");
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, task, -1, SQLITE_TRANSIENT);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    free(sql);
+    sql = fmt("UPDATE task_gate SET %s=1 WHERE task=?1 AND %s=0", column, column);
+    int mine = 0;
+    st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, task, -1, SQLITE_TRANSIENT);
+        mine = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
+    }
+    sqlite3_finalize(st);
+    free(sql);
+    return mine;
+}
+
+/* The reminder for the open tasks that were not reminded of yet (NULL if none), and the tasks it names. */
+static char *task_reminder(sqlite3 *db, const struct gate *g, const char *pane, long long server_start, int *named) {
+    char *list = strdup("");
+    *named = 0;
+    for (int i = 0; i < g->ntasks; i++) {
+        if (task_gate_flag(db, g->task[i].id, "reminded")) continue;
+        char *t = fmt("%s%s%s from %s", list, *list ? ", " : "", g->task[i].id, *g->task[i].sender ? g->task[i].sender : "?");
+        free(list);
+        list = t;
+        (*named)++;
+    }
+    if (!*named) { free(list); return NULL; }
+    struct project proj;
+    resolve_cwd(db, g->path, &proj);
+    long long newest = 0;
+    int unread = 0;
+    free(kb_unread(db, proj.key, g->name, pane, server_start, g->seen, &newest, &unread));
+    char *count = unread ? fmt(" %d unread board posts;", unread) : strdup("");
+    char *text = fmt("[cntctr] you have not answered task %s;%s read the board, then reply with that id", list, count);
+    free(list), free(count);
+    return text;
+}
+
+/* The Stop passed for a worker that still has an unanswered task: tell its parent, once per task. */
+static void tell_parent(sqlite3 *db, const struct gate *g, const char *pane, const char *reason) {
+    if (!*g->parent || !*g->parent_name) return;
+    int told = 0;
+    for (int i = 0; i < g->ntasks; i++) {
+        if (!task_gate_set(db, g->task[i].id, "away")) continue;
+        struct project mine, theirs;
+        resolve_cwd(db, g->path, &mine);
+        resolve_cwd(db, g->parent_path, &theirs);
+        char *text = fmt("%s stopped without a reply to task %s (%s)", g->name, g->task[i].id, reason);
+        char *body = fmt("for %s (notice):\n%s", g->parent_name, text);
+        told += post_mail(db, theirs.key, g->parent, g->parent_name, g->name, "", body, 0, pane, mine.key) > 0;
+        free(text), free(body);
+    }
+    if (told) notify_all();
+}
+
+/* The Stop hook. Mail staged in this turn is delivered by a normal end (and goes back to pending after any other).
+ * Then it holds the agent, once and never at a second Stop of the turn, for mail that was not staged in this turn and, for a
+ * spawned worker, for an open task it has not answered. One message carries both. A Stop that passes for a worker with an
+ * unanswered task tells its parent. */
 static json_object *hook_stop(sqlite3 *db, const char *socket, const char *pane, const char *harness, const struct hook_event *event, const char *token, long long server_start) {
     int normal = stop_normal(harness, event);
     sqlite3_stmt *st = NULL;
@@ -4023,13 +4171,17 @@ static json_object *hook_stop(sqlite3 *db, const char *socket, const char *pane,
         sqlite3_step(st);
     }
     sqlite3_finalize(st);
+    struct gate g;
+    int worker = gate_snapshot(pane, &g) && *g.parent;   /* only a spawned worker has a parent */
     json_object *answer = NULL;
     if (normal && !event->loop && sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK) {
         struct mrow rows[MAIL_ROWS];
-        int n = pending_rows(db, pane, server_start, 0, rows, MAIL_ROWS), taken = 0;
-        char *text = n ? fit_mail(harness, event->kind, HOOK_BLOCK, rows, n, NULL, &taken) : NULL;
-        if (taken) {
+        int n = pending_rows(db, pane, server_start, 0, rows, MAIL_ROWS), taken = 0, named = 0;
+        char *extra = worker ? task_reminder(db, &g, pane, server_start, &named) : NULL;
+        char *text = n || extra ? fit_mail(harness, event->kind, HOOK_BLOCK, rows, n, extra, &taken) : NULL;
+        if (taken || named) {
             stage_rows(db, rows, taken, 0, token);
+            for (int i = 0; named && i < g.ntasks; i++) task_gate_set(db, g.task[i].id, "reminded");
             st = NULL;
             if (sqlite3_prepare_v2(db, "UPDATE hook_sessions SET stop_blocked=1 WHERE socket=?1 AND pane=?2", -1, &st, NULL) == SQLITE_OK) {
                 sqlite3_bind_text(st, 1, socket, -1, SQLITE_TRANSIENT);
@@ -4039,10 +4191,14 @@ static json_object *hook_stop(sqlite3 *db, const char *socket, const char *pane,
             sqlite3_finalize(st);
         }
         if (sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK) {
-            if (taken) answer = hook_answer(harness, event->kind, HOOK_BLOCK, text);
+            if (taken || named) answer = hook_answer(harness, event->kind, HOOK_BLOCK, text);
         } else sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
         for (int i = 0; i < n; i++) free(rows[i].text);
-        free(text);
+        free(text), free(extra);
+    }
+    if (!answer && worker && g.ntasks) {
+        const char *r = event->reason;
+        tell_parent(db, &g, pane, !strcmp(r, "ERROR") || !strcmp(r, "USER_CANCELED") ? r : "no reply after one reminder");
     }
     if (!answer) {   /* mail still waits (after an error, or past the first Stop): the agent's own server wakes it */
         st = NULL;

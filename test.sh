@@ -1107,19 +1107,107 @@ u5p4_run() {
     unset CNTCTR_WAKE_SEC CNTCTR_PASTE_WAIT_MS
 }
 
+# stopped <task>: how many "stopped without a reply" mails exist for that task
+stopped() { sqx "$CNTCTR_DB" "SELECT count(*) FROM posts WHERE text LIKE '%stopped without a reply to task $1 (%'"; }
+
+u5p5_run() {
+    local PAR OTH W AW NP OLD NEW out T id ans reason
+    PAR=$(newpane u5_par1); OTH=$(newpane u5_oth1)
+
+    # U18: a spawned worker with an open, unanswered task is held once; then it passes and the parent is told once
+    W=$(hk_agent claude u5_w1); t set -p -t "$W" @cntctr_parent "$PAR"
+    call "$W" board '{}' >/dev/null
+    out=$(txt "$(call "$PAR" send '{"to":"u5_w1","text":"do the job"}')")
+    T=${out#sent id=}; id=$(mailid "$T")
+    call "$OTH" post '{"text":"news for the fleet"}' >/dev/null
+    c_prompt "$W" "$(pointer "$id")" >/dev/null
+    ans=$(c_stop "$W")
+    same "U18 a Stop with an open unanswered task blocks" "$(printf '%s' "$ans" | jq -r '.decision')" block
+    reason=$(printf '%s' "$ans" | jq -r '.reason')
+    check "U18 the hold names the task id" "$reason" "$T"
+    check "U18 and the sender" "$reason" "u5_par1"
+    check "U18 and the unread count" "$reason" "1 unread"
+    check "U18 and what to do" "$reason" "read the board, then reply"
+    same "U18 the mail of that turn is delivered by the Stop" "$(mstate "$id")" "delivered/1/1"
+    same "U18 the parent is not told at the hold" "$(stopped "$T")" 0
+    ans=$(c_stop "$W" true)
+    emptyans "$ans" && ok_ || bad "U18 the second Stop of the turn passes" "  got: $ans"
+    same "U18 the parent has one stopped-without-a-reply mail" "$(stopped "$T")" 1
+    check "U18 it names the worker and the task" "$(txt "$(call "$PAR" board '{}')")" "u5_w1 stopped without a reply to task $T ("
+    c_prompt "$W" "carry on" >/dev/null
+    ans=$(c_stop "$W")
+    emptyans "$ans" && ok_ || bad "U18 a Stop in a later turn for the same task passes" "  got: $ans"
+    same "U18 and adds no second mail" "$(stopped "$T")" 1
+    # one message: mail and an open task together
+    W=$(hk_agent claude u5_w5); t set -p -t "$W" @cntctr_parent "$PAR"
+    out=$(txt "$(call "$PAR" send '{"to":"u5_w5","text":"task for the one-message case"}')")
+    T=${out#sent id=}; id=$(mailid "$T")
+    c_prompt "$W" "$(pointer "$id")" >/dev/null
+    mailput "$W" m5000001 "$(mail_text m5000001 'extra mail during the turn')" 0 >/dev/null
+    ans=$(c_stop "$W")
+    reason=$(printf '%s' "$ans" | jq -r '.reason')
+    check "U18 one message carries the mail" "$reason" "extra mail during the turn"
+    check "U18 and the open task" "$reason" "$T"
+    c_stop "$W" true >/dev/null
+
+    # U19: a Stop after an error passes at once, and the parent gets the reason
+    AW=$(hk_agent agy u5_w2); t set -p -t "$AW" @cntctr_parent "$PAR"
+    out=$(txt "$(call "$PAR" send '{"to":"u5_w2","text":"a job that fails"}')")
+    T=${out#sent id=}; id=$(mailid "$T")
+    a_pre "$AW" 0 "$(pointer "$id")" >/dev/null
+    ans=$(a_stop "$AW" ERROR)
+    emptyans "$ans" && ok_ || bad "U19 a Stop with terminationReason ERROR passes" "  got: $ans"
+    same "U19 the parent has one mail" "$(stopped "$T")" 1
+    check "U19 with the reason" "$(txt "$(call "$PAR" board '{}')")" "u5_w2 stopped without a reply to task $T (ERROR)"
+    # and a cancel is never held either
+    AW=$(hk_agent agy u5_w6); t set -p -t "$AW" @cntctr_parent "$PAR"
+    out=$(txt "$(call "$PAR" send '{"to":"u5_w6","text":"a job that is cancelled"}')")
+    T=${out#sent id=}; id=$(mailid "$T")
+    a_pre "$AW" 0 "$(pointer "$id")" >/dev/null
+    ans=$(a_stop "$AW" USER_CANCELED)
+    emptyans "$ans" && ok_ || bad "U19 a Stop with terminationReason USER_CANCELED passes" "  got: $ans"
+    check "U19 the parent is told with that reason" "$(txt "$(call "$PAR" board '{}')")" "u5_w6 stopped without a reply to task $T (USER_CANCELED)"
+
+    # U20: an agent without a parent is held for mail only, never for board news or an open task
+    NP=$(hk_agent claude u5_np)
+    call "$NP" board '{}' >/dev/null
+    out=$(txt "$(call "$OTH" send '{"to":"u5_np","text":"a task for a user session"}')")
+    T=${out#sent id=}; id=$(mailid "$T")
+    c_prompt "$NP" "$(pointer "$id")" >/dev/null
+    call "$OTH" post '{"text":"more news for the fleet"}' >/dev/null
+    ans=$(c_stop "$NP")
+    emptyans "$ans" && ok_ || bad "U20 a Stop for an agent without a parent, with unread posts and an open task, passes" "  got: $ans"
+    same "U20 nobody is told" "$(stopped "$T")" 0
+    mailput "$NP" n6000001 "$(mail_text n6000001 'mail for the user session')" 0 >/dev/null
+    c_prompt "$NP" "next question" >/dev/null
+    ans=$(c_stop "$NP")
+    same "U20 but mail addressed to it still holds it" "$(printf '%s' "$ans" | jq -r '.decision')" block
+
+    # U21: a worker respawned under the same name in a new pane is not held for the old pane's task
+    OLD=$(hk_agent claude u5_w4); t set -p -t "$OLD" @cntctr_parent "$PAR"
+    out=$(txt "$(call "$PAR" send '{"to":"u5_w4","text":"a task for the old pane"}')")
+    T=${out#sent id=}
+    t kill-window -t "$OLD"
+    NEW=$(hk_agent claude u5_w4); t set -p -t "$NEW" @cntctr_parent "$PAR"
+    ans=$(c_stop "$NEW")
+    emptyans "$ans" && ok_ || bad "U21 a respawned worker is not held for the old pane's task" "  got: $ans"
+    same "U21 and the parent is not told about it" "$(stopped "$T")" 0
+}
+
 u5_run() {   # U5PARTS="p3 p4" runs just those parts, in that order
     hk_boot
     local part
-    for part in ${U5PARTS:-p1 p2 p3 p4}; do "u5${part}_run"; done
+    for part in ${U5PARTS:-p1 p2 p3 p4 p5}; do "u5${part}_run"; done
     hk_stop
 }
-if [ "${ONLY:-}" = u5 ] || [ "${ONLY:-}" = u5p1 ] || [ "${ONLY:-}" = u5p2 ] || [ "${ONLY:-}" = u5p3 ] || [ "${ONLY:-}" = u5p4 ]; then
+if [ "${ONLY:-}" = u5 ] || [ "${ONLY:-}" = u5p1 ] || [ "${ONLY:-}" = u5p2 ] || [ "${ONLY:-}" = u5p3 ] || [ "${ONLY:-}" = u5p4 ] || [ "${ONLY:-}" = u5p5 ]; then
     case $ONLY in
         u5) u5_run ;;
         u5p1) hk_boot; u5p1_run; hk_stop ;;
         u5p2) hk_boot; u5p2_run; hk_stop ;;
         u5p3) hk_boot; u5p3_run; hk_stop ;;
         u5p4) hk_boot; u5p4_run; hk_stop ;;
+        u5p5) hk_boot; u5p5_run; hk_stop ;;
     esac
     printf '%d passed, %d failed\n' "$pass" "$fail"
     [ "$fail" -eq 0 ]; exit $?
