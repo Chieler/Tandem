@@ -237,6 +237,101 @@ f9_run() {
     check "F9.11 list says idle is not free to use" "$out" "idle does not mean free to use"
     check "F9.11 spawn says to spawn fresh with a cwd" "$out" "Spawn a fresh agent with an explicit cwd instead of reusing an agent from list all=true"
 }
+# F10: agent scope is the spawn tree. Real spawns with a fake harness, and no cross/all rewrite (scall). Run alone with ONLY=f10.
+f10_run() {
+    local UA UB L W G K BW out id id2 n bg
+    pane_of() { t list-panes -a -F '#{pane_id} #{@cntctr_name}' | awk -v n="$1" '$2 == n {print $1}'; }
+    popt() { t show -pqv -t "$1" "$2"; }
+    gone() { for _ in $(seq 30); do has_pane "$1" || break; sleep 0.1; done; has_pane "$1" && bad "$2" || ok_; }
+    printf '#!/bin/sh\nexec cat\n' > "$TMPD/bin/claude"
+    printf '#!/bin/sh\ntool=$2; shift 2; [ "$1" = -- ] && shift\nexec "$tool" "$@"\n' > "$TMPD/bin/headroom"
+    chmod +x "$TMPD/bin/claude" "$TMPD/bin/headroom"
+    UA=$(newpane f10_ua); UB=$(newpane f10_ub)
+    # spawn tree of session A: ua -> l -> w -> g, and l -> k; session B: ub -> bw
+    out=$(scall "$UA" spawn '{"harness":"claude","name":"f10_l","task":"f10 lead"}'); check "F10.1 spawn from a session works" "$(txt "$out")" "spawned f10_l"
+    L=$(pane_of f10_l)
+    out=$(scall "$L" spawn '{"harness":"claude","name":"f10_w","task":"f10 worker"}'); W=$(pane_of f10_w)
+    out=$(scall "$W" spawn '{"harness":"claude","name":"f10_g","task":"f10 grandchild"}'); G=$(pane_of f10_g)
+    out=$(scall "$L" spawn '{"harness":"claude","name":"f10_k","task":"f10 to kill"}'); K=$(pane_of f10_k)
+    out=$(scall "$UB" spawn '{"harness":"claude","name":"f10_bw","task":"f10 other tree"}'); BW=$(pane_of f10_bw)
+    same "F10.1 a spawn from a session has the session as parent" "$(popt "$L" @cntctr_parent)" "$UA"
+    same "F10.1 and the session as root" "$(popt "$L" @cntctr_root)" "$UA"
+    same "F10.1 a worker's parent is its spawner" "$(popt "$W" @cntctr_parent)" "$L"
+    same "F10.1 and its root is the session" "$(popt "$W" @cntctr_root)" "$UA"
+    same "F10.1 a grandchild's parent is its spawner" "$(popt "$G" @cntctr_parent)" "$W"
+    same "F10.1 and its root is still the session" "$(popt "$G" @cntctr_root)" "$UA"
+    same "F10.1 the other session's worker has its own root" "$(popt "$BW" @cntctr_root)" "$UB"
+    same "F10.1 a session by hand has no root option" "$(popt "$UA" @cntctr_root)" ""
+    # (a) kill of your own worker, no cross
+    out=$(scall "$L" kill '{"name":"f10_k"}'); same "F10.2 kill of your own worker needs no cross" "$(iserr "$out")" false
+    gone "$K" "F10.2 the killed worker's pane is gone"
+    # (b) a scoped send and a gather wait=true to a spawned worker
+    out=$(scall "$L" send '{"to":"f10_w","text":"f10 scoped send"}'); same "F10.3 send to a spawned worker needs no cross" "$(iserr "$out")" false
+    expect_screen "F10.3 the worker got it" "$W" "f10 scoped send"
+    ( scall "$L" gather '{"tasks":[{"kind":"send","to":"f10_w","text":"f10 scoped gather"}],"timeout":20}' > "$TMPD/f10.gather" ) & bg=$!
+    expect_screen "F10.3 the worker got the gather task" "$W" "f10 scoped gather"
+    scall "$W" reply "{\"id\":\"$(lastid "$W")\",\"text\":\"f10 gather answer\"}" > /dev/null
+    wait $bg
+    same "F10.3 gather wait=true to a spawned worker completes" "$(txt "$(cat "$TMPD/f10.gather")" | jq -r '.results[0].status')" answered
+    # (d) a worker's send to parent wait=true round trip
+    ( scall "$W" send '{"to":"parent","text":"f10 up","wait":true,"timeout":20}' > "$TMPD/f10.up" ) & bg=$!
+    expect_screen "F10.4 the parent got the worker's task" "$L" "f10 up"
+    scall "$L" reply "{\"id\":\"$(lastid "$L")\",\"text\":\"f10 down\"}" > /dev/null
+    wait $bg
+    check "F10.4 the worker's wait returns the answer" "$(txt "$(cat "$TMPD/f10.up")")" "f10 down"
+    # (c) a re follow-up: in scope, and to an agent outside the tree after a cross=true task
+    out=$(scall "$L" send '{"to":"f10_w","text":"f10 open task"}'); id=$(txt "$out" | sed -n 's/.*id=\([0-9a-f]\{8\}\).*/\1/p')
+    out=$(scall "$L" send "{\"to\":\"f10_w\",\"text\":\"f10 follow-up\",\"re\":\"$id\"}"); same "F10.5 re follow-up to a worker works" "$(iserr "$out")" false
+    expect_screen "F10.5 and is typed" "$W" "f10 follow-up"
+    out=$(scall "$L" send '{"to":"f10_ub","text":"f10 cross open","cross":true}'); id2=$(txt "$out" | sed -n 's/.*id=\([0-9a-f]\{8\}\).*/\1/p')
+    out=$(scall "$L" send "{\"to\":\"f10_ub\",\"text\":\"f10 addendum no cross\",\"re\":\"$id2\"}")
+    same "F10.5 re follow-up to an open cross task needs no cross" "$(iserr "$out")" false
+    expect_screen "F10.5 and is typed to the other session" "$UB" "f10 addendum no cross"
+    out=$(scall "$L" send '{"to":"f10_ub","text":"f10 new no cross"}'); check "F10.5 a new task to it is still refused" "$(txt "$out")" "f10_ub is not yours"
+    out=$(scall "$W" send "{\"to\":\"f10_ub\",\"text\":\"f10 stolen re\",\"re\":\"$id2\"}"); same "F10.5 another sender cannot use the task id" "$(iserr "$out")" true
+    # (e) grandchild and orphan, both ways
+    out=$(txt "$(scall "$L" list '{}')")
+    check "F10.6 list shows a grandchild by default" "$(printf '%s\n' "$out" | grep '^f10_g ')" "owner=f10_w"
+    check "F10.6 list from the grandchild shows the lead" "$(txt "$(scall "$G" list '{}')" | grep '^f10_l ')" "owner=f10_ua"
+    out=$(scall "$L" send '{"to":"f10_g","text":"f10 down to g"}'); same "F10.6 lead to grandchild works" "$(iserr "$out")" false
+    expect_screen "F10.6 the grandchild got it" "$G" "f10 down to g"
+    out=$(scall "$G" send '{"to":"f10_l","text":"f10 up from g"}'); same "F10.6 grandchild to lead works" "$(iserr "$out")" false
+    expect_screen "F10.6 the lead got it" "$L" "f10 up from g"
+    out=$(scall "$L" kill '{"name":"f10_w"}'); same "F10.7 the lead kills the worker" "$(iserr "$out")" false
+    gone "$W" "F10.7 the worker's pane is gone"
+    check "F10.7 the orphan shows its dead parent" "$(txt "$(scall "$L" list '{}')" | grep '^f10_g ')" "owner=$W (gone)"
+    out=$(scall "$L" send '{"to":"f10_g","text":"f10 down to orphan"}'); same "F10.7 lead to orphan works" "$(iserr "$out")" false
+    expect_screen "F10.7 the orphan got it" "$G" "f10 down to orphan"
+    out=$(scall "$G" send '{"to":"f10_l","text":"f10 up from orphan"}'); same "F10.7 orphan to lead works" "$(iserr "$out")" false
+    expect_screen "F10.7 the lead got it from the orphan" "$L" "f10 up from orphan"
+    out=$(scall "$L" kill '{"name":"f10_g"}'); same "F10.7 the lead kills the orphan" "$(iserr "$out")" false
+    gone "$G" "F10.7 the orphan's pane is gone"
+    # (f) two separate sessions with their own trees cannot reach each other
+    for n in f10_ub f10_bw; do
+        out=$(scall "$L" send "{\"to\":\"$n\",\"text\":\"f10 refused to $n\"}"); check "F10.8 the lead cannot send to $n" "$(txt "$out")" "$n is not yours"
+        out=$(scall "$L" kill "{\"name\":\"$n\"}"); check "F10.8 the lead cannot kill $n" "$(txt "$out")" "$n is not yours"
+    done
+    for n in f10_l f10_ua; do
+        out=$(scall "$UB" send "{\"to\":\"$n\",\"text\":\"f10 refused to $n\"}"); check "F10.8 the other session cannot send to $n" "$(txt "$out")" "$n is not yours"
+    done
+    out=$(scall "$BW" send '{"to":"f10_l","text":"f10 refused from bw"}'); check "F10.8 the other tree's worker cannot send to the lead" "$(txt "$out")" "f10_l is not yours"
+    out=$(txt "$(scall "$UB" list '{}')")
+    check "F10.8 a session lists its own worker" "$out" "f10_bw "
+    refute "F10.8 and not the other tree" "$out" "f10_l "
+    out=$(scall "$L" gather '{"wait":false,"tasks":[{"kind":"send","to":"f10_bw","text":"f10 refused gather"}]}'); check "F10.8 gather is refused across trees" "$(txt "$out")" "f10_bw is not yours"
+    # from= never overrides a caller's own pane
+    out=$(scall "$UB" send '{"from":"f10_l","to":"f10_l","text":"f10 spoof"}'); check "F10.9 from= naming another agent does not make it the caller" "$(txt "$out")" "f10_l is not yours"
+    out=$(scall "$UB" send '{"from":"f10_ub","to":"f10_bw","text":"f10 from itself"}'); same "F10.9 from= naming itself is harmless" "$(iserr "$out")" false
+    # gather: top-level cross covers every send
+    out=$(scall "$UA" gather '{"wait":false,"tasks":[{"kind":"send","to":"f10_ub","text":"f10 no top cross"}]}'); check "F10.10 gather without cross is refused" "$(txt "$out")" "f10_ub is not yours"
+    out=$(scall "$UA" gather '{"wait":false,"cross":true,"tasks":[{"kind":"send","to":"f10_ub","text":"f10 top cross"}]}'); check "F10.10 gather with top-level cross works" "$(txt "$out")" '"status":"sent"'
+    expect_screen "F10.10 and is typed" "$UB" "f10 top cross"
+    sleep 0.3
+    for n in "refused to f10_ub" "refused to f10_l" "no top cross" "spoof" "new no cross" "stolen re"; do
+        refute "F10.8 nothing typed for: $n" "$(screen "$UB")$(screen "$L")$(screen "$BW")" "f10 $n"
+    done
+    scall "$UB" kill '{"name":"f10_bw"}' > /dev/null; scall "$UA" kill '{"name":"f10_l"}' > /dev/null
+}
 gboard_run() {
     local sender target r
     sender=$(newpane gb_sender); target=$(newpane gb_off)
@@ -245,9 +340,9 @@ gboard_run() {
     same "gather wait=false names the board fallback" "$(printf '%s' "$r" | jq -r '.results[0].status')" "sent on board"
     check "gather wait=false board send is stored" "$(txt "$(call "$target" board '{}')")" "gather input off"
 }
-if [ "${ONLY:-}" = u28 ] || [ "${ONLY:-}" = gboard ] || [ "${ONLY:-}" = f9 ]; then
+if [ "${ONLY:-}" = u28 ] || [ "${ONLY:-}" = gboard ] || [ "${ONLY:-}" = f9 ] || [ "${ONLY:-}" = f10 ]; then
     export CNTCTR_PASTE_WAIT_MS=100
-    case $ONLY in u28) u28_run ;; f9) f9_run ;; *) gboard_run ;; esac
+    case $ONLY in u28) u28_run ;; f9) f9_run ;; f10) f10_run ;; *) gboard_run ;; esac
     printf '%d passed, %d failed\n' "$pass" "$fail"
     [ "$fail" -eq 0 ]; exit $?
 fi
@@ -2055,6 +2150,7 @@ call "$GA" reply "{\"id\":\"$(lastid "$GA")\",\"text\":\"async answer\"}" >/dev/
 expect_screen "async gather answer reaches pane" "$S" "async answer"
 gboard_run
 f9_run
+f10_run
 
 # a worker that dies ends its task as dead
 GD=$(newpane gd sh -c 'sleep 6')
