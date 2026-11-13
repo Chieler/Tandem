@@ -1395,7 +1395,7 @@ f6_5() {
     local S P out task id ans lines
     export CNTCTR_WAKE_SEC=2
     S=$(newpane f6_snd5)
-    P=$(hk_agent claude f6_nostop)
+    P=$(hk_agent claude f6_nostop); t set -p -t "$P" @cntctr_parent "$S"   # a spawned worker: only those are released
     daemon_start "$P"
     daemon_hello
     out=$(txt "$(call "$S" send '{"to":"f6_nostop","text":"mail whose turn is cancelled"}')")
@@ -1510,6 +1510,29 @@ f7_2() {
     sqx "$d" "PRAGMA user_version=0"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
     same "F7.2 an older database is migrated and stamped" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")$(sqx "$d" 'PRAGMA user_version')" 11
+}
+
+# f7_3: staged mail is released after a cancelled turn only for a spawned worker; a user's own session is left to its next prompt event
+f7_3() {
+    local S P out task id ans
+    export CNTCTR_WAKE_SEC=2
+    S=$(newpane f7_snd3)
+    P=$(hk_agent claude f7_user3)   # no @cntctr_parent
+    daemon_start "$P"
+    daemon_hello
+    out=$(txt "$(call "$S" send '{"to":"f7_user3","text":"mail for a session of the user"}')")
+    task=${out#sent id=}; id=$(mailid "$task")
+    wait_mstate "F7.3 the first line is typed and counted" "$id" "pending/1/0"
+    ans=$(c_prompt "$P" "$(pointer "$id")")
+    check "F7.3 the prompt attaches the mail" "$(ctx_c "$ans")" "mail for a session of the user"
+    same "F7.3 the mail is staged" "$(mstate "$id")" "staged/1/0"
+    sleep 7   # three wake windows, no event, an idle screen
+    same "F7.3 with no Stop it stays staged for a session with no parent" "$(mstate "$id")" "staged/1/0"
+    same "F7.3 and nothing more was typed" "$(screen "$P" | grep -c '\[cntctr mail id=')" 2   # cat shows each typed line twice
+    ans=$(c_prompt "$P" "my next question")
+    same "F7.3 the user's next prompt event makes it pending again" "$(mstate "$id")" "pending/1/0"
+    daemon_stop
+    unset CNTCTR_WAKE_SEC
 }
 
 u5p6_run() {

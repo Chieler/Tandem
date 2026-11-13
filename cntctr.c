@@ -3887,12 +3887,19 @@ static void release_unended(sqlite3 *db, const char *socket, const char *pane, c
     }
     sqlite3_finalize(st);
     free(sql);
-    if (!staged || !pane_served(pane)) return;
+    if (!staged) return;   /* caller: wake_pending, reached only for a pane has_hooks accepted, so a live 0.4.0 server serves it */
+    {   /* only an agent cntctr spawned: a user's own or leader session is never typed into after a cancelled turn (its next prompt event re-pends the mail) */
+        char *parent = NULL;
+        int worker = TMUX(NULL, &parent, "show", "-pqv", "-t", pane, "@cntctr_parent") == 0 && *parent;
+        free(parent);
+        if (!worker) return;
+    }
     char *tail = pane_tail(pane);
     enum pstate on_screen = pane_state_screen(tail, NULL);
     free(tail);
     if (on_screen != P_IDLE) return;
-    /* the session row is the claim: an event that came meanwhile changed `at`, and then nothing is released */
+    /* the session row is the claim: an event that came meanwhile changed `at`, and then nothing is released; claim and release are one transaction */
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) return;
     st = NULL;
     int mine = 0;
     if (sqlite3_prepare_v2(db, "UPDATE hook_sessions SET last_event='Stop', stop_blocked=0, at=?3 WHERE socket=?1 AND pane=?2 AND at=?4", -1, &st, NULL) == SQLITE_OK) {
@@ -3903,7 +3910,7 @@ static void release_unended(sqlite3 *db, const char *socket, const char *pane, c
         mine = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
     }
     sqlite3_finalize(st);
-    if (!mine) return;
+    if (!mine) { sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL); return; }
     sql = fmt("UPDATE mail SET state='pending' WHERE post IN (SELECT mail.post FROM mail JOIN posts ON posts.rowid=mail.post WHERE %s AND state='staged')", own);
     st = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
@@ -3915,6 +3922,7 @@ static void release_unended(sqlite3 *db, const char *socket, const char *pane, c
     }
     sqlite3_finalize(st);
     free(sql);
+    sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
     stall_overdue(db, socket, pane);
 }
 
