@@ -1261,6 +1261,54 @@ old mail from 0.3.0',strftime('%s','now')-604800); INSERT INTO mail(post,name,pa
     check "F1c mail from after the restart is attached" "$(ctx_a "$ans")" "agy mail after the restart"
 }
 
+# f6_2: a hook event from a harness another harness started inside the pane (claude -p run by an agent's shell tool) is not the pane agent's
+f6_2() {
+    local PAR N T id ans row gate rowq gateq out i
+    mkdir -p "$TMPD/nest"
+    cat > "$TMPD/nest/outer.c" << 'EOF'
+#include <stdlib.h>
+int main(int argc, char **argv) { return argc > 1 ? system(argv[1]) : 1; }
+EOF
+    cc -o "$TMPD/nest/claude" "$TMPD/nest/outer.c"   # the outer harness: runs the inner one as its child, inside the pane
+    printf '#!/bin/sh\nexec "%s/hook_harness/claude" "%s" claude < "%s/nest_in" > "%s/nest_out"\n' "$TMPD" "$BIN" "$TMPD" "$TMPD" > "$TMPD/nest/inner.sh"
+    chmod +x "$TMPD/nest/inner.sh"
+    rm -f "$TMPD/nest_in" "$TMPD/nest_out"; mkfifo "$TMPD/nest_in" "$TMPD/nest_out"
+    PAR=$(newpane f6_par2)
+    N=$(hk_agent claude f6_nest "$TMPD/nest/claude $TMPD/nest/inner.sh")   # the pane's process is the outer harness; the pane's own agent talks through the shared launcher
+    t set -p -t "$N" @cntctr_parent "$PAR"
+    exec 26> "$TMPD/nest_in" 27< "$TMPD/nest_out"
+    read -r i <&27
+    call "$N" board '{}' >/dev/null
+    out=$(txt "$(call "$PAR" send '{"to":"f6_nest","text":"do the nested job"}')")
+    T=${out#sent id=}; id=$(mailid "$T")
+    rowq="SELECT session_id||'|'||harness_pid||'|'||last_event||'|'||prompt_seen||'|'||stop_seen||'|'||wake_reserved||'|'||stop_blocked||'|'||turn||'|'||broken FROM hook_sessions WHERE pane='$N'"
+    gateq="SELECT count(*)||'/'||coalesce(sum(reminded),0)||'/'||coalesce(sum(away),0) FROM task_gate WHERE task='$T'"
+    row=$(sqx "$CNTCTR_DB" "$rowq"); gate=$(sqx "$CNTCTR_DB" "$gateq")
+    nest() {   # nest <event> <json>: one hook call from the inner harness, which stands inside the pane under the outer one
+        printf '%s' "$2" > "$TMPD/nest_event"; rm -f "$TMPD/nest_answer"
+        printf '%s %s %s %s\n' "$1" "$TMPD/nest_event" "$N" "$TMPD/nest_answer" >&26; read -r i <&27
+        cat "$TMPD/nest_answer" 2>/dev/null
+    }
+    ans=$(nest UserPromptSubmit "$(jq -nc --arg p "$(pointer "$id")" '{session_id:"NEST",hook_event_name:"UserPromptSubmit",prompt:$p}')")
+    emptyans "$ans" && ok_ || bad "F2 a nested harness's prompt gets the neutral answer" "  got: $ans"
+    same "F2 and attaches nothing: the mail stays pending" "$(mstate "$id" | cut -d/ -f1)" pending
+    ans=$(nest Stop '{"session_id":"NEST","hook_event_name":"Stop","stop_hook_active":false}')
+    emptyans "$ans" && ok_ || bad "F2 a nested harness's Stop gets the neutral answer, though the pane's task is open" "  got: $ans"
+    same "F2 and the parent is not told" "$(stopped "$T")" 0
+    ans=$(nest Stop '{"session_id":"NEST","hook_event_name":"Stop","stop_hook_active":true}')
+    emptyans "$ans" && ok_ || bad "F2 nor by its second Stop" "  got: $ans"
+    same "F2 and the parent is still not told" "$(stopped "$T")" 0
+    same "F2 the pane's hook session is unchanged" "$(sqx "$CNTCTR_DB" "$rowq")" "$row"
+    same "F2 the gate state of the task is unchanged" "$(sqx "$CNTCTR_DB" "$gateq")" "$gate"
+    # the pane's own agent still works: its prompt attaches the mail and its Stop is held for the open task
+    ans=$(c_prompt "$N" "$(pointer "$id")")
+    check "F2 the pane's own agent still gets its mail" "$(ctx_c "$ans")" "do the nested job"
+    ans=$(c_stop "$N")
+    same "F2 and its Stop is held for the open task" "$(printf '%s' "$ans" | jq -r '.decision')" block
+    exec 26>&- 27<&-
+    t kill-window -t "$N" 2>/dev/null
+}
+
 u5p6_run() {
     export CNTCTR_PASTE_WAIT_MS=100
     local f

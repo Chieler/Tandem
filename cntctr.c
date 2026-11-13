@@ -250,13 +250,29 @@ static int match_pane(const char *panes, long pid) {
     return 0;
 }
 
-/* Parent of `pid` according to `procs` ("pid ppid" lines), or 0. */
+/* Parent of `pid` according to `procs` ("pid ppid" lines, more columns after them are ignored), or 0. */
 static long parent_of(const char *procs, long pid) {
     long p, pp;
     int n;
-    for (const char *s = procs; sscanf(s, "%ld %ld%n", &p, &pp, &n) == 2; s += n)
+    for (const char *s = procs; sscanf(s, "%ld %ld%n", &p, &pp, &n) == 2; s += n + strcspn(s + n, "\n"))
         if (p == pid) return pp;
     return 0;
+}
+
+/* Base name of the command of `pid` according to `procs` ("pid ppid comm" lines); "" if not listed. */
+static void comm_of(const char *procs, long pid, char out[64]) {
+    long p, pp;
+    int n;
+    *out = '\0';
+    for (const char *s = procs; sscanf(s, "%ld %ld%n", &p, &pp, &n) == 2; s += n + strcspn(s + n, "\n"))
+        if (p == pid) {
+            const char *c = s + n + strspn(s + n, " \t");
+            size_t len = strcspn(c, "\n");
+            for (size_t i = len; i > 0; i--)
+                if (c[i - 1] == '/') { c += i; len -= i; break; }
+            snprintf(out, 64, "%.*s", (int)len, c);
+            return;
+        }
 }
 
 /* Find our pane: $TMUX_PANE, else the nearest ancestor process that is a pane's
@@ -3444,15 +3460,34 @@ static void hook_alarm(int sig) {
     _exit(0);
 }
 
-static long hook_parent(const char *harness) {
-    char *procs = NULL;
-    if (run(NULL, &procs, (const char *[]){"ps", "-A", "-o", "pid=,ppid=", NULL}) != 0) { free(procs); return 0; }
-    long result = 0;
-    for (long pid = getppid(); pid > 1; pid = parent_of(procs, pid)) {
-        if (hook_process_alive(pid, harness)) { result = pid; break; }
+/* The harness process that sent this event; *procs is the process table ("pid ppid comm"), the caller frees it. */
+static long hook_parent(const char *harness, char **procs) {
+    *procs = NULL;
+    if (run(NULL, procs, (const char *[]){"ps", "-A", "-o", "pid=,ppid=,comm=", NULL}) != 0) { free(*procs); *procs = NULL; return 0; }
+    for (long pid = getppid(); pid > 1; pid = parent_of(*procs, pid))
+        if (hook_process_alive(pid, harness)) return pid;
+    return 0;
+}
+
+/* An event from a harness that another harness started inside the pane (`claude -p` run by an agent's shell tool inherits
+ * CNTCTR_PANE) is not the pane agent's: walking up from the sender, another harness is met before the pane's own process.
+ * The pane's process is looked up (one tmux call) only when another harness stands above the sender at all. */
+static int hook_nested(const char *procs, long pid, const char *pane) {
+    char comm[64];
+    long other = 0;
+    if (!procs || pid <= 1) return 0;
+    for (long up = parent_of(procs, pid); up > 1 && !other; up = parent_of(procs, up)) {
+        comm_of(procs, up, comm);
+        if (!strcmp(comm, "claude") || !strcmp(comm, "agy") || !strcmp(comm, "codex")) other = up;
     }
-    free(procs);
-    return result;
+    if (!other) return 0;
+    char *panes = NULL;
+    int nested = 0;
+    if (TMUX(NULL, &panes, "list-panes", "-a", "-F", "#{pane_pid} #{pane_id}") == 0)
+        for (long up = other; up > 1; up = parent_of(procs, up))
+            if (match_pane(panes, up)) { nested = !strcmp(self_pane, pane); break; }   /* self_pane is the pane found; unused by a hook */
+    free(panes);
+    return nested;
 }
 
 static void hook_session_identity(long pid, char pane[32], char **socket) {
@@ -4324,13 +4359,14 @@ static int hook_cmd(int argc, char **argv) {
         const char *pane = getenv("CNTCTR_PANE");
         if (!pane || !*pane) pane = getenv("TMUX_PANE");
         if (input && hook_parse(argv[2], argv[3], input, &event)) {
-            long pid = hook_parent(argv[2]);
+            char *procs = NULL;
+            long pid = hook_parent(argv[2], &procs);
             char found_pane[32] = "";
             int had_socket = *socket != '\0';
             if ((!pane || !*pane || !*socket) && !strcmp(argv[2], "claude")) hook_session_identity(pid, found_pane, &socket);
             if ((!pane || !*pane) && !*found_pane && had_socket) hook_ancestor_pane(found_pane);
             if (!pane || !*pane) pane = found_pane;
-            if (*pane && *socket) {
+            if (*pane && *socket && !hook_nested(procs, pid, pane)) {   /* an event from a nested agent records and answers nothing */
                 char *err = NULL; sqlite3 *db = kb_timed(&err, 1000); free(err);
                 if (db) {
                     long long started = 0;
@@ -4344,6 +4380,7 @@ static int hook_cmd(int argc, char **argv) {
                     sqlite3_close(db);
                 }
             }
+            free(procs);
         }
         if (input) json_object_put(input);
     }
