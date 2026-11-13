@@ -231,6 +231,9 @@ f9_run() {
     check "F9.10 from= a user session pane id is refused for another agent" "$(txt "$out")" "f9_sib is not yours"
     sleep 0.3
     refute "F9.10 nothing was typed for the refused one" "$(screen "$USR")" "f9 codex refused"
+    out=$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')
+    check "F9.11 list says idle is not free to use" "$out" "idle does not mean free to use"
+    check "F9.11 spawn says to spawn fresh with a cwd" "$out" "Spawn a fresh agent with an explicit cwd instead of reusing an agent from list all=true"
 }
 gboard_run() {
     local sender target r

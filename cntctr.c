@@ -2934,6 +2934,7 @@ static int dispatch(const char *name, json_object *args, char **res) {
 static const char TOOLS[] =
     "{\"tools\":["
     "{\"name\":\"spawn\",\"description\":\"Start a new agent (claude, codex or agy) in its own tmux window with a first task. "
+    "Spawn a fresh agent with an explicit cwd instead of reusing an agent from list all=true. "
     "The worker answers with reply. Returns the message id at once, or with wait=true blocks until the reply arrives.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
     "\"harness\":{\"type\":\"string\",\"enum\":[\"claude\",\"codex\",\"agy\"]},"
@@ -2977,7 +2978,7 @@ static const char TOOLS[] =
     "\"insights\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Facts that stay true after the task, not status or findings that will be fixed; use here instead of a separate note\"},"
     KFROM "},"
     "\"required\":[\"id\",\"text\"]}},"
-    "{\"name\":\"list\",\"description\":\"List agents: name, harness, pane, alive or dead, state (idle, busy, permission, limited, dead), open task ids, seconds since the screen last changed, limit reset time, owner and directory. By default only you, your workers, your parent and your siblings; all=true shows every agent of the tmux server.\","
+    "{\"name\":\"list\",\"description\":\"List your own agents (you, your workers, your parent, your siblings): name, harness, pane, alive or dead, state (idle, busy, permission, limited, dead), open task ids, seconds since the screen last changed, limit reset time, owner and directory. all=true adds every other agent of the tmux server, which may be a session the user runs for other work: idle does not mean free to use.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"all\":{\"type\":\"boolean\",\"description\":\"Show every agent of the tmux server, not only yours\"}," KFROM "}}},"
     "{\"name\":\"kill\",\"description\":\"Close an agent's tmux pane.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"cross\":{\"type\":\"boolean\",\"description\":\"Only if the user asked you to message this agent: allows an agent that is not your worker, parent or sibling\"},\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"}},\"required\":[\"name\"]}}"
