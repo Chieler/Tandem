@@ -121,6 +121,7 @@ sqlite3 *kb_open_timeout(const char *path, char **err, int timeout_ms) {
     if (rc == SQLITE_OK) rc = ensure_mail_column(db, "hooked", "ALTER TABLE mail ADD COLUMN hooked INTEGER NOT NULL DEFAULT 0");
     if (rc == SQLITE_OK) rc = ensure_mail_column(db, "from_pane", "ALTER TABLE mail ADD COLUMN from_pane TEXT NOT NULL DEFAULT ''");
     if (rc == SQLITE_OK) rc = ensure_mail_column(db, "from_scope", "ALTER TABLE mail ADD COLUMN from_scope TEXT NOT NULL DEFAULT ''");
+    if (rc == SQLITE_OK) rc = ensure_mail_column(db, "socket", "ALTER TABLE mail ADD COLUMN socket TEXT NOT NULL DEFAULT ''");   /* the tmux server of `pane`; rows from before 0.4.0 have none */
     if (rc == SQLITE_OK) rc = ensure_column(db, "hook_sessions", "turn", "ALTER TABLE hook_sessions ADD COLUMN turn INTEGER NOT NULL DEFAULT 0");
     if (rc == SQLITE_OK) rc = ensure_column(db, "hook_sessions", "broken", "ALTER TABLE hook_sessions ADD COLUMN broken INTEGER NOT NULL DEFAULT 0");
     if (rc == SQLITE_OK) rc = ensure_column(db, "hook_sessions", "server_start", "ALTER TABLE hook_sessions ADD COLUMN server_start INTEGER NOT NULL DEFAULT 0");
@@ -307,7 +308,7 @@ char *kb_tool_projects(sqlite3 *db) {
 char *kb_board(sqlite3 *db, const char *scope, const char *me, const char *pane, long long server_start, int limit) {
     sqlite3_stmt *st = prep(db,
         "SELECT line FROM (SELECT rowid, datetime(at, 'unixepoch') || ' ' || sender || ': ' || text AS line FROM posts"
-        " WHERE scope = ?1 AND NOT EXISTS (SELECT 1 FROM mail WHERE mail.post = posts.rowid AND (mail.name != ?3 AND (mail.pane != ?4 OR posts.at <= ?5 OR ?4 = ''))) ORDER BY rowid DESC LIMIT ?2) ORDER BY rowid");
+        " WHERE scope = ?1 AND NOT EXISTS (SELECT 1 FROM mail WHERE mail.post = posts.rowid AND (mail.name != ?3 AND (mail.socket || char(10) || mail.pane != ?4 OR posts.at <= ?5 OR ?4 = ''))) ORDER BY rowid DESC LIMIT ?2) ORDER BY rowid");
     sqlite3_bind_text(st, 1, scope, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(st, 2, limit);
     sqlite3_bind_text(st, 3, me, -1, SQLITE_TRANSIENT);
@@ -320,9 +321,9 @@ char *kb_board(sqlite3 *db, const char *scope, const char *me, const char *pane,
 char *kb_board_mail(sqlite3 *db, const char *scope, const char *me, const char *pane, long long server_start, int limit) {
     sqlite3_stmt *st = prep(db,
         "SELECT group_concat(post) FROM mail JOIN posts ON posts.rowid = mail.post WHERE (mail.hooked = 1 OR mail.presentations > 0) AND mail.delivered = 0"
-        " AND (mail.name = ?3 OR (mail.pane = ?4 AND posts.at > ?5 AND ?4 != ''))"
+        " AND (mail.name = ?3 OR (mail.socket || char(10) || mail.pane = ?4 AND posts.at > ?5 AND ?4 != ''))"
         " AND mail.post IN (SELECT rowid FROM (SELECT rowid FROM posts WHERE scope = ?1 AND NOT EXISTS (SELECT 1 FROM mail m2 WHERE m2.post = posts.rowid"
-        " AND (m2.name != ?3 AND (m2.pane != ?4 OR posts.at <= ?5 OR ?4 = ''))) ORDER BY rowid DESC LIMIT ?2))");
+        " AND (m2.name != ?3 AND (m2.socket || char(10) || m2.pane != ?4 OR posts.at <= ?5 OR ?4 = ''))) ORDER BY rowid DESC LIMIT ?2))");
     sqlite3_bind_text(st, 1, scope, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(st, 2, limit);
     sqlite3_bind_text(st, 3, me, -1, SQLITE_TRANSIENT);
@@ -768,7 +769,7 @@ int kb_tool_promote(sqlite3 *db, const char *project, const char *name, int *fro
 }
 char *kb_unread(sqlite3 *db, const char *scope, const char *me, const char *pane, long long server_start, long long after, long long *newest, int *count) {
     sqlite3_stmt *st = prep(db, "SELECT rowid, sender, text FROM posts WHERE scope = ?1 AND rowid > ?2 "
-        "AND (EXISTS (SELECT 1 FROM mail WHERE mail.post = posts.rowid AND (mail.name = ?3 OR (mail.pane = ?4 AND posts.at > ?5 AND ?4 != '')) AND mail.delivered = 0) "
+        "AND (EXISTS (SELECT 1 FROM mail WHERE mail.post = posts.rowid AND (mail.name = ?3 OR (mail.socket || char(10) || mail.pane = ?4 AND posts.at > ?5 AND ?4 != '')) AND mail.delivered = 0) "
         "OR (at >= strftime('%s', 'now') - 86400 AND NOT EXISTS (SELECT 1 FROM mail WHERE mail.post = posts.rowid))) ORDER BY rowid");
     sqlite3_bind_text(st, 1, scope, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 2, after);
@@ -794,10 +795,10 @@ char *kb_unread(sqlite3 *db, const char *scope, const char *me, const char *pane
 int kb_omitted(sqlite3 *db, const char *scope, const char *me, const char *pane, long long server_start, long long after, int limit) {
     sqlite3_stmt *st = prep(db,
         "SELECT count(*) FROM posts WHERE scope=?1 AND rowid>?2 AND sender!=?3 "
-        "AND (EXISTS (SELECT 1 FROM mail WHERE mail.post=posts.rowid AND (name=?3 OR (pane=?4 AND posts.at>?6 AND ?4 != '')) AND delivered=0) "
+        "AND (EXISTS (SELECT 1 FROM mail WHERE mail.post=posts.rowid AND (name=?3 OR (socket || char(10) || pane=?4 AND posts.at>?6 AND ?4 != '')) AND delivered=0) "
         "OR (at >= strftime('%s','now') - 86400 AND NOT EXISTS (SELECT 1 FROM mail WHERE mail.post=posts.rowid))) "
         "AND rowid NOT IN (SELECT rowid FROM posts WHERE scope=?1 AND NOT EXISTS "
-        "(SELECT 1 FROM mail WHERE mail.post=posts.rowid AND name!=?3 AND (pane!=?4 OR posts.at<=?6 OR ?4 = '')) ORDER BY rowid DESC LIMIT ?5)");
+        "(SELECT 1 FROM mail WHERE mail.post=posts.rowid AND name!=?3 AND (socket || char(10) || pane!=?4 OR posts.at<=?6 OR ?4 = '')) ORDER BY rowid DESC LIMIT ?5)");
     sqlite3_bind_text(st, 1, scope, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 2, after);
     sqlite3_bind_text(st, 3, me, -1, SQLITE_TRANSIENT);

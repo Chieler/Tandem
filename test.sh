@@ -613,6 +613,7 @@ hk() {
     printf '%s' "$4" > "$ev"
     rm -f "$out"
     if [ "$1" = claude ]; then printf '%s %s %s %s\n' "$2" "$ev" "$3" "$out" >&20; read -r ready <&21
+    elif [ "$1" = claude2 ]; then printf '%s %s %s %s\n' "$2" "$ev" "$3" "$out" >&24; read -r ready <&25   # a claude on the second private tmux server (f6_1)
     else printf '%s %s %s %s\n' "$2" "$ev" "$3" "$out" >&22; read -r ready <&23; fi
     cat "$out" 2>/dev/null
 }
@@ -636,12 +637,12 @@ hk_agent() {
 }
 # mail_text <task> <body>: an envelope as send stores it
 mail_text() { printf '[cntctr from=sender id=%s]\n%s\n[when done: call the reply tool of the cntctr MCP server with id=%s and your answer]\n[cntctr end id=%s]' "$1" "$2" "$1" "$1"; }
-# mailput <pane> <task> <text> [presentations]: store a pending mail for <pane> the way send does; prints its id
+# mailput <pane> <task> <text> [presentations] [at]: store a pending mail for <pane> the way send does (with its tmux socket); prints its id
 mailput() {
     local f="$TMPD/mail_text" name
     name=$(t display -p -t "$1" '#{@cntctr_name}')
     printf '%s' "$3" > "$f"
-    sqx "$CNTCTR_DB" "INSERT INTO posts(scope,sender,text,at) VALUES('$U5_SCOPE','sender',CAST(readfile('$f') AS TEXT),strftime('%s','now')); INSERT INTO mail(post,name,pane,task,hooked,presentations) VALUES(last_insert_rowid(),'$name','$1','$2',1,${4:-0}); SELECT last_insert_rowid();"
+    sqx "$CNTCTR_DB" "INSERT INTO posts(scope,sender,text,at) VALUES('$U5_SCOPE','sender',CAST(readfile('$f') AS TEXT),${5:-strftime('%s','now')}); INSERT INTO mail(post,name,pane,task,hooked,presentations,socket) VALUES(last_insert_rowid(),'$name','$1','$2',1,${4:-0},'$(t display -p '#{socket_path}')'); SELECT last_insert_rowid();"
 }
 mstate() { sqx "$CNTCTR_DB" "SELECT state||'/'||presentations||'/'||delivered FROM mail WHERE post=$1"; }
 pointer() { printf '[cntctr mail id=%s] body attached; if you see none, call board' "$1"; }
@@ -1194,13 +1195,86 @@ u5p5_run() {
     same "U21 and the parent is not told about it" "$(stopped "$T")" 0
 }
 
+# ---- fix round 6 (F1 to F9) ----
+t2() { tmux -L "$SOCKET-2" -f /dev/null "$@"; }
+# f6_1: mail matches a pane only on its own tmux server (and only when that server's start time is known)
+f6_1() {
+    local W S U U2 A m m2 ans sock2 n out task start
+    S=$(newpane f6_snd)
+    # (a) two private servers, the same pane id: the other server's session is not held with this worker's mail
+    W=$(hk_agent claude f6_w1)
+    t2 kill-server 2>/dev/null
+    t2 new-session -d -s two -x 200 -y 50 cat
+    sock2=$(t2 display -p '#{socket_path}')
+    n=0; until [ "$(t2 new-window -d -P -F '#{pane_id}' cat)" = "$W" ] || [ $((n += 1)) -gt 3000 ]; do :; done
+    same "F1a the second server has a pane with the worker's id" "$(t2 display -p -t "$W" '#{pane_id}' 2>/dev/null)" "$W"
+    rm -f "$TMPD/hk_claude2_in" "$TMPD/hk_claude2_out"; mkfifo "$TMPD/hk_claude2_in" "$TMPD/hk_claude2_out"
+    TMUX="$sock2,0,0" "$TMPD/hook_harness/claude" "$BIN" claude < "$TMPD/hk_claude2_in" > "$TMPD/hk_claude2_out" & HK_PID_c2=$!
+    exec 24> "$TMPD/hk_claude2_in" 25< "$TMPD/hk_claude2_out"
+    read -r n <&25
+    hk claude2 SessionStart "$W" '{"session_id":"S1","hook_event_name":"SessionStart","source":"startup"}' >/dev/null
+    sleep 1
+    out=$(txt "$(call "$S" send '{"to":"f6_w1","text":"mail for the worker on the first server"}')")
+    task=${out#sent id=}; m=$(mailid "$task")
+    same "F1a the mail records its tmux socket" "$(sqx "$CNTCTR_DB" "SELECT socket FROM mail WHERE post=$m")" "$(t display -p '#{socket_path}')"
+    hk claude2 UserPromptSubmit "$W" '{"session_id":"S1","hook_event_name":"UserPromptSubmit","prompt":"my own question"}' >/dev/null
+    ans=$(hk claude2 Stop "$W" '{"session_id":"S1","hook_event_name":"Stop","stop_hook_active":false}')
+    emptyans "$ans" && ok_ || bad "F1a a session on another tmux server is not held with this worker's mail" "  got: $ans"
+    refute "F1a and the mail is not shown to it" "$ans" "mail for the worker on the first server"
+    same "F1a the worker's mail is untouched" "$(mstate "$m")" "pending/1/0"
+    exec 24>&- 25<&-; kill "$HK_PID_c2" 2>/dev/null; wait "$HK_PID_c2" 2>/dev/null
+    t2 kill-server 2>/dev/null
+
+    # (b) a session whose SessionStart was never recorded, after a restart, with old mail for a dead agent
+    U=$(newpane f6_user); t set -p -t "$U" @cntctr_harness claude
+    sqx "$CNTCTR_DB" "INSERT INTO posts(scope,sender,text,at) VALUES('$U5_SCOPE','sender','for builder (reply id=b0ld0001):
+old mail from 0.3.0',strftime('%s','now')-604800); INSERT INTO mail(post,name,pane) VALUES(last_insert_rowid(),'builder','$U')"
+    m=$(sqx "$CNTCTR_DB" "SELECT max(post) FROM mail")
+    c_prompt "$U" "a question" >/dev/null
+    ans=$(c_stop "$U")
+    emptyans "$ans" && ok_ || bad "F1b a row from before the migration (no socket) never holds a session" "  got: $ans"
+    same "F1b and stays as it was" "$(mstate "$m")" "pending/0/0"
+    # the same mail with a socket, stored before this server started: no SessionStart means no start time, so it is read once
+    U2=$(newpane f6_user2); t set -p -t "$U2" @cntctr_harness claude
+    start=$(t display -p '#{start_time}')
+    m2=$(mailput "$U2" b0ld0002 "$(mail_text b0ld0002 'mail from before the restart')" 0 $((start - 3600)))
+    c_prompt "$U2" "a question" >/dev/null
+    ans=$(c_stop "$U2")
+    emptyans "$ans" && ok_ || bad "F1b mail stored before the server started does not hold a session with no SessionStart" "  got: $ans"
+    same "F1b and stays pending" "$(mstate "$m2")" "pending/0/0"
+    same "F1b the start time is read once and kept" "$(sqx "$CNTCTR_DB" "SELECT server_start FROM hook_sessions WHERE pane='$U2'")" "$start"
+    # and mail stored after the start still arrives for such a session
+    m2=$(mailput "$U2" b0ld0003 "$(mail_text b0ld0003 'mail after the start')" 0)
+    ans=$(c_stop "$U2")
+    check "F1b mail stored after the start holds the session" "$(printf '%s' "$ans" | jq -r '.reason')" "mail after the start"
+
+    # (c) an agy session (no SessionStart, ever) after a restart: the old row's start time is not kept
+    A=$(hk_agent agy f6_a1)
+    sqx "$CNTCTR_DB" "UPDATE hook_sessions SET server_start=1000 WHERE pane='$A'"   # what a row from the server before the restart holds
+    m=$(mailput "$A" b0ld0004 "$(mail_text b0ld0004 'agy mail from before the restart')" 1 $((start - 3600)))
+    ans=$(hk agy PreInvocation "$A" "$(jq -nc --arg p "$(pointer "$m")" '{conversationId:"S2",executionNum:0,invocationNum:0,hookEventName:"PreInvocation",lastUserInput:$p}')")
+    emptyans "$ans" && ok_ || bad "F1c a new agy session after a restart does not get mail from before it" "  got: $ans"
+    ans=$(hk agy Stop "$A" '{"conversationId":"S2","executionNum":0,"fullyIdle":true,"terminationReason":"NO_TOOL_CALL"}')
+    emptyans "$ans" && ok_ || bad "F1c nor is it held by it" "  got: $ans"
+    m=$(mailput "$A" b0ld0005 "$(mail_text b0ld0005 'agy mail after the restart')" 1)
+    ans=$(hk agy PreInvocation "$A" "$(jq -nc --arg p "$(pointer "$m")" '{conversationId:"S3",executionNum:0,invocationNum:0,hookEventName:"PreInvocation",lastUserInput:$p}')")
+    check "F1c mail from after the restart is attached" "$(ctx_a "$ans")" "agy mail after the restart"
+}
+
+u5p6_run() {
+    export CNTCTR_PASTE_WAIT_MS=100
+    local f
+    for f in ${F6:-1 2 3 4 5 6 7 8 9}; do declare -F "f6_$f" >/dev/null && "f6_$f"; done
+    unset CNTCTR_PASTE_WAIT_MS
+}
+
 u5_run() {   # U5PARTS="p3 p4" runs just those parts, in that order
     hk_boot
     local part
-    for part in ${U5PARTS:-p1 p2 p3 p4 p5}; do "u5${part}_run"; done
+    for part in ${U5PARTS:-p1 p2 p3 p4 p5 p6}; do "u5${part}_run"; done
     hk_stop
 }
-if [ "${ONLY:-}" = u5 ] || [ "${ONLY:-}" = u5p1 ] || [ "${ONLY:-}" = u5p2 ] || [ "${ONLY:-}" = u5p3 ] || [ "${ONLY:-}" = u5p4 ] || [ "${ONLY:-}" = u5p5 ]; then
+if [ "${ONLY:-}" = u5 ] || [ "${ONLY:-}" = u5p1 ] || [ "${ONLY:-}" = u5p2 ] || [ "${ONLY:-}" = u5p3 ] || [ "${ONLY:-}" = u5p4 ] || [ "${ONLY:-}" = u5p5 ] || [ "${ONLY:-}" = u5p6 ]; then
     case $ONLY in
         u5) u5_run ;;
         u5p1) hk_boot; u5p1_run; hk_stop ;;
@@ -1208,6 +1282,7 @@ if [ "${ONLY:-}" = u5 ] || [ "${ONLY:-}" = u5p1 ] || [ "${ONLY:-}" = u5p2 ] || [
         u5p3) hk_boot; u5p3_run; hk_stop ;;
         u5p4) hk_boot; u5p4_run; hk_stop ;;
         u5p5) hk_boot; u5p5_run; hk_stop ;;
+        u5p6) hk_boot; u5p6_run; hk_stop ;;
     esac
     printf '%d passed, %d failed\n' "$pass" "$fail"
     [ "$fail" -eq 0 ]; exit $?
