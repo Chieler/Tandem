@@ -846,17 +846,201 @@ u5p2_run() {
     same "U10 the mail stays pending" "$(mstate "$m")" "pending/0/0"
 }
 
+# pointers <pane>: the distinct non-empty lines on the pane's screen, one per line (cat shows each typed line twice)
+screen_lines() { screen "$1" | sed 's/\^\[\[20[01]~//g' | grep -v '^[[:space:]]*$' | sort -u; }
+# wait_mstate <description> <mail id> <state/presentations/delivered>: pass once the mail has that state (waits up to 5 s)
+wait_mstate() {
+    for _ in $(seq 50); do [ "$(mstate "$2")" = "$3" ] && { ok_; return; }; sleep 0.1; done
+    bad "$1" "  want: $3" "  got:  $(mstate "$2")"
+}
+# mailid <task>: the mail id stored for a task
+mailid() { sqx "$CNTCTR_DB" "SELECT post FROM mail WHERE task='$1' ORDER BY post DESC LIMIT 1"; }
+
+u5p3_run() {
+    local S S2 P Q N R W id id2 task task2 ans before after lines ctx
+    S=$(newpane u5_snd); S2=$(newpane u5_snd2)
+
+    # U6 (pane half): send to an idle agent that has hooks types the one line and nothing else
+    P=$(hk_agent claude u5_e1)
+    out=$(txt "$(call "$S" send '{"to":"u5_e1","text":"build the widget"}')")
+    check "U6 send reports an id" "$out" "sent id="
+    refute "U6 send to a hook agent is not reported as board only" "$out" "on board"
+    task=${out#sent id=}
+    id=$(mailid "$task")
+    expect_screen "U6 the pane gets the pointer line" "$P" "[cntctr mail id=$id] body attached; if you see none, call board"
+    same "U6 the pane holds that one line and nothing else" "$(screen_lines "$P")" "$(pointer "$id")"
+    same "U6 the stored mail is pending with one presentation" "$(mstate "$id")" "pending/1/0"
+    same "U6 the wake is reserved" "$(sqx "$CNTCTR_DB" "SELECT wake_reserved FROM hook_sessions WHERE pane='$P'")" 1
+    ans=$(c_prompt "$P" "$(pointer "$id")")
+    ctx=$(ctx_c "$ans")
+    check "U6 the prompt hook answer holds the full envelope" "$ctx" "build the widget"
+    check "U6 with its header" "$ctx" "[cntctr from=u5_snd id=$task]"
+    check "U6 with its end line" "$ctx" "[cntctr end id=$task]"
+    check "U6 with the reply instruction" "$ctx" "call the reply tool of the cntctr MCP server with id=$task"
+    same "U6 the mail is staged, not delivered" "$(mstate "$id")" "staged/1/0"
+    same "U6 the hook event ends the wake reservation" "$(sqx "$CNTCTR_DB" "SELECT wake_reserved FROM hook_sessions WHERE pane='$P'")" 0
+    c_stop "$P" >/dev/null
+
+    # never more than the one line: three sends in a row to one idle agent type one line
+    P=$(hk_agent claude u5_e2)
+    for task in 1 2 3; do call "$S" send "{\"to\":\"u5_e2\",\"text\":\"burst $task\"}" >/dev/null; done
+    sleep 1
+    same "no more than the one line: three sends in a row type one line" "$(screen_lines "$P" | wc -l | tr -d ' ')" 1
+    refute "the pane never shows an envelope" "$(screen "$P")" "[cntctr from="
+    same "all three mails are stored" "$(sqx "$CNTCTR_DB" "SELECT count(*) FROM mail WHERE pane='$P' AND state='pending'")" 3
+    id=$(sqx "$CNTCTR_DB" "SELECT min(post) FROM mail WHERE pane='$P'")
+    ans=$(c_prompt "$P" "$(pointer "$id")")
+    ctx=$(ctx_c "$ans")
+    case $ctx in *"burst 1"*"burst 2"*"burst 3"*) ok_ ;; *) bad "one prompt answer holds all three envelopes, oldest first" "  got: $ctx" ;; esac
+    c_stop "$P" >/dev/null
+
+    # never more than the one line: a reply to an agent that has hooks, and a follow-up, type the one line
+    P=$(hk_agent claude u5_e3); W=$(newpane u5_e3w)
+    out=$(txt "$(call "$P" send '{"to":"u5_e3w","text":"work for the worker"}')")
+    task=${out#sent id=}
+    call "$W" reply "{\"id\":\"$task\",\"text\":\"worker answer\"}" >/dev/null
+    id=$(mailid "$task")
+    expect_screen "never more than the line: a reply to a hook agent types the pointer" "$P" "[cntctr mail id=$id] body attached"
+    same "a reply to a hook agent types one line only" "$(screen_lines "$P")" "$(pointer "$id")"
+    ans=$(c_prompt "$P" "$(pointer "$id")")
+    check "the reply text arrives with the attached context" "$(ctx_c "$ans")" "worker answer"
+    check "as a reply envelope" "$(ctx_c "$ans")" "[cntctr reply from=u5_e3w id=$task]"
+    c_stop "$P" >/dev/null
+    Q=$(hk_agent claude u5_e4); W=$(newpane u5_e4w)
+    out=$(txt "$(call "$W" send '{"to":"u5_e4","text":"first task"}')")
+    task=${out#sent id=}
+    id=$(mailid "$task")
+    c_prompt "$Q" "$(pointer "$id")" >/dev/null
+    c_stop "$Q" >/dev/null
+    call "$W" send "{\"to\":\"u5_e4\",\"text\":\"and one more thing\",\"re\":\"$task\"}" >/dev/null
+    id2=$(sqx "$CNTCTR_DB" "SELECT max(post) FROM mail WHERE pane='$Q'")
+    expect_screen "a follow-up to an agent that has hooks types a pointer" "$Q" "[cntctr mail id=$id2] body attached"
+    refute "the follow-up text is not typed" "$(screen "$Q")" "and one more thing"
+    ans=$(c_prompt "$Q" "$(pointer "$id2")")
+    check "the follow-up arrives attached as an addendum" "$(ctx_c "$ans")" "addendum"
+    c_stop "$Q" >/dev/null
+
+    # U15: a busy agent that has hooks gets nothing typed; the Stop hook presents the mail
+    P=$(hk_agent claude u5_f1)
+    c_prompt "$P" "work on something long" >/dev/null
+    before=$(screen "$P")
+    out=$(txt "$(call "$S" send '{"to":"u5_f1","text":"mail for a busy agent"}')")
+    check "U15 send to a busy agent is accepted" "$out" "sent id="
+    task=${out#sent id=}; id=$(mailid "$task")
+    sleep 0.5
+    same "U15 nothing is typed into the pane of a busy agent" "$(screen "$P")" "$before"
+    same "U15 the mail waits, uncounted" "$(mstate "$id")" "pending/0/0"
+    ans=$(c_stop "$P")
+    same "U15 the Stop hook blocks" "$(printf '%s' "$ans" | jq -r '.decision')" block
+    check "U15 and holds the envelope" "$(printf '%s' "$ans" | jq -r '.reason')" "mail for a busy agent"
+    check "U15 with its end line" "$(printf '%s' "$ans" | jq -r '.reason')" "[cntctr end id=$task]"
+    same "U15 the held mail is staged and counted" "$(mstate "$id")" "staged/1/0"
+    same "U15 still nothing typed after the Stop" "$(screen "$P")" "$before"
+    c_stop "$P" true >/dev/null
+    same "U15 the continuation's Stop delivers it" "$(mstate "$id")" "delivered/1/1"
+    # U15: the same for agy
+    Q=$(hk_agent agy u5_f2)
+    a_pre "$Q" 0 "work on something long" >/dev/null
+    before=$(screen "$Q")
+    out=$(txt "$(call "$S" send '{"to":"u5_f2","text":"mail for a busy agy"}')")
+    task=${out#sent id=}; id=$(mailid "$task")
+    sleep 0.5
+    same "U15 agy: nothing is typed into a busy agent" "$(screen "$Q")" "$before"
+    ans=$(a_stop "$Q" NO_TOOL_CALL)
+    same "U15 agy: the Stop hook continues the turn" "$(printf '%s' "$ans" | jq -r '.decision')" continue
+    check "U15 agy: with the envelope as the reason" "$(printf '%s' "$ans" | jq -r '.reason')" "mail for a busy agy"
+    # a permission prompt (Claude Code event) and a busy screen with an idle event: nothing typed either
+    P=$(hk_agent claude u5_f3)
+    c_perm "$P" >/dev/null
+    before=$(screen "$P")
+    call "$S" send '{"to":"u5_f3","text":"mail during a permission prompt"}' >/dev/null
+    sleep 0.5
+    same "U15 nothing is typed while a permission event is the last event" "$(screen "$P")" "$before"
+    P=$(hk_agent claude u5_f4)
+    t send-keys -t "$P" "* Working (12s * esc to interrupt)" Enter
+    expect_screen "U15 the screen shows a busy marker" "$P" "esc to interrupt"
+    before=$(screen "$P")
+    out=$(txt "$(call "$S" send '{"to":"u5_f4","text":"mail for a screen that says busy"}')")
+    task=${out#sent id=}; id=$(mailid "$task")
+    sleep 0.5
+    same "U15 nothing is typed when the screen says busy although the event says idle" "$(screen "$P")" "$before"
+    same "U15 the wake is not left reserved" "$(sqx "$CNTCTR_DB" "SELECT wake_reserved FROM hook_sessions WHERE pane='$P'")" 0
+    same "U15 the mail waits" "$(mstate "$id")" "pending/0/0"
+
+    # U12: two sends at the same moment to one idle agent: one line; one answer holds both envelopes
+    P=$(hk_agent claude u5_g1)
+    local pa pb
+    call "$S" send '{"to":"u5_g1","text":"race text one"}' > "$TMPD/u12_a" & pa=$!
+    call "$S2" send '{"to":"u5_g1","text":"race text two"}' > "$TMPD/u12_b" & pb=$!
+    wait $pa $pb
+    sleep 0.5
+    same "U12 both sends are accepted" "$(txt "$(cat "$TMPD/u12_a")" | grep -c 'sent id='),$(txt "$(cat "$TMPD/u12_b")" | grep -c 'sent id=')" "1,1"
+    same "U12 one line in the pane" "$(screen_lines "$P" | wc -l | tr -d ' ')" 1
+    id=$(sqx "$CNTCTR_DB" "SELECT post FROM mail WHERE pane='$P' AND presentations=1")
+    same "U12 exactly one of the two mails has its own line" "$(echo "$id" | wc -w | tr -d ' ')" 1
+    ans=$(c_prompt "$P" "$(pointer "$id")")
+    ctx=$(ctx_c "$ans")
+    check "U12 the answer holds the first envelope" "$ctx" "race text one"
+    check "U12 and the second" "$ctx" "race text two"
+    same "U12 both are staged with one presentation each" "$(sqx "$CNTCTR_DB" "SELECT group_concat(state||presentations) FROM mail WHERE pane='$P'" | tr ',' '\n' | sort -u | tr '\n' ' ')" "staged1 "
+    c_stop "$P" >/dev/null
+
+    # U16: the hook never runs; the line tells the agent to call board, which lists and delivers its mail
+    P=$(hk_agent claude u5_h1); R=$(newpane u5_h1r)
+    out=$(txt "$(call "$S" send '{"to":"u5_h1","text":"mail that no hook presents"}')")
+    task=${out#sent id=}; id=$(mailid "$task")
+    expect_screen "U16 the pane has the line" "$P" "[cntctr mail id=$id] body attached; if you see none, call board"
+    same "U16 no hook event came; the mail is pending" "$(mstate "$id")" "pending/1/0"
+    refute "U16 another agent's board does not list it" "$(txt "$(call "$R" board '{}')")" "mail that no hook presents"
+    refute "U16 the sender's board does not list it" "$(txt "$(call "$S" board '{}')")" "mail that no hook presents"
+    ans=$(txt "$(call "$P" board '{}')")
+    check "U16 the addressee's board lists the mail" "$ans" "mail that no hook presents"
+    same "U16 and delivers it" "$(mstate "$id")" "delivered/1/1"
+
+    # U17: an agent without hooks gets the full envelope, as in 0.3.0
+    N=$(newpane u5_i1)
+    out=$(txt "$(call "$S" send '{"to":"u5_i1","text":"mail for an agent without hooks"}')")
+    task=${out#sent id=}
+    expect_screen "U17 the pane gets the full envelope" "$N" "[cntctr end id=$task]"
+    check "U17 with the text" "$(screen "$N")" "mail for an agent without hooks"
+    check "U17 and the header" "$(screen "$N")" "[cntctr from=u5_snd id=$task]"
+    refute "U17 no pointer line is typed" "$(screen "$N")" "[cntctr mail id="
+    same "U17 no mail row is kept for it" "$(sqx "$CNTCTR_DB" "SELECT count(*) FROM mail WHERE pane='$N'")" 0
+
+    # the retry thread wakes an idle agent that has hooks and pending mail: one line
+    P=$(hk_agent claude u5_j1)
+    id=$(mailput "$P" j1000001 "$(mail_text j1000001 'mail found by the retry thread')" 0)
+    daemon_start "$P"
+    daemon_send '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list","arguments":{}}}'
+    expect_screen "the retry thread types the pointer for an idle hook agent" "$P" "[cntctr mail id=$id] body attached"
+    same "and nothing else" "$(screen_lines "$P")" "$(pointer "$id")"
+    wait_mstate "and counts the presentation" "$id" "pending/1/0"
+    daemon_stop
+    # and types nothing for a busy one
+    P=$(hk_agent claude u5_j2)
+    c_prompt "$P" "work on something" >/dev/null
+    before=$(screen "$P")
+    id=$(mailput "$P" j2000001 "$(mail_text j2000001 'mail for a busy agent found by the retry thread')" 0)
+    daemon_start "$P"
+    daemon_send '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list","arguments":{}}}'
+    sleep 2
+    same "the retry thread types nothing into a busy hook agent" "$(screen "$P")" "$before"
+    daemon_stop
+}
+
 u5_run() {
     hk_boot
     u5p1_run
     u5p2_run
+    u5p3_run
     hk_stop
 }
-if [ "${ONLY:-}" = u5 ] || [ "${ONLY:-}" = u5p1 ] || [ "${ONLY:-}" = u5p2 ]; then
+if [ "${ONLY:-}" = u5 ] || [ "${ONLY:-}" = u5p1 ] || [ "${ONLY:-}" = u5p2 ] || [ "${ONLY:-}" = u5p3 ]; then
     case $ONLY in
         u5) u5_run ;;
         u5p1) hk_boot; u5p1_run; hk_stop ;;
         u5p2) hk_boot; u5p2_run; hk_stop ;;
+        u5p3) hk_boot; u5p3_run; hk_stop ;;
     esac
     printf '%d passed, %d failed\n' "$pass" "$fail"
     [ "$fail" -eq 0 ]; exit $?
