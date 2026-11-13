@@ -1229,7 +1229,6 @@ u28_run
 u22_run
 u23_run
 u24_run
-u5_run
 
 # ---- MCP protocol ----
 out=$(rpc "$INIT")
@@ -3311,6 +3310,9 @@ res51_1=$(cd "$M3_DIR51" && call "" board '{"limit":1}')
 refute "T51 paneless board hides mail" "$(txt "$res51")" "private mail 51"
 refute "T51 paneless board has no unread notice" "$(txt "$res51_1")" "older unread posts were not shown"
 check "T51 addressee board lists mail" "$(txt "$(call "$M3_A51" board '{}')")" "private mail 51"
+
+# U6 to U21 run last: their agents, posts and history stay behind and would change what the older checks count
+[ "${ONLY:-}" = m3 ] || u5_run
 
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
