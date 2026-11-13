@@ -1558,11 +1558,34 @@ f7_6() {
     same "F7.6 and marks the task answered" "$(sqx "$CNTCTR_DB" "SELECT answered FROM task_gate WHERE task='$T'")" 1
 }
 
+# ---- fix round 8 (F8_1 to F8_4) ----
+# f8_1: a short-lived server never takes over the pane marker; a server's marker is gone when it ends
+f8_1() {
+    local P first dp
+    P=$(newpane f8_srv1)
+    t set -pu -t "$P" @cntctr_srv
+    daemon_start "$P"
+    daemon_hello
+    first=$DPID
+    wait_opt() { for _ in $(seq 50); do [ "$(t show -pqv -t "$P" @cntctr_srv)" = "$1" ] && return 0; sleep 0.1; done; return 1; }
+    wait_opt "$first" && ok_ || bad "F8.1 the first server marks its pane" "  want: $first" "  got:  $(t show -pqv -t "$P" @cntctr_srv)"
+    printf '%s\n' "$INIT" | TMUX_PANE=$P "$BIN" >/dev/null   # a one-shot server in the same pane: starts, reads its name, exits
+    same "F8.1 a one-shot server in the pane leaves the first server's marker alone" "$(t show -pqv -t "$P" @cntctr_srv)" "$first"
+    daemon_stop
+    same "F8.1 the marker is gone when its server ends" "$(t show -pqv -t "$P" @cntctr_srv)" ""
+    sleep 0 & dp=$!; wait $dp
+    t set -p -t "$P" @cntctr_srv "$dp"   # a marker naming a dead process
+    printf '%s\n' "$INIT" | TMUX_PANE=$P "$BIN" >/dev/null
+    same "F8.1 a server that took a dead marker removes it again when it ends" "$(t show -pqv -t "$P" @cntctr_srv)" ""
+    t set -p -t "$P" @cntctr_srv $$   # as newpane left it
+}
+
 u5p6_run() {
     export CNTCTR_PASTE_WAIT_MS=100
     local f
     for f in ${F6:-1 2 3 4 5 6 7 8 9}; do declare -F "f6_$f" >/dev/null && "f6_$f"; done
     for f in ${F7:-1 2 3 4 5 6}; do declare -F "f7_$f" >/dev/null && "f7_$f"; done
+    for f in ${F8:-1}; do declare -F "f8_$f" >/dev/null && "f8_$f"; done
     unset CNTCTR_PASTE_WAIT_MS
 }
 

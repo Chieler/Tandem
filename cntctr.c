@@ -275,6 +275,8 @@ static void comm_of(const char *procs, long pid, char out[64]) {
         }
 }
 
+static int srv_alive(const char *v);
+
 /* Find our pane: $TMUX_PANE, else the nearest ancestor process that is a pane's
  * root process (Codex hides TMUX_PANE from MCP servers). Then take our name from
  * the pane's tag, tagging an untagged pane (e.g. a leader the user started by
@@ -318,10 +320,24 @@ static void find_self(void) {
     }
     if (!*self_pane) return;
 
-    /* @cntctr_srv tells the hook paths that a 0.4.0 server serves this pane (a 0.3.0 server sets nothing); set in the same tmux call that reads the name */
-    char pid[24], *name;
+    /* @cntctr_srv tells the hook paths that a 0.4.0 server serves this pane (a 0.3.0 server sets nothing). One call reads the name and the
+     * marker and sets the marker when it is empty; a marker naming a dead process is replaced in a second call. A live server's pid is never
+     * overwritten, so a short-lived server (a nested `claude -p`, a health check) cannot take the pane over; main unsets it on exit. */
+    char pid[24], *both = NULL, cmd[96];
     snprintf(pid, sizeof pid, "%ld", (long)getpid());
-    if (TMUX(NULL, &name, "show", "-pqv", "-t", self_pane, "@cntctr_name", ";", "set", "-p", "-t", self_pane, "@cntctr_srv", pid) == 0 && *name) {
+    snprintf(cmd, sizeof cmd, "set -p -t %s @cntctr_srv %s", self_pane, pid);
+    char *name = NULL;
+    if (TMUX(NULL, &both, "display", "-p", "-t", self_pane, "#{@cntctr_name}\t#{@cntctr_srv}", ";",
+             "if-shell", "-F", "-t", self_pane, "#{==:#{@cntctr_srv},}", cmd) == 0) {
+        char *tab = strchr(both, '\t');
+        if (tab) {
+            *tab = '\0';
+            if (tab[1] && !srv_alive(tab + 1)) free(TMUXE(NULL, "set", "-p", "-t", self_pane, "@cntctr_srv", pid));
+        }
+        name = strdup(both);
+    }
+    free(both);
+    if (name && *name) {
         snprintf(self_name, sizeof self_name, "%s", name);
     } else {
         const char *fallback = getenv("CNTCTR_NAME");
@@ -4567,6 +4583,13 @@ int main(int argc, char **argv) {
     while (getline(&line, &cap, stdin) > 0) handle(line);
     free(line);
     if (*fifo_path) unlink(fifo_path);
+    if (*self_pane) {   /* leave the pane marker only when it still names this server */
+        char pid[24], fmtq[64], cmd[64];
+        snprintf(pid, sizeof pid, "%ld", (long)getpid());
+        snprintf(fmtq, sizeof fmtq, "#{==:#{@cntctr_srv},%s}", pid);
+        snprintf(cmd, sizeof cmd, "set -pu -t %s @cntctr_srv", self_pane);
+        free(TMUXE(NULL, "if-shell", "-F", "-t", self_pane, fmtq, cmd));
+    }
     /* Client gone: blocking sends stop within one wait slice and their replies
      * go to the pane instead. */
     cancel(NULL);
