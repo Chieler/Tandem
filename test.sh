@@ -1343,6 +1343,43 @@ assert s[:a] == b'' and s[b + 6:] == b'\r', s
 EOF2
 }
 
+# f6_4: a reply while the sender still waits (gather) answers the task for the Stop gate
+f6_4() {
+    local PAR W W2 gp T T2 id id2 ans n res
+    PAR=$(newpane f6_par4)
+    W=$(hk_agent claude f6_w4); t set -p -t "$W" @cntctr_parent "$PAR"
+    W2=$(hk_agent claude f6_w4b); t set -p -t "$W2" @cntctr_parent "$PAR"
+    call "$W" board '{}' >/dev/null
+    call "$PAR" gather '{"tasks":[{"kind":"send","to":"f6_w4","text":"job one"},{"kind":"send","to":"f6_w4b","text":"job two"}],"timeout":40}' > "$TMPD/f6_gather" & gp=$!
+    for n in $(seq 100); do
+        T=$(sqx "$CNTCTR_DB" "SELECT task FROM mail WHERE name='f6_w4' ORDER BY post DESC LIMIT 1")
+        T2=$(sqx "$CNTCTR_DB" "SELECT task FROM mail WHERE name='f6_w4b' ORDER BY post DESC LIMIT 1")
+        [ -n "$T" ] && [ -n "$T2" ] && break; sleep 0.1
+    done
+    id=$(mailid "$T"); id2=$(mailid "$T2")
+    c_prompt "$W" "$(pointer "$id")" >/dev/null
+    check "F4 the first worker's task is open before its reply" "$(t show -sqv "@cntctr_to_$T")" "$W"
+    call "$W" reply "{\"id\":\"$T\",\"text\":\"done one\"}" >/dev/null
+    check "F4 the sender still waits: the task option stays set" "$(t show -sqv "@cntctr_to_$T")" "$W"
+    ans=$(c_stop "$W")
+    emptyans "$ans" && ok_ || bad "F4 a Stop after the reply is not held for the answered task" "  got: $ans"
+    same "F4 the parent is not told the worker stopped without a reply" "$(stopped "$T")" 0
+    same "F4 the task is recorded as answered" "$(sqx "$CNTCTR_DB" "SELECT answered FROM task_gate WHERE task='$T'")" 1
+    c_prompt "$W" "carry on" >/dev/null
+    ans=$(c_stop "$W")
+    emptyans "$ans" && ok_ || bad "F4 nor in a later turn" "  got: $ans"
+    same "F4 and still no mail to the parent" "$(stopped "$T")" 0
+    # the other worker never replies in time: its task is still held and told
+    c_prompt "$W2" "$(pointer "$id2")" >/dev/null
+    ans=$(c_stop "$W2")
+    same "F4 an unanswered task is still held" "$(printf '%s' "$ans" | jq -r '.decision')" block
+    call "$W2" reply "{\"id\":\"$T2\",\"text\":\"done two\"}" >/dev/null
+    wait "$gp"
+    res=$(txt "$(cat "$TMPD/f6_gather")")
+    same "F4 gather reports both answered" "$(printf '%s' "$res" | jq -r '[.results[].text] | join(",")')" "done one,done two"
+    same "F4 and is complete" "$(printf '%s' "$res" | jq -r '.complete')" true
+}
+
 u5p6_run() {
     export CNTCTR_PASTE_WAIT_MS=100
     local f

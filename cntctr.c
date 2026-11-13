@@ -1471,12 +1471,20 @@ static void remember_reply(const char *id, const char *to, const char *sender, c
 
 /* The agent in `pane` answered task `task`: its staged or pending mail for that task is delivered. */
 static void mail_answered(const char *task, const char *pane) {
-    if (!pane || !*pane) return;
     char *err = NULL;
     sqlite3 *db = kb(&err);
     free(err);
     if (!db) return;
     sqlite3_stmt *st = NULL;
+    /* The Stop gate never holds a worker for this task again, nor tells its parent: whatever path the reply takes
+     * (waiting sender, buffer, board), @cntctr_to_<task> may stay set until the sender's wait ends. */
+    if (sqlite3_prepare_v2(db, "INSERT INTO task_gate(task, answered) VALUES(?1, 1) ON CONFLICT(task) DO UPDATE SET answered=1", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, task, -1, SQLITE_TRANSIENT);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    st = NULL;
+    if (!pane || !*pane) { sqlite3_close(db); return; }
     if (sqlite3_prepare_v2(db, "UPDATE mail SET delivered=1, state='delivered' WHERE task=?1 AND pane=?2 AND socket=?3 AND socket!='' AND (hooked=1 OR presentations>0) AND delivered=0", -1, &st, NULL) == SQLITE_OK) {
         sqlite3_bind_text(st, 1, task, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 2, pane, -1, SQLITE_TRANSIENT);
@@ -4237,6 +4245,12 @@ static json_object *hook_stop(sqlite3 *db, const char *socket, const char *pane,
     sqlite3_finalize(st);
     struct gate g;
     int worker = gate_snapshot(pane, &g) && *g.parent;   /* only a spawned worker has a parent */
+    if (worker) {   /* a task already answered is no open task, though its option may stay set while the sender waits */
+        int keep = 0;
+        for (int i = 0; i < g.ntasks; i++)
+            if (!task_gate_flag(db, g.task[i].id, "answered")) g.task[keep++] = g.task[i];
+        g.ntasks = keep;
+    }
     json_object *answer = NULL;
     if (normal && !event->loop && sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK) {
         struct mrow rows[MAIL_ROWS];

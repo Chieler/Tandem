@@ -40,7 +40,8 @@ static const char SCHEMA[] =
     " wake_reserved INTEGER NOT NULL DEFAULT 0, wake_at INTEGER,"
     " stop_blocked INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(socket,pane));"
 
-    "CREATE TABLE IF NOT EXISTS task_gate(task TEXT PRIMARY KEY, reminded INTEGER NOT NULL DEFAULT 0, away INTEGER NOT NULL DEFAULT 0);"
+    "CREATE TABLE IF NOT EXISTS task_gate(task TEXT PRIMARY KEY, reminded INTEGER NOT NULL DEFAULT 0, away INTEGER NOT NULL DEFAULT 0,"
+    " answered INTEGER NOT NULL DEFAULT 0);"
     "CREATE TABLE IF NOT EXISTS tools(project TEXT NOT NULL, name TEXT NOT NULL, version INTEGER NOT NULL,"
     " status TEXT NOT NULL, author TEXT NOT NULL, author_model TEXT NOT NULL DEFAULT '', description TEXT NOT NULL,"
     " input_schema TEXT NOT NULL, interpreter TEXT NOT NULL, script TEXT NOT NULL, net INTEGER NOT NULL DEFAULT 0,"
@@ -125,6 +126,7 @@ sqlite3 *kb_open_timeout(const char *path, char **err, int timeout_ms) {
     if (rc == SQLITE_OK) rc = ensure_column(db, "hook_sessions", "turn", "ALTER TABLE hook_sessions ADD COLUMN turn INTEGER NOT NULL DEFAULT 0");
     if (rc == SQLITE_OK) rc = ensure_column(db, "hook_sessions", "broken", "ALTER TABLE hook_sessions ADD COLUMN broken INTEGER NOT NULL DEFAULT 0");
     if (rc == SQLITE_OK) rc = ensure_column(db, "hook_sessions", "server_start", "ALTER TABLE hook_sessions ADD COLUMN server_start INTEGER NOT NULL DEFAULT 0");
+    if (rc == SQLITE_OK) rc = ensure_column(db, "task_gate", "answered", "ALTER TABLE task_gate ADD COLUMN answered INTEGER NOT NULL DEFAULT 0");
     if (rc == SQLITE_OK) rc = sqlite3_exec(db, machine, NULL, NULL, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
     sqlite3_free(machine);
