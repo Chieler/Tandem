@@ -1496,10 +1496,6 @@ static int start_send(json_object *a, int wait, char id[9], char **pane_out, int
     const char *to = sarg(a, "to"), *text = sarg(a, "text");
     char *rerr, *pane = resolve_target(to, &rerr);
     if (!pane) return fail(res, rerr);
-    if ((rerr = scope_error(a, pane, to))) {
-        free(pane);
-        return fail(res, rerr);
-    }
     char *env, *err;
     int add_wait = 0;
     const char *re = sarg(a, "re");
@@ -1527,7 +1523,11 @@ static int start_send(json_object *a, int wait, char id[9], char **pane_out, int
             free(TMUXE(NULL, "set", "-s", opt, "1"));
             add_wait = 1;
         }
-    } else {
+    } else {   /* a new task is scoped; an addendum to an open task this caller sent to this agent needs no cross */
+        if ((rerr = scope_error(a, pane, to))) {
+            free(pane);
+            return fail(res, rerr);
+        }
         new_id(id);
         track(id, wait);
         track_to(id, pane);
@@ -1828,6 +1828,7 @@ static int tool_gather(json_object *a, char **res) {
         } else if (cancelled()) {
             item->text = strdup("gather cancelled before dispatch");
         } else if (item->kind && strcmp(item->kind, "send") == 0) {
+            if (barg(a, "cross")) json_object_object_add(task, "cross", json_object_new_boolean(1));   /* top-level cross covers every send */
             start_send(task, wait, item->id, &item->pane, &item->on_board, &item->text);
         } else if (item->kind && strcmp(item->kind, "spawn") == 0) {
             start_spawn(task, wait, item->id, &item->pane, NULL, &item->text);
@@ -2980,6 +2981,7 @@ static const char TOOLS[] =
     "{\"name\":\"gather\",\"description\":\"Dispatch delegated send or spawn tasks, then return one JSON result when all answer or the shared deadline expires. Check complete before deciding. Task item fields: kind=send takes to,text,re,cross; kind=spawn takes harness,name,task,cwd,tier,model,effort. wait and timeout are top-level only. Each result has a status: answered, timed_out, dead, limited (with resets), failed, or sent when wait=false. Replies that arrive after a timeout or cancel are typed into your pane.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{"
     "\"wait\":{\"type\":\"boolean\",\"description\":\"Default true. false: send every task and return their ids at once; replies arrive in your pane as they come\"},"
+    "\"cross\":{\"type\":\"boolean\",\"description\":\"Only if the user asked you to message these agents: applies to every send task\"},"
     "\"tasks\":{\"type\":\"array\",\"minItems\":1,\"items\":{\"type\":\"object\",\"properties\":{"
     "\"kind\":{\"type\":\"string\",\"enum\":[\"send\",\"spawn\"]},"
     "\"to\":{\"type\":\"string\",\"description\":\"Agent name, or \\\"parent\\\" for the agent that spawned you\"},\"text\":{\"type\":\"string\"},"
