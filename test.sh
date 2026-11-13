@@ -1620,14 +1620,18 @@ f8_2() {
     # ponytail: release_unended's COMMIT cannot be made to fail with the transaction still open from outside (a rolled-back one makes ROLLBACK a no-op), so that check has no test
 }
 
-# f8_4: a database migrated from the oldest schema has the same tables and columns as a new one (a column added to SCHEMA and not to MIGRATIONS shows up here)
+# f8_4: a database from the oldest schema, migrated, and one stamped at an earlier schema version, opened, have the tables and columns of a new one
+# (a column only in SCHEMA shows up in the first; a table added without raising KB_SCHEMA_VERSION shows up in the second)
 f8_4() {
-    local old="$TMPD/f8_4_old.db" fresh="$TMPD/f8_4_new.db" sockpath cols='SELECT m.name||"."||p.name FROM sqlite_master m, pragma_table_info(m.name) p WHERE m.type="table" ORDER BY 1'
+    local old="$TMPD/f8_4_old.db" stamped="$TMPD/f8_4_stamped.db" fresh="$TMPD/f8_4_new.db" sockpath cols='SELECT m.name||"."||p.name FROM sqlite_master m, pragma_table_info(m.name) p WHERE m.type="table" ORDER BY 1'
     sockpath=$(t display -p '#{socket_path}')
-    rm -f "$old" "$old-wal" "$old-shm" "$fresh" "$fresh-wal" "$fresh-shm"
+    rm -f "$old" "$old-wal" "$old-shm" "$stamped" "$stamped-wal" "$stamped-shm" "$fresh" "$fresh-wal" "$fresh-shm"
     sqlite3 "$old" < tests/schema_v0.1.0.sql   # what a 0.1.0 database holds
     CNTCTR_DB=$old TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null   # opening migrates it
+    sqlite3 "$stamped" < tests/schema_stamp1.sql   # a database stamped version 1, the schema of that version
+    CNTCTR_DB=$stamped TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
     CNTCTR_DB=$fresh TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
+    same "F8.4 the stamped database has the tables and columns of a new one" "$(sqx "$stamped" "$cols")" "$(sqx "$fresh" "$cols")"
     same "F8.4 the migrated database has the tables and columns of a new one" "$(sqx "$old" "$cols")" "$(sqx "$fresh" "$cols")"
     check "F8.4 (and the list is not empty)" "$(sqx "$fresh" "$cols")" "mail.socket"
 }
