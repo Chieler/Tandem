@@ -3951,7 +3951,10 @@ static void release_unended(sqlite3 *db, const char *socket, const char *pane, c
     }
     sqlite3_finalize(st);
     free(sql);
-    sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+    if (sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {   /* not released: end the transaction here, the next pass tries again */
+        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+        return;
+    }
     stall_overdue(db, socket, pane);
 }
 
@@ -4364,8 +4367,8 @@ static json_object *hook_stop(sqlite3 *db, const char *socket, const char *pane,
     sqlite3_finalize(st);
     struct gate g;
     int snap = gate_snapshot(pane, &g);
-    if (snap && !srv_alive(g.srv)) return NULL;   /* no 0.4.0 server serves this pane (a 0.3.0 one, or none): no hold, no reminder, no notice */
-    int worker = snap && *g.parent;   /* only a spawned worker has a parent */
+    if (!snap || !srv_alive(g.srv)) return NULL;   /* no 0.4.0 server serves this pane (a 0.3.0 one, or none), or tmux failed: no hold, no reminder, no notice */
+    int worker = *g.parent;   /* only a spawned worker has a parent */
     if (worker) {   /* a task already answered is no open task, though its option may stay set while the sender waits */
         int keep = 0;
         for (int i = 0; i < g.ntasks; i++)
@@ -4393,6 +4396,8 @@ static json_object *hook_stop(sqlite3 *db, const char *socket, const char *pane,
         }
         if (hook_commit(db, taken || named)) {
             if (taken || named) answer = hook_answer(harness, event->kind, HOOK_BLOCK, text);
+        } else {
+            begun = 0;   /* the commit failed and was rolled back: no reminder was given */
         }
         for (int i = 0; i < n; i++) free(rows[i].text);
         free(text), free(extra);

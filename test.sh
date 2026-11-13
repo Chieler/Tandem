@@ -1580,12 +1580,49 @@ f8_1() {
     t set -p -t "$P" @cntctr_srv $$   # as newpane left it
 }
 
+# f8_2: the Stop gate and the release stay neutral when tmux or the commit fails
+f8_2() {
+    local W PAR out T id ans sock2 U m n
+    # (a) tmux cannot be read at the Stop: the pane is not known to be served, so mail is not held with the agent
+    t2 kill-server 2>/dev/null
+    t2 new-session -d -s two -x 200 -y 50 cat
+    sock2=$(t2 display -p '#{socket_path}')
+    U=$(t2 display -p '#{pane_id}')
+    t2 set -p -t "$U" @cntctr_srv $$
+    rm -f "$TMPD/hk_claude2_in" "$TMPD/hk_claude2_out"; mkfifo "$TMPD/hk_claude2_in" "$TMPD/hk_claude2_out"
+    TMUX="$sock2,0,0" "$TMPD/hook_harness/claude" "$BIN" claude < "$TMPD/hk_claude2_in" > "$TMPD/hk_claude2_out" & HK_PID_c2=$!
+    exec 24> "$TMPD/hk_claude2_in" 25< "$TMPD/hk_claude2_out"
+    read -r n <&25
+    hk claude2 SessionStart "$U" '{"session_id":"S1","hook_event_name":"SessionStart","source":"startup"}' >/dev/null
+    sleep 1
+    mail_text f8a00001 'mail for a pane whose tmux is gone' > "$TMPD/f8_a_text"
+    sqx "$CNTCTR_DB" "INSERT INTO posts(scope,sender,text,at) VALUES('$U5_SCOPE','sender',CAST(readfile('$TMPD/f8_a_text') AS TEXT),strftime('%s','now')); INSERT INTO mail(post,name,pane,task,hooked,presentations,socket) VALUES(last_insert_rowid(),'f8_gone','$U','f8a00001',1,0,'$sock2')"
+    m=$(sqx "$CNTCTR_DB" "SELECT max(post) FROM mail")
+    t2 kill-server 2>/dev/null
+    ans=$(hk claude2 Stop "$U" '{"session_id":"S1","hook_event_name":"Stop","stop_hook_active":false}')
+    emptyans "$ans" && ok_ || bad "F8.2 a Stop that cannot read tmux holds nothing" "  got: $ans"
+    same "F8.2 and the mail is untouched" "$(mstate "$m")" "pending/0/0"
+    exec 24>&- 25<&-; kill "$HK_PID_c2" 2>/dev/null; wait "$HK_PID_c2" 2>/dev/null
+    # (b) the commit of the reminder fails (a trigger that rolls the transaction back): no reminder was given, so the parent is told nothing
+    PAR=$(hk_agent claude f8_par2)
+    W=$(hk_agent claude f8_w2); t set -p -t "$W" @cntctr_parent "$PAR"
+    out=$(txt "$(call "$PAR" send '{"to":"f8_w2","text":"a job whose reminder cannot be committed"}')")
+    T=${out#sent id=}; id=$(mailid "$T")
+    c_prompt "$W" "$(pointer "$id")" >/dev/null
+    sqx "$CNTCTR_DB" "CREATE TRIGGER f8_2_fail BEFORE UPDATE ON hook_sessions BEGIN SELECT RAISE(ROLLBACK, 'no commit'); END"
+    ans=$(c_stop "$W")
+    emptyans "$ans" && ok_ || bad "F8.2 a Stop whose commit fails answers neutral" "  got: $ans"
+    same "F8.2 and the parent is not told 'no reply after one reminder'" "$(stopped "$T")" 0
+    sqx "$CNTCTR_DB" "DROP TRIGGER f8_2_fail"
+    # ponytail: release_unended's COMMIT cannot be made to fail with the transaction still open from outside (a rolled-back one makes ROLLBACK a no-op), so that check has no test
+}
+
 u5p6_run() {
     export CNTCTR_PASTE_WAIT_MS=100
     local f
     for f in ${F6:-1 2 3 4 5 6 7 8 9}; do declare -F "f6_$f" >/dev/null && "f6_$f"; done
     for f in ${F7:-1 2 3 4 5 6}; do declare -F "f7_$f" >/dev/null && "f7_$f"; done
-    for f in ${F8:-1}; do declare -F "f8_$f" >/dev/null && "f8_$f"; done
+    for f in ${F8:-1 2}; do declare -F "f8_$f" >/dev/null && "f8_$f"; done
     unset CNTCTR_PASTE_WAIT_MS
 }
 
