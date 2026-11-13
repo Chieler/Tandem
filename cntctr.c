@@ -1525,7 +1525,6 @@ static int tool_reply(json_object *a, char **res) {
         return fail(res, fmt("unknown id %s", id));
     snprintf(opt, sizeof opt, "@cntctr_to_%s", id);
     to = sopt_get(opt);
-    mail_answered(id, to);
     remember_reply(id, to, sender, text, a);
 
     /* Write the buffer before checking the wait flag; wait_tasks clears the flag
@@ -1538,6 +1537,7 @@ static int tool_reply(json_object *a, char **res) {
     }
     snprintf(opt, sizeof opt, "@cntctr_wait_%s", id);
     if ((waiting = sopt_get(opt))) {   /* sender is blocked in wait_one: wake it */
+        mail_answered(id, to);   /* the reply is handed on (buffer loaded); a failed reply leaves the task open */
         free(waiting);
         free(sender);
         free(to);
@@ -1545,6 +1545,7 @@ static int tool_reply(json_object *a, char **res) {
     }
     char *me = pane_name(to);
     int rc = deliver_buffer(buf, id, me && *me ? me : caller_name);
+    if (rc >= 0) mail_answered(id, to);   /* only a reply that reached the sender (or the board) closes the task */
     free(me), free(sender), free(to);
     if (rc < 0) return fail(res, fmt("delivery failed; reply retained for retry"));
     return ok(res, fmt(rc ? "reply is on the board" : "ok"));
@@ -3505,6 +3506,22 @@ static void hook_disarm(void) {
     setitimer(ITIMER_REAL, &off, NULL);
 }
 
+/* COMMIT (ROLLBACK when it fails); 1 when committed. A commit that stages mail (`holds`) blocks SIGALRM across it and, once it is
+ * made, drops the alarm for good: the 1.8 s alarm cannot end the process between the commit and the answer that carries the mail. */
+static int hook_commit(sqlite3 *db, int holds) {
+    sigset_t set, old;
+    sigemptyset(&set);
+    sigaddset(&set, SIGALRM);
+    if (holds) sigprocmask(SIG_BLOCK, &set, &old);
+    int ok = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK;
+    if (!ok) sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    if (holds) {
+        if (ok) { hook_disarm(); signal(SIGALRM, SIG_IGN); }   /* an alarm that came during the commit is dropped, not delivered */
+        sigprocmask(SIG_SETMASK, &old, NULL);
+    }
+    return ok;
+}
+
 /* The harness process that sent this event; *procs is the process table ("pid ppid comm"), the caller frees it. */
 static long hook_parent(const char *harness, char **procs) {
     *procs = NULL;
@@ -4155,9 +4172,9 @@ static json_object *hook_attach(sqlite3 *db, const char *harness, const char *ev
     int n = pending_rows(db, socket, pane, server_start, own, rows, MAIL_ROWS), taken = 0;
     char *text = n ? fit_mail(harness, event, HOOK_ATTACH, rows, n, NULL, &taken) : NULL;
     if (taken) stage_rows(db, rows, taken, own, token);
-    if (sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK) {
-        if (taken) { answer = hook_answer(harness, event, HOOK_ATTACH, text); hook_disarm(); }
-    } else sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    if (hook_commit(db, taken > 0)) {
+        if (taken) answer = hook_answer(harness, event, HOOK_ATTACH, text);
+    }
     for (int i = 0; i < n; i++) free(rows[i].text);
     free(text);
     return answer;
@@ -4344,7 +4361,9 @@ static json_object *hook_stop(sqlite3 *db, const char *socket, const char *pane,
         g.ntasks = keep;
     }
     json_object *answer = NULL;
+    int begun = 0;   /* the gate ran: a reminder was given or already had been */
     if (normal && !event->loop && sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK) {
+        begun = 1;
         struct mrow rows[MAIL_ROWS];
         int n = pending_rows(db, socket, pane, server_start, 0, rows, MAIL_ROWS), taken = 0, named = 0;
         char *extra = worker ? task_reminder(db, &g, socket, pane, server_start, &named) : NULL;
@@ -4360,13 +4379,14 @@ static json_object *hook_stop(sqlite3 *db, const char *socket, const char *pane,
             }
             sqlite3_finalize(st);
         }
-        if (sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK) {
-            if (taken || named) { answer = hook_answer(harness, event->kind, HOOK_BLOCK, text); hook_disarm(); }
-        } else sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+        if (hook_commit(db, taken || named)) {
+            if (taken || named) answer = hook_answer(harness, event->kind, HOOK_BLOCK, text);
+        }
         for (int i = 0; i < n; i++) free(rows[i].text);
         free(text), free(extra);
     }
-    if (!answer && worker && g.ntasks && (normal || !strcmp(event->reason, "ERROR") || !strcmp(event->reason, "USER_CANCELED"))) {
+    if (!answer && worker && g.ntasks && ((normal && (event->loop || begun)) || !strcmp(event->reason, "ERROR") || !strcmp(event->reason, "USER_CANCELED"))) {
+        /* a normal Stop whose gate could not run (database busy) is neutral: no reminder was given, so no "after one reminder" notice */
         /* an agy end that is none of these (a reason this code does not know) gave no reminder and tells the parent nothing */
         const char *r = event->reason;
         tell_parent(db, &g, pane, !strcmp(r, "ERROR") || !strcmp(r, "USER_CANCELED") ? r : "no reply after one reminder");

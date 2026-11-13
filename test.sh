@@ -1535,6 +1535,26 @@ f7_3() {
     unset CNTCTR_WAKE_SEC
 }
 
+# f7_6: a reply that could not be handed on does not mark its task answered; the retry that works does
+f7_6() {
+    local PAR W out T id ans res
+    PAR=$(hk_agent claude f7_par6)
+    W=$(hk_agent claude f7_w6); t set -p -t "$W" @cntctr_parent "$PAR"
+    out=$(txt "$(call "$PAR" send '{"to":"f7_w6","text":"a job whose first reply fails"}')")
+    T=${out#sent id=}; id=$(mailid "$T")
+    c_prompt "$W" "$(pointer "$id")" >/dev/null
+    sqx "$CNTCTR_DB" "CREATE TRIGGER f7_6_fail BEFORE INSERT ON posts BEGIN SELECT RAISE(ABORT, 'no posts'); END"   # the sender's mail cannot be stored
+    res=$(call "$W" reply "{\"id\":\"$T\",\"text\":\"first try\"}"); res=$(txt "$res")   # (nested, bash 3.2 loses the escaped quotes)
+    check "F7.6 the reply fails" "$res" "delivery failed"
+    same "F7.6 and the task is not marked answered" "$(sqx "$CNTCTR_DB" "SELECT coalesce(max(answered),0) FROM task_gate WHERE task='$T'")" 0
+    ans=$(c_stop "$W")
+    same "F7.6 so the Stop still holds the worker for it" "$(printf '%s' "$ans" | jq -r '.decision')" block
+    sqx "$CNTCTR_DB" "DROP TRIGGER f7_6_fail"
+    res=$(call "$W" reply "{\"id\":\"$T\",\"text\":\"second try\"}"); res=$(txt "$res")   # (nested, bash 3.2 loses the escaped quotes)
+    refute "F7.6 the retry works" "$res" "delivery failed"
+    same "F7.6 and marks the task answered" "$(sqx "$CNTCTR_DB" "SELECT answered FROM task_gate WHERE task='$T'")" 1
+}
+
 u5p6_run() {
     export CNTCTR_PASTE_WAIT_MS=100
     local f
