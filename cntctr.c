@@ -318,6 +318,12 @@ static void find_self(void) {
     }
     if (!*self_pane) return;
 
+    {   /* tells the hook paths that a 0.4.0 server serves this pane (a 0.3.0 server sets nothing) */
+        char pid[24];
+        snprintf(pid, sizeof pid, "%ld", (long)getpid());
+        free(TMUXE(NULL, "set", "-p", "-t", self_pane, "@cntctr_srv", pid));
+    }
+
     char *name;
     if (TMUX(NULL, &name, "show", "-pqv", "-t", self_pane, "@cntctr_name") == 0 && *name) {
         snprintf(self_name, sizeof self_name, "%s", name);
@@ -899,6 +905,21 @@ static int pane_alive(const char *pane) {
     int alive = TMUX(NULL, &out, "display", "-p", "-t", pane, "#{pane_dead}") == 0 && strcmp(out, "0") == 0;
     free(out);
     return alive;
+}
+
+/* True when `v` (a pane's @cntctr_srv) names a running process: the 0.4.0 server that serves the pane.
+ * ponytail: pid reuse after a crash can pass this; the hook paths then act for a pane that no server serves. */
+static int srv_alive(const char *v) {
+    long pid = atol(v);
+    return pid > 1 && (kill((pid_t)pid, 0) == 0 || errno == EPERM);
+}
+
+/* Nonzero if `pane` is alive and a live 0.4.0 server serves it (one tmux call, as pane_alive). */
+static int pane_served(const char *pane) {
+    char *out;
+    int ok = TMUX(NULL, &out, "display", "-p", "-t", pane, "#{pane_dead}\t#{@cntctr_srv}") == 0 && out[0] == '0' && out[1] == '\t' && srv_alive(out + 2);
+    free(out);
+    return ok;
 }
 
 /* Value of server option `name` (caller frees), or NULL if unset. */
@@ -3584,7 +3605,7 @@ static int hook_row_get(sqlite3 *db, const char *socket, const char *pane, struc
  * has not gone quiet after a wake, and both its pane and its recorded harness process are alive. */
 static int hook_row_has(const struct hook_row *r, const char *pane) {
     return (!strcmp(r->harness, "claude") || !strcmp(r->harness, "agy")) && r->pid > 1 && r->prompt_seen && r->stop_seen && !r->broken &&
-           hook_process_alive(r->pid, r->harness) && pane_alive(pane);
+           hook_process_alive(r->pid, r->harness) && pane_served(pane);
 }
 
 static int has_hooks(sqlite3 *db, const char *socket, const char *pane) {
@@ -3866,7 +3887,7 @@ static void release_unended(sqlite3 *db, const char *socket, const char *pane, c
     }
     sqlite3_finalize(st);
     free(sql);
-    if (!staged) return;
+    if (!staged || !pane_served(pane)) return;
     char *tail = pane_tail(pane);
     enum pstate on_screen = pane_state_screen(tail, NULL);
     free(tail);
@@ -4142,7 +4163,7 @@ static int stop_normal(const char *harness, const struct hook_event *event) {
 /* ---- the Stop gate (H5): what tmux knows about this agent, read in one invocation ---- */
 
 struct gate {
-    char name[128], parent[32], parent_name[128], path[4096], parent_path[4096];
+    char name[128], parent[32], srv[24], parent_name[128], path[4096], parent_path[4096];
     struct { char id[16], sender[128]; } task[16];   /* open tasks given to this pane */
     int ntasks;
     long long seen;
@@ -4158,26 +4179,27 @@ static void unquote_value(char *v) {
 static int gate_snapshot(const char *pane, struct gate *g) {
     char *out = NULL;
     memset(g, 0, sizeof *g);
-    if (TMUX(NULL, &out, "list-panes", "-a", "-F", "#{pane_id}\t#{@cntctr_name}\t#{@cntctr_parent}\t#{pane_current_path}", ";", "show", "-s") != 0) {
+    if (TMUX(NULL, &out, "list-panes", "-a", "-F", "#{pane_id}\t#{@cntctr_name}\t#{@cntctr_parent}\t#{@cntctr_srv}\t#{pane_current_path}", ";", "show", "-s") != 0) {
         free(out);
         return 0;
     }
     char *pristine = out, *save = NULL;   /* strtok cuts its input, so each pass reads its own copy */
     char *pass1 = strdup(pristine), *pass2 = strdup(pristine), *pass3 = strdup(pristine);
     for (char *line = strtok_r(pass1, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {   /* this pane */
-        char *name = strchr(line, '\t'), *parent = name ? strchr(name + 1, '\t') : NULL, *path = parent ? strchr(parent + 1, '\t') : NULL;
+        char *name = strchr(line, '\t'), *parent = name ? strchr(name + 1, '\t') : NULL, *srv = parent ? strchr(parent + 1, '\t') : NULL, *path = srv ? strchr(srv + 1, '\t') : NULL;
         if (line[0] != '%' || !path) continue;
-        *name++ = *parent++ = *path++ = '\0';
+        *name++ = *parent++ = *srv++ = *path++ = '\0';
         if (!strcmp(line, pane)) {
             snprintf(g->name, sizeof g->name, "%s", name);
             snprintf(g->parent, sizeof g->parent, "%s", parent);
+            snprintf(g->srv, sizeof g->srv, "%s", srv);
             snprintf(g->path, sizeof g->path, "%s", path);
         }
     }
     for (char *line = strtok_r(pass2, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {   /* its parent */
-        char *name = strchr(line, '\t'), *parent = name ? strchr(name + 1, '\t') : NULL, *path = parent ? strchr(parent + 1, '\t') : NULL;
+        char *name = strchr(line, '\t'), *parent = name ? strchr(name + 1, '\t') : NULL, *srv = parent ? strchr(parent + 1, '\t') : NULL, *path = srv ? strchr(srv + 1, '\t') : NULL;
         if (line[0] != '%' || !path) continue;
-        *name++ = *parent++ = *path++ = '\0';
+        *name++ = *parent++ = *srv++ = *path++ = '\0';
         if (*g->parent && !strcmp(line, g->parent)) {
             snprintf(g->parent_name, sizeof g->parent_name, "%s", name);
             snprintf(g->parent_path, sizeof g->parent_path, "%s", path);
@@ -4304,7 +4326,9 @@ static json_object *hook_stop(sqlite3 *db, const char *socket, const char *pane,
     }
     sqlite3_finalize(st);
     struct gate g;
-    int worker = gate_snapshot(pane, &g) && *g.parent;   /* only a spawned worker has a parent */
+    int snap = gate_snapshot(pane, &g);
+    if (snap && !srv_alive(g.srv)) return NULL;   /* no 0.4.0 server serves this pane (a 0.3.0 one, or none): no hold, no reminder, no notice */
+    int worker = snap && *g.parent;   /* only a spawned worker has a parent */
     if (worker) {   /* a task already answered is no open task, though its option may stay set while the sender waits */
         int keep = 0;
         for (int i = 0; i < g.ntasks; i++)
@@ -4404,7 +4428,7 @@ static json_object *hook_decide(sqlite3 *db, const char *socket, const char *pan
         }
         sqlite3_finalize(st);
         /* agy calls this before every model step: only the first call of a turn attaches */
-        if (mine && !event->loop) answer = hook_attach(db, harness, event->kind, socket, pane, token, server_start, own);
+        if (mine && !event->loop && pane_served(pane)) answer = hook_attach(db, harness, event->kind, socket, pane, token, server_start, own);
     }
     if (!strcmp(event->kind, "Stop")) answer = hook_stop(db, socket, pane, harness, event, token, server_start);
     stall_overdue(db, socket, pane);

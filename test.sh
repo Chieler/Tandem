@@ -72,7 +72,11 @@ session() {
     rm -f "$fifo"
 }
 call() {
-    SKIP=1 session "$1" 2 "$INIT" "$(printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"%s","arguments":%s}}' "$2" "$3")" | tail -n 1
+    # a one-call session stands in for the agent's long-lived MCP server: it sets @cntctr_srv to its own pid and exits, so the pane is put back to the test shell's pid
+    local out
+    out=$(SKIP=1 session "$1" 2 "$INIT" "$(printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"%s","arguments":%s}}' "$2" "$3")" | tail -n 1)
+    case $1 in %*) t set -p -t "$1" @cntctr_srv $$ 2>/dev/null ;; esac
+    printf '%s\n' "$out"
 }
 rawtxt() { printf '%s' "$1" | jq -r '.result.content[0].text'; }
 notice() { printf '%s' "$1" | jq -r '.result.content[1].text // empty'; }
@@ -105,6 +109,7 @@ newpane() {
     pane=$(t new-window -d -n "$name" -P -F '#{pane_id}' "$@")
     t set -p -t "$pane" @cntctr_name "$name"
     t set -p -t "$pane" @cntctr_harness test
+    t set -p -t "$pane" @cntctr_srv $$   # a live pid: as if a 0.4.0 server served the pane (f7_1 unsets it)
     echo "$pane"
 }
 
@@ -1212,6 +1217,7 @@ f6_1() {
     t2 new-session -d -s two -x 200 -y 50 cat
     sock2=$(t2 display -p '#{socket_path}')
     U=$(t2 display -p '#{pane_id}')
+    t2 set -p -t "$U" @cntctr_srv $$
     rm -f "$TMPD/hk_claude2_in" "$TMPD/hk_claude2_out"; mkfifo "$TMPD/hk_claude2_in" "$TMPD/hk_claude2_out"
     TMUX="$sock2,0,0" "$TMPD/hook_harness/claude" "$BIN" claude < "$TMPD/hk_claude2_in" > "$TMPD/hk_claude2_out" & HK_PID_c2=$!
     exec 24> "$TMPD/hk_claude2_in" 25< "$TMPD/hk_claude2_out"
@@ -1447,10 +1453,55 @@ f6_9() {
     same "F9 and the current version" "$(sqx "$d" 'PRAGMA user_version')" 1
 }
 
+# ---- fix round 7 (F7_1 to F7_6) ----
+# f7_1: a pane no 0.4.0 server serves (no @cntctr_srv, or a dead pid) gets nothing from the hook paths and is mailed the 0.3.0 way
+f7_1() {
+    local S PAR P C kind dp out task id id2 ans scr n nc here
+    S=$(newpane f7_snd1); PAR=$(newpane f7_par1)
+    here="TMUX=$(t display -p '#{socket_path}'),0,0"
+    P=$(hk_agent claude f7_w1); t set -p -t "$P" @cntctr_parent "$PAR"
+    for kind in none dead; do
+        if [ $kind = none ]; then t set -pu -t "$P" @cntctr_srv; else sleep 0 & dp=$!; wait $dp; t set -p -t "$P" @cntctr_srv "$dp"; fi
+        same "F7.1 $kind: the pane has no hooks" "$(env "$here" "$BIN" hook status "$P")" no
+        # a mail stored for it as hooked (by a sender that did not check) is not attached, and no Stop holds the agent or reminds it
+        id=$(mailput "$P" f7a00001 "$(mail_text f7a00001 'mail for a pane no 0.4.0 server serves')" 0)
+        t set -s @cntctr_to_f7a00001 "$P"; t set -s @cntctr_sender_f7a00001 f7_snd1
+        ans=$(c_prompt "$P" "$(pointer "$id")")
+        emptyans "$ans" && ok_ || bad "F7.1 $kind: the prompt attaches nothing" "  got: $ans"
+        ans=$(c_stop "$P")
+        emptyans "$ans" && ok_ || bad "F7.1 $kind: the Stop neither holds nor reminds" "  got: $ans"
+        same "F7.1 $kind: the mail is untouched" "$(mstate "$id")" "pending/0/0"
+        same "F7.1 $kind: the parent is told nothing" "$(stopped f7a00001)" 0
+        t set -su @cntctr_to_f7a00001; t set -su @cntctr_sender_f7a00001
+        sqx "$CNTCTR_DB" "UPDATE mail SET delivered=1 WHERE post=$id"
+        # a send is pasted as the full envelope: the same text as to a pane that has no hooks at all, once, with no pointer line
+        out=$(txt "$(call "$S" send '{"to":"f7_w1","text":"f7 full envelope text '"$kind"'"}')")
+        task=${out#sent id=}
+        C=$(newpane f7_ctl$kind)
+        call "$S" send '{"to":"f7_ctl'"$kind"'","text":"f7 full envelope text '"$kind"'"}' >/dev/null
+        sleep 1
+        n=$(screen "$P" | grep -c "f7 full envelope text $kind"); nc=$(screen "$C" | grep -c "f7 full envelope text $kind")
+        [ "$n" -gt 0 ] && [ "$n" = "$nc" ] && ok_ || bad "F7.1 $kind: the send is pasted once as for a pane without hooks" "  pane $n, control $nc"
+        refute "F7.1 $kind: no pointer line" "$(screen "$P")" "[cntctr mail id="
+        same "F7.1 $kind: the mail is not stored as hooked" "$(sqx "$CNTCTR_DB" "SELECT count(*) FROM mail WHERE task='$task' AND hooked=1")" 0
+    done
+    # the same pane with a live pid has the 0.4.0 behaviour
+    t set -p -t "$P" @cntctr_srv $$
+    same "F7.1 served: the pane has hooks" "$(env "$here" "$BIN" hook status "$P")" yes
+    out=$(txt "$(call "$S" send '{"to":"f7_w1","text":"f7 served mail"}')")
+    task=${out#sent id=}; id2=$(mailid "$task")
+    expect_screen "F7.1 served: the pane gets the pointer line" "$P" "[cntctr mail id=$id2] body attached"
+    ans=$(c_prompt "$P" "$(pointer "$id2")")
+    check "F7.1 served: the prompt attaches the envelope" "$(ctx_c "$ans")" "f7 served mail"
+    c_stop "$P" >/dev/null
+    same "F7.1 served: the Stop delivers it" "$(mstate "$id2")" "delivered/1/1"
+}
+
 u5p6_run() {
     export CNTCTR_PASTE_WAIT_MS=100
     local f
     for f in ${F6:-1 2 3 4 5 6 7 8 9}; do declare -F "f6_$f" >/dev/null && "f6_$f"; done
+    for f in ${F7:-1 2 3 4 5 6}; do declare -F "f7_$f" >/dev/null && "f7_$f"; done
     unset CNTCTR_PASTE_WAIT_MS
 }
 
