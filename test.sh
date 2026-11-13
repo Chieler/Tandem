@@ -1380,6 +1380,37 @@ f6_4() {
     same "F4 and is complete" "$(printf '%s' "$res" | jq -r '.complete')" true
 }
 
+# f6_5: mail staged in a turn that never ends with a Stop (cancel, API failure) is presented again; the third presentation stalls it
+f6_5() {
+    local S P out task id ans lines
+    export CNTCTR_WAKE_SEC=2
+    S=$(newpane f6_snd5)
+    P=$(hk_agent claude f6_nostop)
+    daemon_start "$P"
+    daemon_hello
+    out=$(txt "$(call "$S" send '{"to":"f6_nostop","text":"mail whose turn is cancelled"}')")
+    task=${out#sent id=}; id=$(mailid "$task")
+    wait_mstate "F5 the first line is typed and counted" "$id" "pending/1/0"
+    ans=$(c_prompt "$P" "$(pointer "$id")")
+    check "F5 the prompt attaches the mail" "$(ctx_c "$ans")" "mail whose turn is cancelled"
+    same "F5 the mail is staged" "$(mstate "$id")" "staged/1/0"
+    # the user cancels: no Stop comes. The screen reads idle; after the wake window the mail is pending and the line is typed again
+    wait_mstate "F5 with no Stop and an idle screen the mail is pending again and the line is typed a second time" "$id" "pending/2/0"
+    lines=$(screen "$P" | grep -c '\[cntctr mail id=')   # cat shows each typed line twice
+    same "F5 the pointer is on the screen twice, typed twice" "$lines" 4
+    ans=$(c_prompt "$P" "$(pointer "$id")")
+    check "F5 the second presentation attaches it again" "$(ctx_c "$ans")" "mail whose turn is cancelled"
+    wait_mstate "F5 again no Stop: pending, typed a third time" "$id" "pending/3/0"
+    ans=$(c_prompt "$P" "$(pointer "$id")")
+    check "F5 the third presentation attaches it" "$(ctx_c "$ans")" "mail whose turn is cancelled"
+    wait_mstate "F5 the third presentation ended without delivery: stalled" "$id" "stalled/3/0"
+    same "F5 the sender is told once" "$(notices "$id")" 1
+    sleep 3
+    same "F5 and nothing is told again" "$(notices "$id")" 1
+    daemon_stop
+    unset CNTCTR_WAKE_SEC
+}
+
 u5p6_run() {
     export CNTCTR_PASTE_WAIT_MS=100
     local f

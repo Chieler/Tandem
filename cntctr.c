@@ -3838,10 +3838,62 @@ static int hook_mail(const char *pane, const char *name, const char *scope, cons
     return rc;
 }
 
+/* Claude Code runs no Stop when the user cancels a turn or the API fails, so mail staged in that turn would stay staged. When
+ * mail of this agent is staged, no hook event came for wake_sec() and the screen reads idle, the turn is over: the mail goes back
+ * to pending and the session reads idle (as after a Stop). It counts as a presentation that ended without delivery: its count
+ * stands, and the third one stalls the mail and tells its sender, as after an error Stop. */
+static void release_unended(sqlite3 *db, const char *socket, const char *pane, const char *name, const char *scope, const char *own) {
+    struct hook_row r;
+    time_t now = time(NULL);
+    if (!*socket || !hook_row_get(db, socket, pane, &r) || r.broken || r.at > now - wake_sec()) return;
+    char *sql = fmt("SELECT 1 FROM mail JOIN posts ON posts.rowid=mail.post WHERE %s AND state='staged' LIMIT 1", own);
+    sqlite3_stmt *st = NULL;
+    int staged = 0;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, scope, -1, SQLITE_TRANSIENT);
+        { char *pk = pane_key(socket, pane); sqlite3_bind_text(st, 3, pk, -1, SQLITE_TRANSIENT); free(pk); }
+        sqlite3_bind_int64(st, 4, server_start);
+        staged = sqlite3_step(st) == SQLITE_ROW;
+    }
+    sqlite3_finalize(st);
+    free(sql);
+    if (!staged) return;
+    char *tail = pane_tail(pane);
+    enum pstate on_screen = pane_state_screen(tail, NULL);
+    free(tail);
+    if (on_screen != P_IDLE) return;
+    /* the session row is the claim: an event that came meanwhile changed `at`, and then nothing is released */
+    st = NULL;
+    int mine = 0;
+    if (sqlite3_prepare_v2(db, "UPDATE hook_sessions SET last_event='Stop', stop_blocked=0, at=?3 WHERE socket=?1 AND pane=?2 AND at=?4", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, socket, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, pane, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 3, now);
+        sqlite3_bind_int64(st, 4, r.at);
+        mine = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
+    }
+    sqlite3_finalize(st);
+    if (!mine) return;
+    sql = fmt("UPDATE mail SET state='pending' WHERE post IN (SELECT mail.post FROM mail JOIN posts ON posts.rowid=mail.post WHERE %s AND state='staged')", own);
+    st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, scope, -1, SQLITE_TRANSIENT);
+        { char *pk = pane_key(socket, pane); sqlite3_bind_text(st, 3, pk, -1, SQLITE_TRANSIENT); free(pk); }
+        sqlite3_bind_int64(st, 4, server_start);
+        sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    free(sql);
+    stall_overdue(db, socket, pane);
+}
+
 /* The retry thread's turn for an agent that has hooks: wake it for its oldest pending mail.
  * Returns 1 while mail of this agent still waits for a hook, so the thread looks again. */
 static int wake_pending(sqlite3 *db, const char *socket, const char *pane, const char *name, const char *scope) {
     const char *own = "(name=?1 OR (socket || char(10) || pane=?3 AND posts.at>?4 AND ?3 != '')) AND scope=?2 AND delivered=0";
+    release_unended(db, socket, pane, name, scope, own);
     char *sql = fmt("SELECT post FROM mail JOIN posts ON posts.rowid=mail.post WHERE %s AND state='pending' ORDER BY post LIMIT 1", own);
     sqlite3_stmt *st = NULL;
     long long mail = 0;
