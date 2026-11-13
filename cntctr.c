@@ -318,14 +318,10 @@ static void find_self(void) {
     }
     if (!*self_pane) return;
 
-    {   /* tells the hook paths that a 0.4.0 server serves this pane (a 0.3.0 server sets nothing) */
-        char pid[24];
-        snprintf(pid, sizeof pid, "%ld", (long)getpid());
-        free(TMUXE(NULL, "set", "-p", "-t", self_pane, "@cntctr_srv", pid));
-    }
-
-    char *name;
-    if (TMUX(NULL, &name, "show", "-pqv", "-t", self_pane, "@cntctr_name") == 0 && *name) {
+    /* @cntctr_srv tells the hook paths that a 0.4.0 server serves this pane (a 0.3.0 server sets nothing); set in the same tmux call that reads the name */
+    char pid[24], *name;
+    snprintf(pid, sizeof pid, "%ld", (long)getpid());
+    if (TMUX(NULL, &name, "show", "-pqv", "-t", self_pane, "@cntctr_name", ";", "set", "-p", "-t", self_pane, "@cntctr_srv", pid) == 0 && *name) {
         snprintf(self_name, sizeof self_name, "%s", name);
     } else {
         const char *fallback = getenv("CNTCTR_NAME");

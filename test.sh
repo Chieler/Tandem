@@ -71,10 +71,13 @@ session() {
     }
     rm -f "$fifo"
 }
+call_raw() {
+    SKIP=1 session "$1" 2 "$INIT" "$(printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"%s","arguments":%s}}' "$2" "$3")" | tail -n 1
+}
 call() {
     # a one-call session stands in for the agent's long-lived MCP server: it sets @cntctr_srv to its own pid and exits, so the pane is put back to the test shell's pid
     local out
-    out=$(SKIP=1 session "$1" 2 "$INIT" "$(printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"%s","arguments":%s}}' "$2" "$3")" | tail -n 1)
+    out=$(call_raw "$@")
     case $1 in %*) t set -p -t "$1" @cntctr_srv $$ 2>/dev/null ;; esac
     printf '%s\n' "$out"
 }
@@ -566,7 +569,7 @@ u24_run() {
     local first_pane; first_pane=$(echo "$panes" | awk '{print $1}')
     local start_ms end_ms elapsed out
     start_ms=$(python3 -c "import time; print(int(time.time()*1000))")
-    out=$(call "$first_pane" list '{}')
+    out=$(call_raw "$first_pane" list '{}')   # not call: its restore of @cntctr_srv is test bookkeeping, not part of the answer time
     end_ms=$(python3 -c "import time; print(int(time.time()*1000))")
     elapsed=$((end_ms - start_ms))
 
