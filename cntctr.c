@@ -3453,16 +3453,28 @@ static int has_hooks(sqlite3 *db, const char *socket, const char *pane) {
     return yes;
 }
 
-static void record_hook(sqlite3 *db, const char *socket, const char *pane, const char *harness, long pid, const struct hook_event *event) {
-    const char *sql = "INSERT INTO hook_sessions(socket,pane,harness,session_id,harness_pid,last_event,at,prompt_seen,stop_seen,stop_blocked) "
-        "VALUES(?1,?2,?3,?4,?5,?6,strftime('%s','now'),?7,?8,?10) "
+/* A turn starts at a Claude Code prompt, or at the first agy model call after one that cntctr did not hold open. */
+static int turn_start(const char *harness, const struct hook_event *event) {
+    return !strcmp(event->kind, "UserPromptSubmit") ||
+           (!strcmp(harness, "agy") && !strcmp(event->kind, "PreInvocation") && !event->loop);
+}
+
+static void record_hook(sqlite3 *db, const char *socket, const char *pane, const char *harness, long pid, const struct hook_event *event, long long server_start) {
+    #define FRESH "(?9 OR hook_sessions.session_id!=excluded.session_id OR hook_sessions.harness!=excluded.harness OR hook_sessions.harness_pid!=excluded.harness_pid)"
+    const char *sql = "INSERT INTO hook_sessions(socket,pane,harness,session_id,harness_pid,last_event,at,prompt_seen,stop_seen,stop_blocked,turn,server_start) "
+        "VALUES(?1,?2,?3,?4,?5,?6,strftime('%s','now'),?7,?8,?10,?11,?13) "
         "ON CONFLICT(socket,pane) DO UPDATE SET "
-        "prompt_seen=CASE WHEN ?9 OR hook_sessions.session_id!=excluded.session_id OR hook_sessions.harness!=excluded.harness OR hook_sessions.harness_pid!=excluded.harness_pid THEN excluded.prompt_seen ELSE max(hook_sessions.prompt_seen,excluded.prompt_seen) END,"
-        "stop_seen=CASE WHEN ?9 OR hook_sessions.session_id!=excluded.session_id OR hook_sessions.harness!=excluded.harness OR hook_sessions.harness_pid!=excluded.harness_pid THEN excluded.stop_seen ELSE max(hook_sessions.stop_seen,excluded.stop_seen) END,"
-        "wake_reserved=CASE WHEN ?9 OR hook_sessions.session_id!=excluded.session_id OR hook_sessions.harness!=excluded.harness OR hook_sessions.harness_pid!=excluded.harness_pid THEN 0 ELSE hook_sessions.wake_reserved END,"
-        "wake_at=CASE WHEN ?9 OR hook_sessions.session_id!=excluded.session_id OR hook_sessions.harness!=excluded.harness OR hook_sessions.harness_pid!=excluded.harness_pid THEN NULL ELSE hook_sessions.wake_at END,"
+        "prompt_seen=CASE WHEN " FRESH " THEN excluded.prompt_seen ELSE max(hook_sessions.prompt_seen,excluded.prompt_seen) END,"
+        "stop_seen=CASE WHEN " FRESH " THEN excluded.stop_seen ELSE max(hook_sessions.stop_seen,excluded.stop_seen) END,"
+        "wake_reserved=0,wake_at=NULL,"   /* a wake ends at the agent's next hook event */
+        "broken=CASE WHEN ?7 OR " FRESH " THEN 0 ELSE hook_sessions.broken END,"
+        "turn=CASE WHEN " FRESH " THEN excluded.turn "
+        "WHEN ?11 AND NOT (?12 AND hook_sessions.last_event='Stop' AND hook_sessions.stop_blocked) THEN hook_sessions.turn+1 "
+        "ELSE hook_sessions.turn END,"
+        "server_start=CASE WHEN ?13>0 THEN ?13 ELSE hook_sessions.server_start END,"
         "stop_blocked=excluded.stop_blocked,"
         "harness=excluded.harness,session_id=excluded.session_id,harness_pid=excluded.harness_pid,last_event=excluded.last_event,at=excluded.at";
+    #undef FRESH
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return;
     sqlite3_bind_text(st, 1, socket, -1, SQLITE_TRANSIENT);
@@ -3475,6 +3487,9 @@ static void record_hook(sqlite3 *db, const char *socket, const char *pane, const
     sqlite3_bind_int(st, 8, !strcmp(event->kind, "Stop"));
     sqlite3_bind_int(st, 9, !strcmp(event->kind, "SessionStart"));
     sqlite3_bind_int(st, 10, 0);
+    sqlite3_bind_int(st, 11, turn_start(harness, event));
+    sqlite3_bind_int(st, 12, !strcmp(harness, "agy"));
+    sqlite3_bind_int64(st, 13, server_start);
     sqlite3_step(st);
     sqlite3_finalize(st);
 }
@@ -3493,6 +3508,199 @@ static int hook_seen(const char *harness) {
     return yes;
 }
 
+/* ---- mail by reference (H3): the pointer line, what a hook attaches, and where a body that is too big goes ---- */
+
+#define WAKE_FMT "[cntctr mail id=%lld] body attached; if you see none, call board"
+
+/* The mail id of a prompt that is exactly the pointer line, else 0. Nothing looser matches. */
+static long long pointer_id(const char *prompt) {
+    long long id = 0;
+    if (!prompt || sscanf(prompt, "[cntctr mail id=%lld]", &id) != 1 || id <= 0) return 0;
+    char *want = fmt(WAKE_FMT, id), *got = strdup(prompt);
+    size_t n = strlen(got);
+    while (n && strchr("\r\n \t", got[n - 1])) got[--n] = '\0';
+    int same = !strcmp(want, got);
+    free(want), free(got);
+    return same ? id : 0;
+}
+
+/* Save a mail body in full under ~/.cache/cntctr/mail (dir 0700, file 0600, files over a day old removed). */
+static char *spill_file(const char *text) {
+    const char *home = getenv("HOME");
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof dir, "%s/.cache", home && *home ? home : ".");
+    mkdir(dir, 0700);
+    snprintf(dir, sizeof dir, "%s/.cache/cntctr", home && *home ? home : ".");
+    mkdir(dir, 0700);
+    snprintf(dir, sizeof dir, "%s/.cache/cntctr/mail", home && *home ? home : ".");
+    mkdir(dir, 0700);
+    chmod(dir, 0700);
+    DIR *d = opendir(dir);
+    for (struct dirent *e; d && (e = readdir(d));) {
+        if (strncmp(e->d_name, "mail-", 5)) continue;
+        char *old = fmt("%s/%s", dir, e->d_name);
+        struct stat sb;
+        if (lstat(old, &sb) == 0 && S_ISREG(sb.st_mode) && sb.st_mtime < time(NULL) - 86400) unlink(old);
+        free(old);
+    }
+    if (d) closedir(d);
+    char *path = fmt("%s/mail-XXXXXX", dir);
+    int fd = mkstemp(path), bad = fd < 0;
+    size_t off = 0, len = strlen(text);
+    while (!bad && off < len) {
+        ssize_t n = write(fd, text + off, len - off);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) bad = 1;
+        else off += (size_t)n;
+    }
+    if (fd >= 0 && close(fd) != 0) bad = 1;
+    if (bad) { unlink(path); free(path); return NULL; }
+    return path;
+}
+
+/* First `head` and last `tail` bytes of `text` (cut on character boundaries) and the file that holds all of it. */
+static char *excerpt(const char *text, const char *path, size_t head, size_t tail) {
+    size_t len = strlen(text), h = head < len ? head : len, t = tail < len - h ? tail : len - h;
+    while (h > 0 && (text[h] & 0xC0) == 0x80) h--;
+    size_t from = len - t;
+    while (from < len && (text[from] & 0xC0) == 0x80) from++;
+    return fmt("%.*s\n[... %zu bytes left out; the whole mail is in the file %s ...]\n%s", (int)h, text, from - h, path, text + from);
+}
+
+struct mrow { long long id; char *text; int repeat; };
+
+static int answer_fits(const char *harness, const char *event, enum hook_answer_kind kind, const char *text) {
+    json_object *a = hook_answer(harness, event, kind, text);
+    int fits = json_object_object_length(a) > 0;
+    json_object_put(a);
+    return fits;
+}
+
+static char *mail_piece(const struct mrow *r, const char *body) {
+    return r->repeat ? fmt("(may be a repeat)\n%s", body) : strdup(body);
+}
+
+/* The text for a hook answer: as many of the rows (oldest first) as the harness budget takes, then `extra`.
+ * A first mail that cannot fit alone goes to a file and is cut; later mail that does not fit stays pending.
+ * *taken is how many rows went in. NULL when nothing fits. */
+static char *fit_mail(const char *harness, const char *event, enum hook_answer_kind kind, const struct mrow *rows, int n, const char *extra, int *taken) {
+    char *out = strdup("");
+    *taken = 0;
+    for (int i = 0; i < n; i++) {
+        char *piece = mail_piece(&rows[i], rows[i].text);
+        char *cand = fmt("%s%s%s", out, *out ? "\n\n" : "", piece), *full = extra ? fmt("%s\n\n%s", cand, extra) : strdup(cand);
+        int fits = answer_fits(harness, event, kind, full);
+        free(full), free(piece);
+        if (!fits && i == 0) {   /* alone it is too big: the store keeps the body, a file holds it, the context holds its ends */
+            free(cand);
+            cand = NULL;
+            char *path = spill_file(rows[i].text);
+            for (size_t head = 4096, tail = 2048; path && !cand && head >= 64; head /= 2, tail /= 2) {
+                char *cut = excerpt(rows[i].text, path, head, tail), *p2 = mail_piece(&rows[i], cut);
+                full = extra ? fmt("%s\n\n%s", p2, extra) : strdup(p2);
+                if (answer_fits(harness, event, kind, full)) cand = p2;
+                else free(p2);
+                free(full), free(cut);
+            }
+            free(path);
+            fits = cand != NULL;
+        }
+        if (!fits) { free(cand); break; }
+        free(out);
+        out = cand;
+        (*taken)++;
+    }
+    if (!*taken && !extra) { free(out); return NULL; }
+    char *all = !*taken ? strdup(extra) : extra ? fmt("%s\n\n%s", out, extra) : strdup(out);
+    free(out);
+    return all;
+}
+
+/* The pending mail of `pane` that a hook may present now, oldest first (rows[].text is allocated; caller frees).
+ * `own` is the mail whose pointer line this event carries: its presentation was counted when the line was typed. */
+static int pending_rows(sqlite3 *db, const char *pane, long long server_start, long long own, struct mrow *rows, int max) {
+    sqlite3_stmt *st = NULL;
+    int n = 0;
+    if (sqlite3_prepare_v2(db, "SELECT mail.post, posts.text, mail.presentations FROM mail JOIN posts ON posts.rowid=mail.post "
+                               "WHERE mail.pane=?1 AND mail.state='pending' AND mail.delivered=0 AND mail.presentations<3 AND posts.at>?2 "
+                               "ORDER BY mail.post LIMIT ?3", -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_text(st, 1, pane, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, server_start);
+    sqlite3_bind_int(st, 3, max);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        rows[n].id = sqlite3_column_int64(st, 0);
+        rows[n].text = strdup((const char *)sqlite3_column_text(st, 1));
+        rows[n].repeat = sqlite3_column_int(st, 2) - (rows[n].id == own) > 0;
+        n++;
+    }
+    sqlite3_finalize(st);
+    return n;
+}
+
+/* Mark rows[0..taken) staged in this turn. A mail with no pointer line of its own is counted now. */
+static void stage_rows(sqlite3 *db, const struct mrow *rows, int taken, long long own, const char *token) {
+    for (int i = 0; i < taken; i++) {
+        sqlite3_stmt *st = NULL;
+        if (sqlite3_prepare_v2(db, "UPDATE mail SET state='staged', hooked=1, staged_turn=?2, presentations=presentations+?3 WHERE post=?1 AND state='pending'", -1, &st, NULL) != SQLITE_OK) continue;
+        sqlite3_bind_int64(st, 1, rows[i].id);
+        sqlite3_bind_text(st, 2, token, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 3, rows[i].id != own);
+        sqlite3_step(st);
+        sqlite3_finalize(st);
+    }
+}
+
+#define MAIL_ROWS 50
+
+/* The prompt event carried a pointer line: attach the pending mail of `pane` and stage it in this turn. */
+static json_object *hook_attach(sqlite3 *db, const char *harness, const char *event, const char *pane, const char *token, long long server_start, long long own) {
+    struct mrow rows[MAIL_ROWS];
+    json_object *answer = NULL;
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) return NULL;
+    int n = pending_rows(db, pane, server_start, own, rows, MAIL_ROWS), taken = 0;
+    char *text = n ? fit_mail(harness, event, HOOK_ATTACH, rows, n, NULL, &taken) : NULL;
+    if (taken) stage_rows(db, rows, taken, own, token);
+    if (sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK) {
+        if (taken) answer = hook_answer(harness, event, HOOK_ATTACH, text);
+    } else sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    for (int i = 0; i < n; i++) free(rows[i].text);
+    free(text);
+    return answer;
+}
+
+/* After the event is recorded: what the hook prints, or NULL for the neutral answer. */
+static json_object *hook_decide(sqlite3 *db, const char *socket, const char *pane, const char *harness, const struct hook_event *event) {
+    sqlite3_stmt *st = NULL;
+    char *token = NULL;
+    long long server_start = 0;
+    if (sqlite3_prepare_v2(db, "SELECT session_id, turn, server_start FROM hook_sessions WHERE socket=?1 AND pane=?2", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, socket, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, pane, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            token = fmt("%s:%lld", sqlite3_column_text(st, 0), (long long)sqlite3_column_int64(st, 1));
+            server_start = sqlite3_column_int64(st, 2);
+        }
+    }
+    sqlite3_finalize(st);
+    if (!token) return NULL;
+    json_object *answer = NULL;
+    if (!strcmp(event->kind, "UserPromptSubmit") || !strcmp(event->kind, "PreInvocation")) {
+        long long own = pointer_id(event->prompt);
+        st = NULL;
+        int mine = 0;
+        if (own && sqlite3_prepare_v2(db, "SELECT 1 FROM mail WHERE post=?1 AND pane=?2", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, own);
+            sqlite3_bind_text(st, 2, pane, -1, SQLITE_TRANSIENT);
+            mine = sqlite3_step(st) == SQLITE_ROW;
+        }
+        sqlite3_finalize(st);
+        /* agy calls this before every model step: only the first call of a turn attaches */
+        if (mine && !event->loop) answer = hook_attach(db, harness, event->kind, pane, token, server_start, own);
+    }
+    free(token);
+    return answer;
+}
+
 static int hook_cmd(int argc, char **argv) {
     struct sigaction sa = {0}; sa.sa_handler = hook_alarm; sigemptyset(&sa.sa_mask); sigaction(SIGALRM, &sa, NULL);
     struct itimerval timer = {{0, 0}, {1, 800000}}; setitimer(ITIMER_REAL, &timer, NULL);
@@ -3505,6 +3713,7 @@ static int hook_cmd(int argc, char **argv) {
         printf("%s\n", yes ? "yes" : "no");
         return 0;
     }
+    json_object *decided = NULL;
     if (argc >= 4 && (!strcmp(argv[2], "claude") || !strcmp(argv[2], "agy"))) {
         char *data = calloc(1, 1048577); size_t n = 0; ssize_t got;
         if (!data) { free(socket); puts("{}"); return 0; }
@@ -3532,13 +3741,23 @@ static int hook_cmd(int argc, char **argv) {
             if (!pane || !*pane) pane = found_pane;
             if (*pane && *socket) {
                 char *err = NULL; sqlite3 *db = kb_timed(&err, 1000); free(err);
-                if (db) { record_hook(db, socket, pane, argv[2], pid, &event); sqlite3_close(db); }
+                if (db) {
+                    long long started = 0;
+                    if (!strcmp(event.kind, "SessionStart")) {   /* the one tmux read of this event: mail older than the server is not ours */
+                        char *out = NULL;
+                        if (TMUX(NULL, &out, "display", "-p", "#{start_time}") == 0) started = atoll(out);
+                        free(out);
+                    }
+                    record_hook(db, socket, pane, argv[2], pid, &event, started);
+                    decided = hook_decide(db, socket, pane, argv[2], &event);
+                    sqlite3_close(db);
+                }
             }
         }
         if (input) json_object_put(input);
     }
     free(socket);
-    json_object *answer = hook_answer(argc > 2 ? argv[2] : "", argc > 3 ? argv[3] : "", HOOK_NEUTRAL, NULL);
+    json_object *answer = decided ? decided : hook_answer(argc > 2 ? argv[2] : "", argc > 3 ? argv[3] : "", HOOK_NEUTRAL, NULL);
     if (answer) { puts(json_object_to_json_string_ext(answer, JSON_C_TO_STRING_PLAIN)); json_object_put(answer); }
     else puts("{}");
     return 0;

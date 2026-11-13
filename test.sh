@@ -326,14 +326,14 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     puts("READY");
     while (fgets(line, sizeof line, stdin)) {
-        char event[128] = "", path[2048] = "", pane[64] = "";
-        int n = sscanf(line, "%127s %2047s %63s", event, path, pane);
+        char event[128] = "", path[2048] = "", pane[64] = "", answer[2048] = "";
+        int n = sscanf(line, "%127s %2047s %63s %2047s", event, path, pane, answer);
         if (n < 2) continue;
         pid_t child = fork();
         if (!child) {
             if (*pane) setenv("CNTCTR_PANE", pane, 1);
             if (freopen(path, "r", stdin) == NULL) _exit(2);
-            if (freopen("/dev/null", "w", stdout) == NULL) _exit(3);
+            if (freopen(*answer ? answer : "/dev/null", "w", stdout) == NULL) _exit(3);
             execl(bin, bin, "hook", harness, event, (char *)0);
             _exit(127);
         }
@@ -580,6 +580,185 @@ u24_run() {
     kill $c_pid 2>/dev/null; wait $c_pid 2>/dev/null
 }
 
+# ---- step 5: mail by reference and the Stop gate (U6 to U21) ----
+# Fake claude and agy processes run `cntctr hook` for fake agents (shell panes on the private socket); the
+# agents are `cat` panes, so what cntctr types shows on their screen. Nothing here touches a real ~/.claude.
+sqx() { sqlite3 -cmd '.timeout 5000' "$@" 2>/dev/null; }   # like sq, but a missing column is a failed check, not an abort
+hk_boot() {
+    ensure_hook_launchers
+    local h
+    for h in claude agy; do
+        rm -f "$TMPD/hk_${h}_in" "$TMPD/hk_${h}_out"
+        mkfifo "$TMPD/hk_${h}_in" "$TMPD/hk_${h}_out"
+        "$TMPD/hook_harness/$h" "$BIN" "$h" < "$TMPD/hk_${h}_in" > "$TMPD/hk_${h}_out" &
+        eval "HK_PID_$h=$!"
+    done
+    exec 20> "$TMPD/hk_claude_in" 21< "$TMPD/hk_claude_out" 22> "$TMPD/hk_agy_in" 23< "$TMPD/hk_agy_out"
+    local ready
+    read -r ready <&21; read -r ready <&23
+    sleep 1   # mail counts only when posted after the tmux server's start second
+}
+hk_stop() {
+    exec 20>&- 21<&- 22>&- 23<&-
+    kill "$HK_PID_claude" "$HK_PID_agy" 2>/dev/null
+    wait "$HK_PID_claude" "$HK_PID_agy" 2>/dev/null
+}
+# hk <harness> <event> <pane> <json>: run one hook call as that harness's process, print the answer
+hk() {
+    local ev="$TMPD/hk_event" out="$TMPD/hk_answer" ready
+    printf '%s' "$4" > "$ev"
+    rm -f "$out"
+    if [ "$1" = claude ]; then printf '%s %s %s %s\n' "$2" "$ev" "$3" "$out" >&20; read -r ready <&21
+    else printf '%s %s %s %s\n' "$2" "$ev" "$3" "$out" >&22; read -r ready <&23; fi
+    cat "$out" 2>/dev/null
+}
+c_start() { hk claude SessionStart "$1" '{"session_id":"S1","hook_event_name":"SessionStart","source":"startup"}'; }
+c_prompt() { hk claude UserPromptSubmit "$1" "$(jq -nc --arg p "$2" '{session_id:"S1",hook_event_name:"UserPromptSubmit",prompt:$p}')"; }
+c_stop() { hk claude Stop "$1" "{\"session_id\":\"S1\",\"hook_event_name\":\"Stop\",\"stop_hook_active\":${2:-false}}"; }
+c_perm() { hk claude PermissionRequest "$1" '{"session_id":"S1","hook_event_name":"PermissionRequest","tool_name":"Bash"}'; }
+a_start() { hk agy SessionStart "$1" '{"conversationId":"S1","hookEventName":"SessionStart"}'; }
+a_pre() { hk agy PreInvocation "$1" "$(jq -nc --arg p "$3" --argjson n "${2:-0}" '{conversationId:"S1",executionNum:0,invocationNum:$n,hookEventName:"PreInvocation",lastUserInput:$p}')"; }
+a_stop() { hk agy Stop "$1" "{\"conversationId\":\"S1\",\"executionNum\":${3:-0},\"fullyIdle\":true,\"terminationReason\":\"${2:-NO_TOOL_CALL}\"}"; }
+# hk_agent <claude|agy> <name>: a fake agent pane whose hook events are on record and whose last event is a passing Stop
+hk_agent() {
+    local p
+    p=$(newpane "$2")
+    t set -p -t "$p" @cntctr_harness "$1"
+    if [ "$1" = claude ]; then c_start "$p"; c_prompt "$p" hello; c_stop "$p"
+    else a_start "$p"; a_pre "$p" 0 hello; a_stop "$p"; fi >/dev/null
+    echo "$p"
+}
+# mail_text <task> <body>: an envelope as send stores it
+mail_text() { printf '[cntctr from=sender id=%s]\n%s\n[when done: call the reply tool of the cntctr MCP server with id=%s and your answer]\n[cntctr end id=%s]' "$1" "$2" "$1" "$1"; }
+# mailput <pane> <task> <text> [presentations]: store a pending mail for <pane> the way send does; prints its id
+mailput() {
+    local f="$TMPD/mail_text" name
+    name=$(t display -p -t "$1" '#{@cntctr_name}')
+    printf '%s' "$3" > "$f"
+    sqx "$CNTCTR_DB" "INSERT INTO posts(scope,sender,text,at) VALUES('u5','sender',CAST(readfile('$f') AS TEXT),strftime('%s','now')); INSERT INTO mail(post,name,pane,task,hooked,presentations) VALUES(last_insert_rowid(),'$name','$1','$2',1,${4:-0}); SELECT last_insert_rowid();"
+}
+mstate() { sqx "$CNTCTR_DB" "SELECT state||'/'||presentations||'/'||delivered FROM mail WHERE post=$1"; }
+pointer() { printf '[cntctr mail id=%s] body attached; if you see none, call board' "$1"; }
+ctx_c() { printf '%s' "$1" | jq -r '.hookSpecificOutput.additionalContext // empty'; }
+ctx_a() { printf '%s' "$1" | jq -r '.injectSteps[0].systemMessage.systemMessage // empty'; }
+emptyans() { [ "$(printf '%s' "$1" | jq -c . 2>/dev/null)" = '{}' ]; }
+
+u5p1_run() {
+    local P Q m1 m2 m3 ans ctx body path i
+    P=$(hk_agent claude u5_c1)
+    m1=$(mailput "$P" a0000001 "$(mail_text a0000001 'please build the thing')" 1)
+    m2=$(mailput "$P" a0000002 "$(mail_text a0000002 'second request about docs')" 0)
+    ans=$(c_prompt "$P" "$(pointer "$m1")")
+    ctx=$(ctx_c "$ans")
+    same "U6 prompt hook answers in the UserPromptSubmit format" "$(printf '%s' "$ans" | jq -r '.hookSpecificOutput.hookEventName')" UserPromptSubmit
+    check "U6 prompt hook attaches the full envelope" "$ctx" "please build the thing"
+    check "U6 attached envelope keeps its reply instruction" "$ctx" "call the reply tool of the cntctr MCP server with id=a0000001"
+    check "U6 attached envelope keeps its end line" "$ctx" "[cntctr end id=a0000001]"
+    check "U6 the same prompt also attaches the other pending mail" "$ctx" "second request about docs"
+    case $ctx in *"please build the thing"*"second request about docs"*) ok_ ;; *) bad "U6 oldest mail comes first" "  got: $ctx" ;; esac
+    refute "U6 a first presentation is not marked as a repeat" "$ctx" "may be a repeat"
+    same "U6 the mail named by the line is staged and not delivered; its typed line already counted" "$(mstate "$m1")" "staged/1/0"
+    same "U6 a mail that rode along is staged and counts one presentation" "$(mstate "$m2")" "staged/1/0"
+
+    # U14: a line inside other text, a trailing text, leading zeros, an unknown id, another agent's mail id: nothing attached
+    Q=$(hk_agent claude u5_c2)
+    m3=$(mailput "$Q" a0000003 "$(mail_text a0000003 'mail for the other agent')" 1)
+    ans=$(c_prompt "$Q" "please look at $(pointer "$m3")")
+    emptyans "$ans" && ok_ || bad "U14 a line inside other text attaches nothing" "  got: $ans"
+    ans=$(c_prompt "$Q" "$(pointer "$m3") now")
+    emptyans "$ans" && ok_ || bad "U14 a line with text after it attaches nothing" "  got: $ans"
+    ans=$(c_prompt "$Q" "$(pointer "0$m3")")
+    emptyans "$ans" && ok_ || bad "U14 a line with a padded id attaches nothing" "  got: $ans"
+    ans=$(c_prompt "$Q" "$(pointer 99999999)")
+    emptyans "$ans" && ok_ || bad "U14 an unknown id attaches nothing" "  got: $ans"
+    ans=$(c_prompt "$Q" "$(pointer "$m1")")
+    emptyans "$ans" && ok_ || bad "U14 another agent's mail id attaches nothing" "  got: $ans"
+    same "U14 the mail stays pending after refused lines" "$(mstate "$m3")" "pending/1/0"
+    ans=$(hk claude UserPromptSubmit "$Q" "$(cat fixtures/hooks/claude-UserPromptSubmit-other.json)")
+    emptyans "$ans" && ok_ || bad "U14 the recorded fixture with the line inside text attaches nothing" "  got: $ans"
+    ans=$(c_prompt "$Q" "$(pointer "$m3")")
+    check "U14 the exact line still attaches afterwards" "$(ctx_c "$ans")" "mail for the other agent"
+
+    # U13: one 100 KB body for Claude Code goes to a file; the context holds head, tail and the path
+    P=$(hk_agent claude u5_c3)
+    body=$(printf 'HEADMARK\n'; head -c 50000 /dev/zero | tr '\0' x; printf '\nMIDMARK\n'; head -c 50000 /dev/zero | tr '\0' y; printf '\nTAILMARK')
+    m1=$(mailput "$P" b0000001 "$(mail_text b0000001 "$body")" 1)
+    ans=$(c_prompt "$P" "$(pointer "$m1")")
+    ctx=$(ctx_c "$ans")
+    check "U13 Claude Code answer for 100 KB stays within 8 KB" "$((${#ans} <= 8192))" 1
+    check "U13 the context holds the head of the body" "$ctx" HEADMARK
+    check "U13 the context holds the tail of the body" "$ctx" TAILMARK
+    check "U13 the context holds the reply instruction in the tail" "$ctx" "[cntctr end id=b0000001]"
+    refute "U13 the middle of the body is not in the context" "$ctx" MIDMARK
+    path=$(printf '%s' "$ctx" | grep -o "$HOME/[^ ]*" | head -1)
+    check "U13 the context names a file under the cache directory" "$path" "/.cache/cntctr/"
+    check "U13 the file holds the whole body" "$(cat "$path" 2>/dev/null | grep -c MIDMARK)" 1
+    same "U13 the file holds the whole envelope" "$(wc -c < "$path" 2>/dev/null | tr -d ' ')" "$(mail_text b0000001 "$body" | wc -c | tr -d ' ')"
+    same "U13 the file has private permissions" "$(ls -l "$path" 2>/dev/null | cut -c1-10)" "-rw-------"
+    same "U13 the big mail is staged" "$(mstate "$m1")" "staged/1/0"
+    # five 3 KB bodies: as many as fit, oldest first, the rest stays pending
+    P=$(hk_agent claude u5_c4)
+    local ids=""
+    for i in 1 2 3 4 5; do
+        body=$(printf 'BODY%s ' "$i"; head -c 3000 /dev/zero | tr '\0' z)
+        ids="$ids $(mailput "$P" "c000000$i" "$(mail_text "c000000$i" "$body")" $((i == 1)))"
+    done
+    set -- $ids
+    ans=$(c_prompt "$P" "$(pointer "$1")")
+    ctx=$(ctx_c "$ans")
+    check "U13 five 3 KB bodies for Claude Code stay within 8 KB" "$((${#ans} <= 8192))" 1
+    check "U13 the oldest of five is attached" "$ctx" BODY1
+    refute "U13 the newest of five is not attached" "$ctx" BODY5
+    same "U13 the oldest of five is staged" "$(mstate "$1")" "staged/1/0"
+    same "U13 the newest of five stays pending and uncounted" "$(mstate "$5")" "pending/0/0"
+    # the same 100 KB body for agy has room for the 40 KB budget; the five bodies all fit
+    Q=$(hk_agent agy u5_a1)
+    body=$(printf 'HEADMARK\n'; head -c 50000 /dev/zero | tr '\0' x; printf '\nMIDMARK\n'; head -c 50000 /dev/zero | tr '\0' y; printf '\nTAILMARK')
+    m1=$(mailput "$Q" d0000001 "$(mail_text d0000001 "$body")" 1)
+    ans=$(a_pre "$Q" 0 "$(pointer "$m1")")
+    ctx=$(ctx_a "$ans")
+    check "U13 agy answer for 100 KB stays within 40 KB" "$((${#ans} <= 40960))" 1
+    check "U13 agy gets the head" "$ctx" HEADMARK
+    refute "U13 agy does not get the middle" "$ctx" MIDMARK
+    check "U13 agy names a file" "$ctx" "$HOME/"
+    Q=$(hk_agent agy u5_a2)
+    ids=""
+    for i in 1 2 3 4 5; do
+        body=$(printf 'BODY%s ' "$i"; head -c 3000 /dev/zero | tr '\0' z)
+        ids="$ids $(mailput "$Q" "e000000$i" "$(mail_text "e000000$i" "$body")" $((i == 1)))"
+    done
+    set -- $ids
+    ans=$(a_pre "$Q" 0 "$(pointer "$1")")
+    ctx=$(ctx_a "$ans")
+    check "U13 agy takes all five 3 KB bodies" "$ctx" BODY5
+    same "U13 agy stages all five" "$(sqx "$CNTCTR_DB" "SELECT count(*) FROM mail WHERE pane='$Q' AND state='staged'")" 5
+
+    # U9: agy calls the hook before every model step; a second call of the turn attaches nothing
+    Q=$(hk_agent agy u5_a3)
+    m1=$(mailput "$Q" f0000001 "$(mail_text f0000001 'agy first mail')" 1)
+    ans=$(a_pre "$Q" 0 "$(pointer "$m1")")
+    check "U9 first PreInvocation attaches the mail as an injected step" "$(ctx_a "$ans")" "agy first mail"
+    same "U9 agy mail is staged" "$(mstate "$m1")" "staged/1/0"
+    m2=$(mailput "$Q" f0000002 "$(mail_text f0000002 'agy mail that arrived mid-turn')" 0)
+    ans=$(a_pre "$Q" 1 "$(pointer "$m1")")
+    emptyans "$ans" && ok_ || bad "U9 a second PreInvocation of the same turn attaches nothing" "  got: $ans"
+    same "U9 the mid-turn mail stays pending" "$(mstate "$m2")" "pending/0/0"
+    same "U9 the staged mail is not counted again" "$(mstate "$m1")" "staged/1/0"
+}
+
+u5_run() {
+    hk_boot
+    u5p1_run
+    hk_stop
+}
+if [ "${ONLY:-}" = u5 ] || [ "${ONLY:-}" = u5p1 ]; then
+    case $ONLY in
+        u5) u5_run ;;
+        u5p1) hk_boot; u5p1_run; hk_stop ;;
+    esac
+    printf '%d passed, %d failed\n' "$pass" "$fail"
+    [ "$fail" -eq 0 ]; exit $?
+fi
 if [ "${ONLY:-}" = u22 ] || [ "${ONLY:-}" = u23 ] || [ "${ONLY:-}" = u24 ] || [ "${ONLY:-}" = u22-u24 ]; then
     case $ONLY in
         u22) u22_run ;;
@@ -597,6 +776,7 @@ u28_run
 u22_run
 u23_run
 u24_run
+u5_run
 
 # ---- MCP protocol ----
 out=$(rpc "$INIT")

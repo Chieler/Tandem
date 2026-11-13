@@ -40,6 +40,7 @@ static const char SCHEMA[] =
     " wake_reserved INTEGER NOT NULL DEFAULT 0, wake_at INTEGER,"
     " stop_blocked INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(socket,pane));"
 
+    "CREATE TABLE IF NOT EXISTS task_gate(task TEXT PRIMARY KEY, reminded INTEGER NOT NULL DEFAULT 0, away INTEGER NOT NULL DEFAULT 0);"
     "CREATE TABLE IF NOT EXISTS tools(project TEXT NOT NULL, name TEXT NOT NULL, version INTEGER NOT NULL,"
     " status TEXT NOT NULL, author TEXT NOT NULL, author_model TEXT NOT NULL DEFAULT '', description TEXT NOT NULL,"
     " input_schema TEXT NOT NULL, interpreter TEXT NOT NULL, script TEXT NOT NULL, net INTEGER NOT NULL DEFAULT 0,"
@@ -116,6 +117,13 @@ sqlite3 *kb_open_timeout(const char *path, char **err, int timeout_ms) {
     if (rc == SQLITE_OK) rc = ensure_mail_column(db, "staged_turn", "ALTER TABLE mail ADD COLUMN staged_turn TEXT");
     if (rc == SQLITE_OK) rc = ensure_mail_column(db, "presentations", "ALTER TABLE mail ADD COLUMN presentations INTEGER NOT NULL DEFAULT 0");
     if (rc == SQLITE_OK) rc = ensure_column(db, "hook_sessions", "stop_blocked", "ALTER TABLE hook_sessions ADD COLUMN stop_blocked INTEGER NOT NULL DEFAULT 0");
+    if (rc == SQLITE_OK) rc = ensure_mail_column(db, "task", "ALTER TABLE mail ADD COLUMN task TEXT NOT NULL DEFAULT ''");
+    if (rc == SQLITE_OK) rc = ensure_mail_column(db, "hooked", "ALTER TABLE mail ADD COLUMN hooked INTEGER NOT NULL DEFAULT 0");
+    if (rc == SQLITE_OK) rc = ensure_mail_column(db, "from_pane", "ALTER TABLE mail ADD COLUMN from_pane TEXT NOT NULL DEFAULT ''");
+    if (rc == SQLITE_OK) rc = ensure_mail_column(db, "from_scope", "ALTER TABLE mail ADD COLUMN from_scope TEXT NOT NULL DEFAULT ''");
+    if (rc == SQLITE_OK) rc = ensure_column(db, "hook_sessions", "turn", "ALTER TABLE hook_sessions ADD COLUMN turn INTEGER NOT NULL DEFAULT 0");
+    if (rc == SQLITE_OK) rc = ensure_column(db, "hook_sessions", "broken", "ALTER TABLE hook_sessions ADD COLUMN broken INTEGER NOT NULL DEFAULT 0");
+    if (rc == SQLITE_OK) rc = ensure_column(db, "hook_sessions", "server_start", "ALTER TABLE hook_sessions ADD COLUMN server_start INTEGER NOT NULL DEFAULT 0");
     if (rc == SQLITE_OK) rc = sqlite3_exec(db, machine, NULL, NULL, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
     sqlite3_free(machine);
