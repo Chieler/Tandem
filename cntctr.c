@@ -650,10 +650,8 @@ static int awaiting_permission(const char *pane) {
 
 /* What `pane` is doing, from its screen. Order matters: a limit screen can also show
  * "esc to cancel", and permission dialogs can show "Esc to cancel". */
-static enum pstate pane_state(const char *pane, char **resets) {
+static enum pstate pane_state_screen(const char *tail, char **resets) {
     if (resets) *resets = NULL;
-    if (!pane_alive(pane)) return P_DEAD;
-    char *tail = pane_tail(pane);
     if (!tail) return P_DEAD;
     enum pstate s = P_IDLE;
     regmatch_t m[4];
@@ -669,6 +667,14 @@ static enum pstate pane_state(const char *pane, char **resets) {
     } else if (match_any(busy_re, sizeof BUSY / sizeof *BUSY, tail)) {
         s = P_BUSY;
     }
+    return s;
+}
+
+static enum pstate pane_state(const char *pane, char **resets) {
+    if (resets) *resets = NULL;
+    if (!pane_alive(pane)) return P_DEAD;
+    char *tail = pane_tail(pane);
+    enum pstate s = pane_state_screen(tail, resets);
     free(tail);
     return s;
 }
@@ -1148,6 +1154,95 @@ static int route(const char *task) {
 
 /* ---- tools ---- */
 
+static char *hook_socket(void) {
+    const char *socket = getenv("CNTCTR_TMUX"), *tmux = getenv("TMUX");
+    if (socket && *socket) return strdup(socket);
+    if (!tmux || !*tmux) return strdup("");
+    return strndup(tmux, strcspn(tmux, ","));
+}
+
+static int hook_process_alive(long pid, const char *harness) {
+    if (pid <= 1 || kill((pid_t)pid, 0) != 0) return 0;
+    char arg[32], *command = NULL;
+    snprintf(arg, sizeof arg, "%ld", pid);
+    int ok = 0;
+    if (run(NULL, &command, (const char *[]){"ps", "-p", arg, "-o", "comm=", NULL}) == 0) {
+        const char *base = strrchr(command, '/');
+        ok = !strcmp(base ? base + 1 : command, harness);
+    }
+    free(command);
+    return ok;
+}
+
+struct proc_cache {
+    long pid;
+    char harness[32];
+    int ok;
+};
+
+static int cached_process_alive(struct proc_cache *cache, int *cache_len, long pid, const char *harness) {
+    for (int i = 0; i < *cache_len; i++) {
+        if (cache[i].pid == pid && !strcmp(cache[i].harness, harness))
+            return cache[i].ok;
+    }
+    int ok = hook_process_alive(pid, harness);
+    if (*cache_len < 64) {
+        cache[*cache_len].pid = pid;
+        snprintf(cache[*cache_len].harness, sizeof cache[*cache_len].harness, "%s", harness);
+        cache[*cache_len].ok = ok;
+        (*cache_len)++;
+    }
+    return ok;
+}
+
+static int agent_hook_state(sqlite3_stmt *st, struct proc_cache *cache, int *cache_len, const char *socket, const char *pane, time_t now, enum pstate *out_st, int *needs_screen) {
+    *needs_screen = 1;
+    if (!st) return 0;
+    sqlite3_reset(st);
+    sqlite3_bind_text(st, 1, socket, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, pane, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) != SQLITE_ROW) return 0;
+    const char *harness = (const char *)sqlite3_column_text(st, 0);
+    long pid = (long)sqlite3_column_int64(st, 1);
+    int prompt_seen = sqlite3_column_int(st, 2);
+    int stop_seen = sqlite3_column_int(st, 3);
+    const char *last_event = (const char *)sqlite3_column_text(st, 4);
+    time_t at = (time_t)sqlite3_column_int64(st, 5);
+    int stop_blocked = sqlite3_column_int(st, 6);
+
+    if (!harness || (strcmp(harness, "claude") != 0 && strcmp(harness, "agy") != 0)) return 0;
+    if (!prompt_seen || !stop_seen || pid <= 1) return 0;
+    if (!cached_process_alive(cache, cache_len, pid, harness)) return 0;
+
+    enum pstate s = P_IDLE;
+    if (!strcmp(last_event, "UserPromptSubmit") || !strcmp(last_event, "PreInvocation") || !strcmp(last_event, "PostToolUse")) {
+        s = P_BUSY;
+    } else if (!strcmp(last_event, "Stop")) {
+        s = stop_blocked ? P_BUSY : P_IDLE;
+    } else if (!strcmp(last_event, "PermissionRequest")) {
+        s = P_PERMISSION;
+    }
+
+    const char *max_age_env = getenv("CNTCTR_HOOK_MAX_AGE_SEC");
+    int max_age = max_age_env ? atoi(max_age_env) : 120;
+    int is_agy = strcmp(harness, "agy") == 0;
+
+    if (is_agy && s != P_IDLE) {
+        *needs_screen = 1;
+        *out_st = s;
+        return 1;
+    }
+    if ((s == P_BUSY || s == P_PERMISSION) && (now - at > max_age)) {
+        *needs_screen = 1;
+        *out_st = s;
+        return 1;
+    }
+
+    *needs_screen = 0;
+    *out_st = s;
+    return 1;
+}
+
 static int tool_list(json_object *args, char **res) {
     (void)args;
     char *out;
@@ -1156,6 +1251,26 @@ static int tool_list(json_object *args, char **res) {
         return fail(res, out);
     char *opts = server_opts(), *list = strdup(""), *save;
     time_t now = time(NULL);
+    char *db_err = NULL;
+    sqlite3 *db = kb_timed(&db_err, 1000);
+    free(db_err);
+    char *sock = hook_socket();
+    if (!*sock) {
+        char *path = NULL;
+        if (TMUX(NULL, &path, "display", "-p", "#{socket_path}") == 0 && *path) {
+            free(sock);
+            sock = path;
+        } else {
+            free(path);
+        }
+    }
+    sqlite3_stmt *hook_st = NULL;
+    if (db && *sock) {
+        sqlite3_prepare_v2(db,
+            "SELECT harness,harness_pid,prompt_seen,stop_seen,last_event,at,stop_blocked "
+            "FROM hook_sessions WHERE socket=?1 AND pane=?2", -1, &hook_st, NULL);
+    }
+    struct proc_cache pcache[64]; int pcache_len = 0;
     for (char *line = strtok_r(out, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
         char *name = line, *harness = strchr(name, '\t');
         char *pane = harness ? strchr(harness + 1, '\t') : NULL;
@@ -1165,7 +1280,20 @@ static int tool_list(json_object *args, char **res) {
         *harness++ = *pane++ = *alive++ = *activity++ = '\0';
         long long act = atoll(activity);
         char *resets = NULL, *tasks = strdup("");
-        enum pstate st = pane_state(pane, &resets);
+        enum pstate st = P_IDLE;
+        int is_dead = !strcmp(alive, "dead");
+        int needs_screen = 1;
+        if (is_dead) {
+            st = P_DEAD;
+            needs_screen = 0;
+        } else if (db && *sock && hook_st) {
+            agent_hook_state(hook_st, pcache, &pcache_len, sock, pane, now, &st, &needs_screen);
+        }
+        if (needs_screen) {
+            char *tail = pane_tail(pane);
+            st = pane_state_screen(tail, &resets);
+            free(tail);
+        }
         for (const char *l = opts; *l; l += strcspn(l, "\n") + (l[strcspn(l, "\n")] == '\n')) {
             char id[9], val[32];
             if (sscanf(l, "@cntctr_to_%8[0-9a-f] %31s", id, val) != 2) continue;
@@ -1185,6 +1313,9 @@ static int tool_list(json_object *args, char **res) {
         free(resets);
         free(tasks);
     }
+    if (hook_st) sqlite3_finalize(hook_st);
+    if (db) sqlite3_close(db);
+    free(sock);
     free(out);
     free(opts);
     if (!*list) {
@@ -3260,26 +3391,6 @@ static void hook_alarm(int sig) {
     _exit(0);
 }
 
-static char *hook_socket(void) {
-    const char *socket = getenv("CNTCTR_TMUX"), *tmux = getenv("TMUX");
-    if (socket && *socket) return strdup(socket);
-    if (!tmux || !*tmux) return strdup("");
-    return strndup(tmux, strcspn(tmux, ","));
-}
-
-static int hook_process_alive(long pid, const char *harness) {
-    if (pid <= 1 || kill((pid_t)pid, 0) != 0) return 0;
-    char arg[32], *command = NULL;
-    snprintf(arg, sizeof arg, "%ld", pid);
-    int ok = 0;
-    if (run(NULL, &command, (const char *[]){"ps", "-p", arg, "-o", "comm=", NULL}) == 0) {
-        const char *base = strrchr(command, '/');
-        ok = !strcmp(base ? base + 1 : command, harness);
-    }
-    free(command);
-    return ok;
-}
-
 static long hook_parent(const char *harness) {
     char *procs = NULL;
     if (run(NULL, &procs, (const char *[]){"ps", "-A", "-o", "pid=,ppid=", NULL}) != 0) { free(procs); return 0; }
@@ -3343,13 +3454,14 @@ static int has_hooks(sqlite3 *db, const char *socket, const char *pane) {
 }
 
 static void record_hook(sqlite3 *db, const char *socket, const char *pane, const char *harness, long pid, const struct hook_event *event) {
-    const char *sql = "INSERT INTO hook_sessions(socket,pane,harness,session_id,harness_pid,last_event,at,prompt_seen,stop_seen) "
-        "VALUES(?1,?2,?3,?4,?5,?6,strftime('%s','now'),?7,?8) "
+    const char *sql = "INSERT INTO hook_sessions(socket,pane,harness,session_id,harness_pid,last_event,at,prompt_seen,stop_seen,stop_blocked) "
+        "VALUES(?1,?2,?3,?4,?5,?6,strftime('%s','now'),?7,?8,?10) "
         "ON CONFLICT(socket,pane) DO UPDATE SET "
         "prompt_seen=CASE WHEN ?9 OR hook_sessions.session_id!=excluded.session_id OR hook_sessions.harness!=excluded.harness OR hook_sessions.harness_pid!=excluded.harness_pid THEN excluded.prompt_seen ELSE max(hook_sessions.prompt_seen,excluded.prompt_seen) END,"
         "stop_seen=CASE WHEN ?9 OR hook_sessions.session_id!=excluded.session_id OR hook_sessions.harness!=excluded.harness OR hook_sessions.harness_pid!=excluded.harness_pid THEN excluded.stop_seen ELSE max(hook_sessions.stop_seen,excluded.stop_seen) END,"
         "wake_reserved=CASE WHEN ?9 OR hook_sessions.session_id!=excluded.session_id OR hook_sessions.harness!=excluded.harness OR hook_sessions.harness_pid!=excluded.harness_pid THEN 0 ELSE hook_sessions.wake_reserved END,"
         "wake_at=CASE WHEN ?9 OR hook_sessions.session_id!=excluded.session_id OR hook_sessions.harness!=excluded.harness OR hook_sessions.harness_pid!=excluded.harness_pid THEN NULL ELSE hook_sessions.wake_at END,"
+        "stop_blocked=excluded.stop_blocked,"
         "harness=excluded.harness,session_id=excluded.session_id,harness_pid=excluded.harness_pid,last_event=excluded.last_event,at=excluded.at";
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return;
@@ -3362,6 +3474,7 @@ static void record_hook(sqlite3 *db, const char *socket, const char *pane, const
     sqlite3_bind_int(st, 7, !strcmp(event->kind, "UserPromptSubmit") || !strcmp(event->kind, "PreInvocation"));
     sqlite3_bind_int(st, 8, !strcmp(event->kind, "Stop"));
     sqlite3_bind_int(st, 9, !strcmp(event->kind, "SessionStart"));
+    sqlite3_bind_int(st, 10, 0);
     sqlite3_step(st);
     sqlite3_finalize(st);
 }

@@ -37,7 +37,8 @@ static const char SCHEMA[] =
     " socket TEXT NOT NULL, pane TEXT NOT NULL, harness TEXT NOT NULL, session_id TEXT NOT NULL,"
     " harness_pid INTEGER NOT NULL, last_event TEXT NOT NULL, at INTEGER NOT NULL,"
     " prompt_seen INTEGER NOT NULL DEFAULT 0, stop_seen INTEGER NOT NULL DEFAULT 0,"
-    " wake_reserved INTEGER NOT NULL DEFAULT 0, wake_at INTEGER, PRIMARY KEY(socket,pane));"
+    " wake_reserved INTEGER NOT NULL DEFAULT 0, wake_at INTEGER,"
+    " stop_blocked INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(socket,pane));"
 
     "CREATE TABLE IF NOT EXISTS tools(project TEXT NOT NULL, name TEXT NOT NULL, version INTEGER NOT NULL,"
     " status TEXT NOT NULL, author TEXT NOT NULL, author_model TEXT NOT NULL DEFAULT '', description TEXT NOT NULL,"
@@ -79,15 +80,21 @@ static int exec2(sqlite3 *db, const char *sql, const char *a, const char *b) {
     return rc;
 }
 
-static int ensure_mail_column(sqlite3 *db, const char *name, const char *sql) {
+static int ensure_column(sqlite3 *db, const char *table, const char *name, const char *sql) {
     sqlite3_stmt *st = NULL;
-    int found = 0, rc = sqlite3_prepare_v2(db, "PRAGMA table_info(mail)", -1, &st, NULL);
+    char query[128];
+    snprintf(query, sizeof query, "PRAGMA table_info(%s)", table);
+    int found = 0, rc = sqlite3_prepare_v2(db, query, -1, &st, NULL);
     if (rc != SQLITE_OK) return rc;
     while ((rc = sqlite3_step(st)) == SQLITE_ROW)
         if (!strcmp((const char *)sqlite3_column_text(st, 1), name)) found = 1;
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) return rc;
     return found ? SQLITE_OK : sqlite3_exec(db, sql, NULL, NULL, NULL);
+}
+
+static int ensure_mail_column(sqlite3 *db, const char *name, const char *sql) {
+    return ensure_column(db, "mail", name, sql);
 }
 
 sqlite3 *kb_open_timeout(const char *path, char **err, int timeout_ms) {
@@ -108,6 +115,7 @@ sqlite3 *kb_open_timeout(const char *path, char **err, int timeout_ms) {
     if (rc == SQLITE_OK) rc = ensure_mail_column(db, "state", "ALTER TABLE mail ADD COLUMN state TEXT NOT NULL DEFAULT 'pending'");
     if (rc == SQLITE_OK) rc = ensure_mail_column(db, "staged_turn", "ALTER TABLE mail ADD COLUMN staged_turn TEXT");
     if (rc == SQLITE_OK) rc = ensure_mail_column(db, "presentations", "ALTER TABLE mail ADD COLUMN presentations INTEGER NOT NULL DEFAULT 0");
+    if (rc == SQLITE_OK) rc = ensure_column(db, "hook_sessions", "stop_blocked", "ALTER TABLE hook_sessions ADD COLUMN stop_blocked INTEGER NOT NULL DEFAULT 0");
     if (rc == SQLITE_OK) rc = sqlite3_exec(db, machine, NULL, NULL, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
     sqlite3_free(machine);

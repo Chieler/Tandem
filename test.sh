@@ -14,6 +14,20 @@ cat > "$TMPD/bin/cat" <<'EOF'
 exec /bin/cat "$@"
 EOF
 chmod +x "$TMPD/bin/cat"
+REAL_TMUX=$(command -v tmux)
+cat > "$TMPD/bin/tmux" <<EOF
+#!/bin/sh
+if [ -n "\$U24_CAPTURE_LOG" ]; then
+    for a in "\$@"; do
+        if [ "\$a" = "capture-pane" ]; then
+            echo "\$@" >> "\$U24_CAPTURE_LOG"
+            break
+        fi
+    done
+fi
+exec "$REAL_TMUX" "\$@"
+EOF
+chmod +x "$TMPD/bin/tmux"
 FSH='printf "\033[?2004h"; exec sh'   # a fake agent that is a shell, same reason
 export HOME="$TMPD/home"   # fleet tools keep their cache under ~/.cache
 export BIN INIT CNTCTR_ENTER_DELAY_MS=50 LC_ALL=en_US.UTF-8 PATH="$TMPD/bin:$PATH" CNTCTR_DB="$TMPD/kb.db" CNTCTR_MEM_URL=
@@ -295,9 +309,294 @@ EOF
     [ "$fail" -eq 0 ]; exit $?
 fi
 
+ensure_hook_launchers() {
+    mkdir -p "$TMPD/hook_harness"
+    if [ ! -x "$TMPD/hook_harness/claude" ]; then
+        cat > "$TMPD/hook_launcher.c" << 'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    if (argc < 2) return 1;
+    const char *bin = argv[1];
+    const char *harness = argv[2] ? argv[2] : "claude";
+    char line[4096];
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    puts("READY");
+    while (fgets(line, sizeof line, stdin)) {
+        char event[128] = "", path[2048] = "", pane[64] = "";
+        int n = sscanf(line, "%127s %2047s %63s", event, path, pane);
+        if (n < 2) continue;
+        pid_t child = fork();
+        if (!child) {
+            if (*pane) setenv("CNTCTR_PANE", pane, 1);
+            if (freopen(path, "r", stdin) == NULL) _exit(2);
+            if (freopen("/dev/null", "w", stdout) == NULL) _exit(3);
+            execl(bin, bin, "hook", harness, event, (char *)0);
+            _exit(127);
+        }
+        int st;
+        waitpid(child, &st, 0);
+        puts("DONE");
+    }
+    return 0;
+}
+EOF
+        cc -o "$TMPD/hook_harness/claude" "$TMPD/hook_launcher.c"
+        cc -o "$TMPD/hook_harness/agy" "$TMPD/hook_launcher.c"
+    fi
+}
+
+u22_run() {
+    ensure_hook_launchers
+    local c_in="$TMPD/u22_c_in" c_out="$TMPD/u22_c_out"
+    rm -f "$c_in" "$c_out"
+    mkfifo "$c_in" "$c_out"
+    "$TMPD/hook_harness/claude" "$BIN" claude < "$c_in" > "$c_out" &
+    local c_pid=$!
+    exec 7> "$c_in"
+    exec 8< "$c_out"
+    local ready; read -r ready <&8
+
+    local emit_c
+    emit_c() {
+        local ev=$1 fix=$2 p=$3
+        printf '%s %s %s\n' "$ev" "$(realpath "fixtures/hooks/$fix")" "$p" >&7
+        local d; read -r d <&8
+    }
+
+    local P; P=$(newpane u22_claude sh -c "$FSH")
+    t set -p -t "$P" @cntctr_harness claude
+    emit_c SessionStart claude-SessionStart.json "$P"
+    emit_c UserPromptSubmit claude-UserPromptSubmit-mail.json "$P"
+    emit_c Stop claude-Stop.json "$P"
+
+    # Part 1: prompt submitted makes list show busy when screen is idle
+    emit_c UserPromptSubmit claude-UserPromptSubmit-mail.json "$P"
+    local out; out=$(call "$P" list '{}')
+    check "U22 prompt event makes list show busy when screen is idle" "$(txt "$out")" "u22_claude claude $P alive busy"
+
+    # Part 2: passing Stop makes list show idle when screen is busy
+    t send-keys -t "$P" "printf '* Working (12s * esc to interrupt)\n'" Enter
+    expect_screen "U22 screen shows busy" "$P" "esc to interrupt"
+    emit_c Stop claude-Stop.json "$P"
+    out=$(call "$P" list '{}')
+    check "U22 passing Stop makes list show idle when screen is busy" "$(txt "$out")" "u22_claude claude $P alive idle"
+
+    # Part 3: Claude Code permission event makes list show permission when screen says otherwise
+    emit_c PermissionRequest claude-PermissionRequest.json "$P"
+    out=$(call "$P" list '{}')
+    check "U22 PermissionRequest makes list show permission when screen is busy" "$(txt "$out")" "u22_claude claude $P alive permission"
+
+    # Part 4: a Stop that cntctr blocked: busy
+    t send-keys -t "$P" C-c clear Enter
+    sleep 0.2
+    if ! sqlite3 -cmd '.timeout 5000' "$CNTCTR_DB" "UPDATE hook_sessions SET last_event='Stop', stop_blocked=1 WHERE pane='$P'" 2>/dev/null; then
+        bad "U22 blocked Stop shows busy when screen is idle" "  want: u22_claude claude $P alive busy" "  got:  schema missing stop_blocked"
+    else
+        out=$(call "$P" list '{}')
+        check "U22 blocked Stop shows busy when screen is idle" "$(txt "$out")" "u22_claude claude $P alive busy"
+    fi
+
+    exec 7>&-
+    exec 8<&-
+    kill $c_pid 2>/dev/null; wait $c_pid 2>/dev/null
+    t kill-window -t "$P" 2>/dev/null
+}
+
+u23_run() {
+    ensure_hook_launchers
+    local c_in="$TMPD/u23_c_in" c_out="$TMPD/u23_c_out"
+    rm -f "$c_in" "$c_out"
+    mkfifo "$c_in" "$c_out"
+    "$TMPD/hook_harness/claude" "$BIN" claude < "$c_in" > "$c_out" &
+    local c_pid=$!
+    exec 7> "$c_in"
+    exec 8< "$c_out"
+    local ready; read -r ready <&8
+
+    local emit_c
+    emit_c() {
+        local ev=$1 fix=$2 p=$3
+        printf '%s %s %s\n' "$ev" "$(realpath "fixtures/hooks/$fix")" "$p" >&7
+        local d; read -r d <&8
+    }
+
+    local REF; REF=$(newpane u23_ref)
+
+    # 1. Events say busy and the pane is dead: dead.
+    local P_DEAD; P_DEAD=$(newpane u23_dead sh -c "$FSH")
+    t set -p -t "$P_DEAD" @cntctr_harness claude
+    t set -p -t "$P_DEAD" remain-on-exit on
+    emit_c SessionStart claude-SessionStart.json "$P_DEAD"
+    emit_c UserPromptSubmit claude-UserPromptSubmit-mail.json "$P_DEAD"
+    emit_c Stop claude-Stop.json "$P_DEAD"
+    emit_c UserPromptSubmit claude-UserPromptSubmit-mail.json "$P_DEAD"
+    kill -9 "$(t display -p -t "$P_DEAD" '#{pane_pid}')" 2>/dev/null
+    for _ in $(seq 20); do [ "$(t display -p -t "$P_DEAD" '#{pane_dead}')" = "1" ] && break; sleep 0.05; done
+    local out; out=$(call "$REF" list '{}')
+    check "U23 dead pane with busy event shows dead" "$(txt "$out")" "u23_dead claude $P_DEAD dead"
+    refute "U23 dead pane does not show busy" "$(txt "$out")" "u23_dead claude $P_DEAD dead busy"
+    t kill-window -t "$P_DEAD" 2>/dev/null
+
+    # 2. Events say busy and recorded harness process is gone (shell is left): screen state
+    local g_in="$TMPD/u23_g_in" g_out="$TMPD/u23_g_out"
+    rm -f "$g_in" "$g_out"
+    mkfifo "$g_in" "$g_out"
+    "$TMPD/hook_harness/claude" "$BIN" claude < "$g_in" > "$g_out" &
+    local g_pid=$!
+    exec 5> "$g_in"
+    exec 6< "$g_out"
+    read -r ready <&6
+    local P_GONE; P_GONE=$(newpane u23_gone sh -c "$FSH")
+    t set -p -t "$P_GONE" @cntctr_harness claude
+    printf '%s %s %s\n' "SessionStart" "$(realpath fixtures/hooks/claude-SessionStart.json)" "$P_GONE" >&5
+    read -r ready <&6
+    printf '%s %s %s\n' "UserPromptSubmit" "$(realpath fixtures/hooks/claude-UserPromptSubmit-mail.json)" "$P_GONE" >&5
+    read -r ready <&6
+    printf '%s %s %s\n' "Stop" "$(realpath fixtures/hooks/claude-Stop.json)" "$P_GONE" >&5
+    read -r ready <&6
+    printf '%s %s %s\n' "UserPromptSubmit" "$(realpath fixtures/hooks/claude-UserPromptSubmit-mail.json)" "$P_GONE" >&5
+    read -r ready <&6
+    exec 5>&-
+    exec 6<&-
+    kill $g_pid 2>/dev/null; wait $g_pid 2>/dev/null
+    out=$(call "$REF" list '{}')
+    check "U23 gone harness process falls back to screen state idle" "$(txt "$out")" "u23_gone claude $P_GONE alive idle"
+    t kill-window -t "$P_GONE" 2>/dev/null
+
+    # 3. A busy event older than 2 minutes on a pane that shows a usage limit: limited
+    local P_LIM; P_LIM=$(newpane u23_lim sh -c "$FSH")
+    t set -p -t "$P_LIM" @cntctr_harness claude
+    emit_c SessionStart claude-SessionStart.json "$P_LIM"
+    emit_c UserPromptSubmit claude-UserPromptSubmit-mail.json "$P_LIM"
+    emit_c Stop claude-Stop.json "$P_LIM"
+    emit_c UserPromptSubmit claude-UserPromptSubmit-mail.json "$P_LIM"
+    t send-keys -t "$P_LIM" "printf 'Usage limit reached * continuing automatically at 10:40pm * esc to cancel\n'" Enter
+    expect_screen "U23 screen shows limit" "$P_LIM" "continuing automatically at 10:40pm"
+    out=$(call "$REF" list '{}')
+    check "U23 fresh busy event ignores limit screen" "$(txt "$out")" "u23_lim claude $P_LIM alive busy"
+    sq "$CNTCTR_DB" "UPDATE hook_sessions SET at=strftime('%s','now') - 130 WHERE pane='$P_LIM'"
+    out=$(call "$REF" list '{}')
+    check "U23 busy event older than 2 min reads limit screen" "$(txt "$out")" "u23_lim claude $P_LIM alive limited"
+    check "U23 resets parsed from limit screen" "$(txt "$out")" 'resets="10:40pm"'
+    t kill-window -t "$P_LIM" 2>/dev/null
+
+    # 4. Agy non-idle reads screen; agy idle does not read screen
+    local a_in="$TMPD/u23_a_in" a_out="$TMPD/u23_a_out"
+    rm -f "$a_in" "$a_out"
+    mkfifo "$a_in" "$a_out"
+    "$TMPD/hook_harness/agy" "$BIN" agy < "$a_in" > "$a_out" &
+    local a_pid=$!
+    exec 5> "$a_in"
+    exec 6< "$a_out"
+    read -r ready <&6
+    local P_AGY; P_AGY=$(newpane u23_agy sh -c "$FSH")
+    t set -p -t "$P_AGY" @cntctr_harness agy
+    printf '%s %s %s\n' "PreInvocation" "$(realpath fixtures/hooks/agy-PreInvocation-first.json)" "$P_AGY" >&5
+    read -r ready <&6
+    printf '%s %s %s\n' "Stop" "$(realpath fixtures/hooks/agy-Stop.json)" "$P_AGY" >&5
+    read -r ready <&6
+
+    # Test agy idle: screen says busy (esc to cancel), event says Stop passed -> idle
+    t send-keys -t "$P_AGY" "printf '* Working (12s * esc to cancel)\n'" Enter
+    expect_screen "U23 agy screen shows busy" "$P_AGY" "esc to cancel"
+    out=$(call "$REF" list '{}')
+    check "U23 agy idle ignores busy screen" "$(txt "$out")" "u23_agy agy $P_AGY alive idle"
+
+    # Test agy non-idle: screen says permission prompt, event says PreInvocation -> reads screen -> permission
+    t send-keys -t "$P_AGY" C-c clear Enter
+    sleep 0.1
+    t send-keys -t "$P_AGY" "printf 'Do you want to proceed?\n'" Enter
+    expect_screen "U23 agy screen shows permission" "$P_AGY" "Do you want to proceed?"
+    printf '%s %s %s\n' "PreInvocation" "$(realpath fixtures/hooks/agy-PreInvocation-first.json)" "$P_AGY" >&5
+    read -r ready <&6
+    out=$(call "$REF" list '{}')
+    check "U23 agy non-idle reads screen permission" "$(txt "$out")" "u23_agy agy $P_AGY alive permission"
+
+    exec 5>&-
+    exec 6<&-
+    kill $a_pid 2>/dev/null; wait $a_pid 2>/dev/null
+    t kill-window -t "$P_AGY" 2>/dev/null
+
+    exec 7>&-
+    exec 8<&-
+    kill $c_pid 2>/dev/null; wait $c_pid 2>/dev/null
+    t kill-window -t "$REF" 2>/dev/null
+}
+
+u24_run() {
+    ensure_hook_launchers
+    local c_in="$TMPD/u24_c_in" c_out="$TMPD/u24_c_out"
+    rm -f "$c_in" "$c_out"
+    mkfifo "$c_in" "$c_out"
+    "$TMPD/hook_harness/claude" "$BIN" claude < "$c_in" > "$c_out" &
+    local c_pid=$!
+    exec 7> "$c_in"
+    exec 8< "$c_out"
+    local ready; read -r ready <&8
+
+    local emit_c
+    emit_c() {
+        local ev=$1 fix=$2 p=$3
+        printf '%s %s %s\n' "$ev" "$(realpath "fixtures/hooks/$fix")" "$p" >&7
+        local d; read -r d <&8
+    }
+
+    local panes=""
+    for i in $(seq 1 32); do
+        local p; p=$(newpane "u24_$i")
+        t set -p -t "$p" @cntctr_harness claude
+        emit_c SessionStart claude-SessionStart.json "$p"
+        emit_c UserPromptSubmit claude-UserPromptSubmit-mail.json "$p"
+        emit_c Stop claude-Stop.json "$p"
+        panes="$panes $p"
+    done
+
+    export U24_CAPTURE_LOG="$TMPD/u24_capture.log"
+    rm -f "$U24_CAPTURE_LOG"
+
+    local first_pane; first_pane=$(echo "$panes" | awk '{print $1}')
+    local start_ms end_ms elapsed out
+    start_ms=$(python3 -c "import time; print(int(time.time()*1000))")
+    out=$(call "$first_pane" list '{}')
+    end_ms=$(python3 -c "import time; print(int(time.time()*1000))")
+    elapsed=$((end_ms - start_ms))
+
+    check "U24 list answers in under 1 s" "$((elapsed < 1000))" 1
+    local captures=0
+    [ -f "$U24_CAPTURE_LOG" ] && captures=$(wc -l < "$U24_CAPTURE_LOG" | tr -d ' ')
+    same "U24 zero capture-pane calls for 32 hook agents" "$captures" 0
+    same "U24 32 fake agents listed" "$(printf '%s' "$(txt "$out")" | grep -c '^u24_')" 32
+
+    unset U24_CAPTURE_LOG
+    for p in $panes; do
+        t kill-window -t "$p" 2>/dev/null
+    done
+    exec 7>&-
+    exec 8<&-
+    kill $c_pid 2>/dev/null; wait $c_pid 2>/dev/null
+}
+
+if [ "${ONLY:-}" = u22 ] || [ "${ONLY:-}" = u23 ] || [ "${ONLY:-}" = u24 ] || [ "${ONLY:-}" = u22-u24 ]; then
+    case $ONLY in
+        u22) u22_run ;;
+        u23) u23_run ;;
+        u24) u24_run ;;
+        u22-u24) u22_run; u23_run; u24_run ;;
+    esac
+    printf '%d passed, %d failed\n' "$pass" "$fail"
+    [ "$fail" -eq 0 ]; exit $?
+fi
+
 if [ "${ONLY:-}" != "m3" ]; then
 
 u28_run
+u22_run
+u23_run
+u24_run
 
 # ---- MCP protocol ----
 out=$(rpc "$INIT")
