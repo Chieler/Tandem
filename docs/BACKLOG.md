@@ -4,6 +4,7 @@ Releases:
 - `v0.1.0`: tag on main, before fleet tools.
 - `0.2.0`: on main, tag `v0.2.0` (2026-11-08); live in all harnesses as `~/.local/bin/cntctr-0.2.0`.
 - `0.3.0`: on main, tag `v0.3.0` (2026-11-12); live in all harnesses as `~/.local/bin/cntctr-0.3.0`.
+- `0.4.0`: on main, tag `v0.4.0` (2026-11-13); Claude Code hooks, agents scoped by spawn tree.
 Source: orchestrator feedback, 2026-11-07, ranked by cost.
 
 ## 0.2.0
@@ -50,6 +51,22 @@ Source: orchestrator feedback, 2026-11-07, ranked by cost.
 - Reproduce the root cause of truncated pastes with a real Claude Code pane during adversarial review.
 - Clean stale review findings from shared insights against the released code.
 - [ ] Shared resource claims for rate-limited APIs (maybe a fleet tool, not core)
+
+## 0.4.0
+- [x] Claude Code hooks: waiting mail attached at the next prompt, turn held at its end for a wake; hooks never type into a pane or answer a permission prompt
+- [x] `@cntctr_srv` pane marker: hook paths act only when a live 0.4.0 server serves the pane; schema stamp never lowered
+- [x] `list` shows owner and directory, your own spawn tree by default; send, gather and kill outside the tree need `cross=true`
+- [x] `from=` never overrides the caller's own pane
+
+### Open after 0.4.0
+- Toolcheck reviewers share the author's tree: the author can message or kill a pending reviewer without cross (commit e929339 had kept them apart).
+- Any agent in a tree can kill the tree's root, a hand-started session, without cross; refuse a target with no `@cntctr_parent` unless cross is set.
+- An orphan's `to=parent` error says "you have no parent"; name the dead parent and point to the root by name.
+- `@cntctr_root` is set after new-window returns; set it in the start command like `@cntctr_name`.
+- `@cntctr_srv`: a dead marker is replaced by an unconditional set (last writer wins); no re-claim after its owner leaves; the COMMIT-fail branch is untested.
+- Any caller can mark any message id answered.
+- Hooks point at a versioned binary: re-run `cntctr hooks install` after each upgrade.
+- agy hooks (`~/.gemini/config/hooks.json`); Codex hooks in 0.5.0 (UserPromptSubmit and Stop only, command on an unversioned path so trust survives upgrades).
 
 ## Done
 - [x] Claude Code 30-minute idle timeout: cntctr entry `timeout` 3 h (2026-11-07)
