@@ -1309,6 +1309,40 @@ EOF
     t kill-window -t "$N" 2>/dev/null
 }
 
+# f6_3: a multi-line text sent to a pane in copy-mode arrives as one bracketed paste and one Enter
+f6_3() {
+    local S R r n got
+    cat > "$TMPD/f6_reader.py" << 'EOF2'
+import os, sys, tty
+log = sys.argv[1]
+tty.setraw(0)
+os.write(1, b'\x1b[?2004h')
+open(log, 'wb').close()
+while True:
+    data = os.read(0, 4096)
+    if not data: break
+    with open(log, 'ab') as f: f.write(data)
+EOF2
+    S=$(newpane f6_snd3)
+    R=$(newpane f6_rd python3 "$TMPD/f6_reader.py" "$TMPD/f6_3.log")
+    for n in $(seq 50); do [ "$(t display -p -t "$R" '#{bracket_paste_flag}')" = 1 ] && break; sleep 0.1; done
+    t copy-mode -t "$R"
+    same "F3 the receiver's pane is in copy-mode" "$(t display -p -t "$R" '#{pane_in_mode}')" 1
+    r=$(call "$S" send '{"to":"f6_rd","text":"first line\nsecond line"}')
+    check "F3 the send succeeds" "$(txt "$r")" "sent id="
+    sleep 0.3
+    same "F3 the pane left copy-mode" "$(t display -p -t "$R" '#{pane_in_mode}')" 0
+    python3 - "$TMPD/f6_3.log" << 'EOF2' && ok_ || bad "F3 the whole text is inside one paste, followed by exactly one Enter"
+import sys
+s = open(sys.argv[1], 'rb').read()
+a, b = s.find(b'\x1b[200~'), s.find(b'\x1b[201~')
+assert s.count(b'\x1b[200~') == 1 and s.count(b'\x1b[201~') == 1 and 0 <= a < b
+body = s[a + 6:b]
+assert b'first line\rsecond line' in body and body.rstrip().endswith(b']'), body
+assert s[:a] == b'' and s[b + 6:] == b'\r', s
+EOF2
+}
+
 u5p6_run() {
     export CNTCTR_PASTE_WAIT_MS=100
     local f

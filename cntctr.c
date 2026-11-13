@@ -722,17 +722,27 @@ static char *paste(const char *pane, const char *text, int bracketed) {
     deadline.tv_sec += wait / 1000;
     deadline.tv_nsec += (wait % 1000) * 1000000L;
     if (deadline.tv_nsec >= 1000000000L) { deadline.tv_sec++; deadline.tv_nsec -= 1000000000L; }
+    int left_mode = 0;
     for (;;) {
         char *flags = NULL;
         if (TMUX(NULL, &flags, "display", "-p", "-t", pane, "#{pane_input_off} #{bracket_paste_flag} #{pane_in_mode}") != 0) {
             free(flags);
             return fmt("paste blocked: cannot read pane input state");
         }
-        int off = -1, mode = -1, scrolled = 0;
-        int valid = sscanf(flags, "%d %d %d", &off, &mode, &scrolled) == 3;
+        int off = -1, flag = -1, in_mode = 0;
+        int valid = sscanf(flags, "%d %d %d", &off, &flag, &in_mode) == 3;
         free(flags);
         if (!valid || off) return fmt("paste blocked: pane input is disabled or unknown");
-        if (!bracketed || !strchr(text, '\n') || mode || scrolled) break;   /* copy-mode hides the program's flag: do not guess */
+        if (!bracketed || !strchr(text, '\n')) break;   /* a one-line text needs no brackets */
+        if (in_mode) {
+            /* In copy-mode tmux reports the mode screen's bracketed-paste flag and `paste-buffer -p` sends no brackets,
+             * so each newline of a multi-line text would act as Enter. Leave the mode once, then read the flags again. */
+            if (left_mode) return fmt("paste blocked: pane stays in a mode");
+            left_mode = 1;
+            free(TMUXE(NULL, "send-keys", "-X", "-t", pane, "cancel"));
+            continue;
+        }
+        if (flag) break;
         clock_gettime(CLOCK_MONOTONIC, &now);
         if (now.tv_sec > deadline.tv_sec || (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec))
             return fmt("paste blocked: bracketed paste is disabled");
