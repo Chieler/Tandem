@@ -63,7 +63,9 @@ To upgrade or roll back, point the same entries at another version and restart t
 Raise each harness's tool timeout above the longest blocking wait you plan to use:
 
 - Claude Code: aborts a tool call that sends nothing for 30 minutes. Add `"timeout": 10800000` (ms) to the cntctr entry in `~/.claude.json`, or set `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` (ms, 0 disables) for every server.
-- Codex: in `~/.codex/config.toml`, under `[mcp_servers.cntctr]`, set `tool_timeout_sec = 3600`.
+- Codex: in `~/.codex/config.toml`, under `[mcp_servers.cntctr]`, set `tool_timeout_sec = 3600`. For hand-started Codex sessions, also set `env_vars = ["TMUX", "TMUX_PANE"]` so the MCP server can identify the pane. Spawned Codex agents use their own `CNTCTR_*` environment override.
+
+Install Codex hooks with `cntctr hooks install codex`, then start Codex and trust the cntctr hooks on the "Hooks need review" screen.
 - agy: no MCP timeout setting found; keep blocking waits short or use async sends.
 
 ## Use

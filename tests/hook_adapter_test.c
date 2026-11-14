@@ -5,6 +5,8 @@
 
 struct fixture { const char *file, *harness, *event, *prompt, *reason; int loop; };
 static const struct fixture fixtures[] = {
+    {"claude-UserPromptSubmit-mail.json", "codex", "UserPromptSubmit", "[cntctr mail id=42] body attached; if you see none, call board", "", 0},
+    {"claude-Stop-active.json", "codex", "Stop", "", "", 1},
     {"claude-SessionStart.json", "claude", "SessionStart", "", "", 0},
     {"claude-UserPromptSubmit-mail.json", "claude", "UserPromptSubmit", "[cntctr mail id=42] body attached; if you see none, call board", "", 0},
     {"claude-UserPromptSubmit-other.json", "claude", "UserPromptSubmit", "please look at [cntctr mail id=42] body attached; if you see none, call board", "", 0},
@@ -35,6 +37,10 @@ int main(void) {
         if (input) json_object_put(input);
     }
     struct answer_case { const char *h, *event, *text, *expected; enum hook_answer_kind kind; } answers[] = {
+        {"codex", "UserPromptSubmit", "hello", "{\"hookSpecificOutput\":{\"hookEventName\":\"UserPromptSubmit\",\"additionalContext\":\"hello\"}}", HOOK_ATTACH},
+        {"codex", "Stop", "reminder", "{\"decision\":\"block\",\"reason\":\"reminder\"}", HOOK_BLOCK},
+        {"codex", "Stop", "hello", "{}", HOOK_ATTACH},
+        {"codex", "SessionStart", "hello", "{}", HOOK_ATTACH},
         {"claude", "SessionStart", "The session context code word is CRIMSON-FALCON.", "{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"The session context code word is CRIMSON-FALCON.\"}}", HOOK_ATTACH},
         {"claude", "UserPromptSubmit", "MANDATORY: State the first word and the last word of the body below immediately without running any tools or shell commands:\n<content of body.txt>", "{\"hookSpecificOutput\":{\"hookEventName\":\"UserPromptSubmit\",\"additionalContext\":\"MANDATORY: State the first word and the last word of the body below immediately without running any tools or shell commands:\\n<content of body.txt>\"}}", HOOK_ATTACH},
         {"claude", "Stop", "You have mail. Run: cat /home/u/mail.txt and state the word.", "{\"decision\":\"block\",\"reason\":\"You have mail. Run: cat /home/u/mail.txt and state the word.\"}", HOOK_BLOCK},
@@ -50,6 +56,11 @@ int main(void) {
         if (a) json_object_put(a);
         if (want) json_object_put(want);
     }
+    char oversized[9000];
+    memset(oversized, 'x', sizeof oversized - 1); oversized[sizeof oversized - 1] = 0;
+    json_object *large = hook_answer("codex", "UserPromptSubmit", HOOK_ATTACH, oversized);
+    if (!large || json_object_object_length(large)) { fprintf(stderr, "FAIL codex size cap\n"); fail++; }
+    if (large) json_object_put(large);
     printf("ADAPTER: %zu fixtures, %d failures\n",sizeof fixtures/sizeof *fixtures,fail);
     return fail != 0;
 }

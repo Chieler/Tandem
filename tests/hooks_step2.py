@@ -1,4 +1,4 @@
-import json, os, pathlib, select, sqlite3, subprocess, sys, time
+import shutil, json, os, pathlib, select, sqlite3, subprocess, sys, time
 
 binary, root = sys.argv[1:]
 root = pathlib.Path(root)
@@ -34,6 +34,7 @@ def pane(name, command='cat'):
     v=tmux('new-window','-d','-n',name,'-P','-F','#{pane_id}',command)
     tmux('set','-p','-t',v,'@cntctr_name',name)
     tmux('set','-p','-t',v,'@cntctr_harness','claude')
+    tmux('set','-p','-t',v,'@cntctr_srv',str(os.getpid()))
     return v
 
 def call(source, tool, arguments):
@@ -95,13 +96,8 @@ check('U4 codex hook neutral',response('codex','Stop',pathlib.Path('fixtures/hoo
 db=sqlite3.connect(legacy)
 try: n=db.execute("select count(*) from hook_sessions where harness='codex'").fetchone()[0]
 except sqlite3.Error:n=-1
-db.close();check('U4 codex records no session',n==0)
-home=pathlib.Path(env['HOME'])
-def files(): return {str(p.relative_to(home)):p.read_bytes() for p in home.rglob('*') if p.is_file()}
-home_before=files()
-p=subprocess.run([binary,'hooks','install','codex'],input=b'',stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env,timeout=3)
-check('U4 codex hook install refused',p.returncode!=0)
-check('U4 codex hook install changes no file',files()==home_before)
+db.execute("delete from hook_sessions where harness='codex'");db.commit()
+db.close();check('U4 codex records session',n==1)
 
 # A live executable named claude remains the parent of every hook command.
 source=root/'claude.c';source.write_text(r"""
@@ -148,6 +144,45 @@ parent.stdin.close(); time.sleep(.2)
 check('U5 exited unreaped harness has no hooks',status()=='no')
 parent.wait(timeout=3)
 check('U5 dead harness has no hooks',status()=='no')
+# Codex has no SessionStart; prompt and Stop establish the hook channel.
+env['CNTCTR_DB']=str(root/'codex.db')
+codex_launcher=str(root/'codex');shutil.copy2(launcher,codex_launcher)
+parent=subprocess.Popen([codex_launcher,binary,'codex'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True,env=env)
+check('U4 codex prompt accepted',emit('UserPromptSubmit','claude-UserPromptSubmit-mail.json'))
+check('U4 codex stop accepted',emit('Stop','claude-Stop.json'))
+check('U4 codex prompt and stop establish hooks',status()=='yes')
+tmux('set','-p','-t',target,'@cntctr_harness','codex')
+sender4=pane('codex_sender')
+sent=call(sender4,'send',{'to':'hook_claude','text':'codex-hook-envelope','cross':True})
+time.sleep(.3)
+screen=tmux('capture-pane','-p','-t',target)
+check('U4 idle codex gets one-line wake', '[cntctr mail id=' in screen and 'body attached; if you see none, call board' in screen and 'codex-hook-envelope' not in screen and not sent['result'].get('isError'))
+import re
+wake=re.search(r'\[cntctr mail id=[^\n]+body attached; if you see none, call board',screen)
+promptfile=root/'codex-wake.json'
+promptfile.write_text(json.dumps({'session_id':'SESSION-1','prompt':wake.group(0) if wake else ''}))
+parent.stdin.write('UserPromptSubmit '+str(promptfile)+'\n');parent.stdin.flush()
+answer=json.loads(parent.stdout.readline());done=parent.stdout.readline().strip()
+check('U4 codex prompt receives envelope',done=='DONE' and answer.get('hookSpecificOutput',{}).get('hookEventName')=='UserPromptSubmit' and 'codex-hook-envelope' in answer.get('hookSpecificOutput',{}).get('additionalContext',''))
+tmux('set','-p','-t',target,'@cntctr_parent',sender4)
+call(target,'board',{})
+sent=call(sender4,'send',{'to':'hook_claude','text':'codex open task','cross':True})
+task=sent['result']['content'][0]['text'].split('sent id=')[-1].strip()
+stopfile=root/'codex-stop.json'
+stopfile.write_text(json.dumps({'session_id':'SESSION-1','stop_hook_active':False}))
+parent.stdin.write('Stop '+str(stopfile)+'\n');parent.stdin.flush()
+answer=json.loads(parent.stdout.readline());done=parent.stdout.readline().strip()
+check('U4 codex Stop blocks for open task',done=='DONE' and answer.get('decision')=='block' and task in answer.get('reason',''))
+stopfile.write_text(json.dumps({'session_id':'SESSION-1','stop_hook_active':True}))
+parent.stdin.write('Stop '+str(stopfile)+'\n');parent.stdin.flush()
+answer=json.loads(parent.stdout.readline());done=parent.stdout.readline().strip()
+board=call(sender4,'board',{})
+check('U4 codex second Stop passes and tells parent',done=='DONE' and answer=={} and 'stopped without a reply to task '+task in json.dumps(board))
+parent.stdin.close();parent.wait(timeout=3)
+tmux('set','-pu','-t',target,'@cntctr_parent')
+tmux('set','-p','-t',target,'@cntctr_harness','claude')
+env['CNTCTR_DB']=legacy
+
 # Background Claude hooks can recover the pane from the live ancestor's session.
 sessions=root/'claude-sessions'; sessions.mkdir()
 fallback_env=env.copy(); fallback_env.pop('CNTCTR_PANE',None); fallback_env.pop('TMUX_PANE',None)
@@ -197,7 +232,7 @@ for name in ('hook_codex','hook_partial'):
         time.sleep(.05)
     e=env.copy(); e['CNTCTR_PANE']=target2
     if name=='hook_partial': response('claude','SessionStart',fixture,{'CNTCTR_PANE':target2})
-    result=call(sender,'send',{'to':name,'text':'complete envelope '+name})
+    result=call(sender,'send',{'to':name,'text':'complete envelope '+name,'cross':True})
     time.sleep(.2)
     data=log.read_bytes() if log.exists() else b''
     check(('U4' if name=='hook_codex' else 'U5')+' full envelope delivered',b'[cntctr from=' in data and ('complete envelope '+name).encode() in data and b'[cntctr end id=' in data and not result['result'].get('isError'))

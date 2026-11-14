@@ -185,19 +185,30 @@ data = json.loads(path.read_text())
 check('U28 agy: install writes no PreToolUse entry', r.returncode == 0 and not [1 for ev, c in commands(data, 'agy') if ev == 'PreToolUse'])
 check('U28 agy: only PreInvocation and Stop', sorted(set(ev for ev, c in commands(data, 'agy'))) == ['PreInvocation', 'Stop'])
 
-# codex is refused and nothing is written
+# Codex uses Claude's grouped hook format and a bounded timeout.
 home, exe = new_home()
+path = home / '.codex/hooks.json'
+path.parent.mkdir(parents=True)
+other_hook = {'hooks': [{'type': 'command', 'command': 'other-hook'}]}
+path.write_text(json.dumps({'hooks': {'Stop': [other_hook]}}))
+r = run(home, exe, 'install', 'codex')
+data = json.loads(path.read_text()) if path.exists() else {}
+check('U28 codex install and trust instruction', r.returncode == 0 and 'trust' in r.stdout.lower())
+hooks = data.get('hooks', {})
+check('U28 codex events', set(hooks) == {'UserPromptSubmit', 'Stop'})
+check('U28 codex commands and timeout', all(any(entry.get('timeout') == 5 and f'hook codex {event}' in entry.get('command', '') for group in groups for entry in group['hooks']) for event, groups in hooks.items()) and len(hooks) == 2)
+check('U28 codex status', 'codex' in run(home, exe, 'status').stdout)
+check('U28 codex install idempotent', run(home, exe, 'install', 'codex').returncode == 0 and json.loads(path.read_text()) == data)
+check('U28 codex remove', run(home, exe, 'remove', 'codex').returncode == 0 and json.loads(path.read_text()).get('hooks') == {'Stop': [other_hook]})
 before = listing(home)
-for verb in ('install', 'remove'):
-    r = run(home, exe, verb, 'codex')
-    check(f'U28 codex {verb} refused', r.returncode != 0 and 'codex' in r.stderr + r.stdout)
-check('U28 codex changes no file', listing(home) == before)
 r = run(home, exe, 'install', 'nobody')
 check('U28 unknown harness refused', r.returncode != 0 and listing(home) == before)
 
 # a binary that is not named cntctr cannot make entries that remove would recognise
 home, exe = new_home()
-r = subprocess.run([binary, 'hooks', 'install', 'claude'], env=env_for(home), capture_output=True, text=True, timeout=20)
+other = home / 'not-cntctr'
+shutil.copy2(binary, other)
+r = subprocess.run([other, 'hooks', 'install', 'claude'], env=env_for(home), capture_output=True, text=True, timeout=20)
 check('U28 binary not named cntctr is refused', r.returncode != 0 and not (home / HARNESS['claude'][0]).exists())
 
 # status: installed, seen running, binary path, whether it is this binary

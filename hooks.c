@@ -24,11 +24,12 @@ static int int_field(json_object *input, const char *key) {
     return input && json_object_object_get_ex(input, key, &v) ? json_object_get_int(v) : 0;
 }
 int hook_parse(const char *harness, const char *event, json_object *input, struct hook_event *out) {
-    int claude = !strcmp(harness, "claude"), agy = !strcmp(harness, "agy");
+    int codex = !strcmp(harness, "codex"), claude = !strcmp(harness, "claude") || codex, agy = !strcmp(harness, "agy");
     if ((!claude && !agy) || !input || !json_object_is_type(input, json_type_object)) return 0;
     const char *const c[] = {"SessionStart", "UserPromptSubmit", "Stop", "PermissionRequest", "PostToolUse", "PreToolUse", NULL};
     const char *const a[] = {"SessionStart", "PreInvocation", "Stop", "PostToolUse", NULL};
-    const char *const *allowed = claude ? c : a;
+    const char *const x[] = {"UserPromptSubmit", "Stop", NULL};
+    const char *const *allowed = codex ? x : claude ? c : a;
     int known = 0;
     for (int i = 0; allowed[i]; i++) if (!strcmp(allowed[i], event)) known = 1;
     if (!known) return 0;
@@ -42,12 +43,12 @@ int hook_parse(const char *harness, const char *event, json_object *input, struc
 }
 json_object *hook_answer(const char *harness, const char *event, enum hook_answer_kind kind, const char *text) {
     json_object *out = json_object_new_object();
-    int claude = !strcmp(harness, "claude"), agy = !strcmp(harness, "agy");
+    int codex = !strcmp(harness, "codex"), claude = !strcmp(harness, "claude") || codex, agy = !strcmp(harness, "agy");
     if ((!claude && !agy) || !text || kind == HOOK_NEUTRAL) return out;
     if (kind == HOOK_BLOCK && !strcmp(event, "Stop")) {
         json_object_object_add(out, "decision", json_object_new_string(claude ? "block" : "continue"));
         json_object_object_add(out, "reason", json_object_new_string(text));
-    } else if (kind == HOOK_ATTACH && claude && (!strcmp(event, "SessionStart") || !strcmp(event, "UserPromptSubmit"))) {
+    } else if (kind == HOOK_ATTACH && claude && ((!codex && !strcmp(event, "SessionStart")) || !strcmp(event, "UserPromptSubmit"))) {
         json_object *specific = json_object_new_object();
         json_object_object_add(specific, "hookEventName", json_object_new_string(event));
         json_object_object_add(specific, "additionalContext", json_object_new_string(text));
@@ -70,9 +71,11 @@ json_object *hook_answer(const char *harness, const char *event, enum hook_answe
 
 struct target { const char *name, *rel; const char *const *events; };
 static const char *const CLAUDE_EVENTS[] = {"SessionStart", "UserPromptSubmit", "Stop", "PermissionRequest", "PostToolUse", NULL};
+static const char *const CODEX_EVENTS[] = {"UserPromptSubmit", "Stop", NULL};
 static const char *const AGY_EVENTS[] = {"PreInvocation", "Stop", NULL};   /* never PreToolUse: a hook printing {} denies every tool */
 static const struct target TARGETS[] = {
     {"claude", ".claude/settings.json", CLAUDE_EVENTS},
+    {"codex", ".codex/hooks.json", CODEX_EVENTS},
     {"agy", ".gemini/config/hooks.json", AGY_EVENTS},
 };
 
@@ -219,7 +222,7 @@ static void sweep_events(struct sweep *s, json_object *obj) {
 
 static void sweep_root(struct sweep *s, json_object *root) {
     json_object *hooks;
-    if (!strcmp(s->t->name, "claude")) {
+    if (strcmp(s->t->name, "agy")) {
         if (json_object_object_get_ex(root, "hooks", &hooks) && json_object_is_type(hooks, json_type_object)) sweep_events(s, hooks);
         return;
     }
@@ -244,7 +247,7 @@ static json_object *child(json_object *parent, const char *key, json_type type) 
 
 /* 0 ok, -1 when the file's own structure is in the way */
 static int add_missing(struct sweep *s, json_object *root) {
-    int claude = !strcmp(s->t->name, "claude");
+    int codex = !strcmp(s->t->name, "codex"), claude = strcmp(s->t->name, "agy") != 0;
     json_object *top = child(root, claude ? "hooks" : "cntctr", json_type_object);
     for (int i = 0; s->t->events[i]; i++) {
         if (s->seen[i]) continue;
@@ -254,6 +257,7 @@ static int add_missing(struct sweep *s, json_object *root) {
         json_object *entry = json_object_new_object();
         json_object_object_add(entry, "type", json_object_new_string("command"));
         json_object_object_add(entry, "command", json_object_new_string(cmd));
+        if (codex) json_object_object_add(entry, "timeout", json_object_new_int(5));
         free(cmd);
         if (claude) {
             json_object *group = json_object_new_object(), *list = json_object_new_array();
@@ -395,7 +399,7 @@ static void status_one(const struct target *t, const char *home, const char *sel
 int hooks_admin(int argc, char **argv, int (*seen)(const char *harness)) {
     const char *verb = argc > 2 ? argv[2] : "", *harness = argc > 3 ? argv[3] : "";
     int status = !strcmp(verb, "status"), install = !strcmp(verb, "install");
-    if (!status && !install && strcmp(verb, "remove")) { fprintf(stderr, "usage: cntctr hooks install|remove claude|agy | cntctr hooks status\n"); return 2; }
+    if (!status && !install && strcmp(verb, "remove")) { fprintf(stderr, "usage: cntctr hooks install|remove claude|agy|codex | cntctr hooks status\n"); return 2; }
     const char *home = getenv("HOME");
     if (!home || *home != '/') { fprintf(stderr, "HOME is not set to an absolute path\n"); return 1; }
     char self[PATH_MAX] = "";
@@ -404,14 +408,15 @@ int hooks_admin(int argc, char **argv, int (*seen)(const char *harness)) {
         for (size_t i = 0; i < sizeof TARGETS / sizeof *TARGETS; i++) status_one(&TARGETS[i], home, have_self ? self : "", seen);
         return 0;
     }
-    if (!strcmp(harness, "codex")) { fprintf(stderr, "cntctr hooks: codex hooks are not supported in 0.4.0; codex stays on the tmux path\n"); return 1; }
     const struct target *t = NULL;
     for (size_t i = 0; i < sizeof TARGETS / sizeof *TARGETS; i++) if (!strcmp(TARGETS[i].name, harness)) t = &TARGETS[i];
-    if (!t || argc != 4) { fprintf(stderr, "usage: cntctr hooks install|remove claude|agy\n"); return 2; }
+    if (!t || argc != 4) { fprintf(stderr, "usage: cntctr hooks install|remove claude|agy|codex\n"); return 2; }
     size_t n = strlen(self);
     if (install && (!have_self || n < 8 || strcmp(self + n - 7, "/cntctr"))) {
         fprintf(stderr, "cntctr hooks install: the running binary (%s) must be named cntctr, or remove could not recognise its entries\n", have_self ? self : "unknown path");
         return 1;
     }
-    return edit(t, home, self, install);
+    int rc = edit(t, home, self, install);
+    if (!rc && install && !strcmp(harness, "codex")) printf("Start codex once and trust the cntctr hooks on the Hooks need review screen.\n");
+    return rc;
 }

@@ -32,7 +32,7 @@
 #include "fleet.h"
 #include "hooks.h"
 
-#define CNTCTR_VERSION "0.4.1"
+#define CNTCTR_VERSION "0.5.0"
 
 static pthread_mutex_t out_mu = PTHREAD_MUTEX_INITIALIZER;   /* one JSON line at a time on stdout */
 static pthread_mutex_t live_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -633,7 +633,14 @@ static char *resolve_target(const char *to, char **err) {
     if (strcmp(to, "parent") == 0) {
         if (is_reviewer(caller_pane)) { *err = fmt("reviewers answer with tool_verdict"); return NULL; }
         char *p;
-        if (TMUX(NULL, &p, "show", "-pqv", "-t", caller_pane, "@cntctr_parent") == 0 && *p && pane_alive(p)) return p;
+        if (TMUX(NULL, &p, "show", "-pqv", "-t", caller_pane, "@cntctr_parent") == 0 && *p) {
+            if (pane_alive(p)) return p;
+            char *pn = pane_name(p), *root = NULL, *rn = NULL;
+            if (TMUX(NULL, &root, "show", "-pqv", "-t", caller_pane, "@cntctr_root") == 0 && *root && pane_alive(root)) rn = pane_name(root);
+            *err = rn && *rn ? fmt("your parent %s is gone; your root is %s (send to=\"%s\")", pn && *pn ? pn : p, rn, rn) : fmt("your parent %s is gone", pn && *pn ? pn : p);
+            free(pn); free(root); free(rn); free(p);
+            return NULL;
+        }
         free(p);
         *err = fmt("you have no parent (only spawned agents have one)");
         return NULL;
@@ -1280,7 +1287,7 @@ static enum pstate hook_event_state(const char *harness, const char *last_event,
     }
     const char *max_age_env = getenv("CNTCTR_HOOK_MAX_AGE_SEC");
     int max_age = max_age_env ? atoi(max_age_env) : 120;
-    *needs_screen = (!strcmp(harness, "agy") && s != P_IDLE) || ((s == P_BUSY || s == P_PERMISSION) && now - at > max_age);
+    *needs_screen = ((!strcmp(harness, "agy") || !strcmp(harness, "codex")) && s != P_IDLE) || ((s == P_BUSY || s == P_PERMISSION) && now - at > max_age);
     return s;
 }
 
@@ -1300,7 +1307,7 @@ static int agent_hook_state(sqlite3_stmt *st, struct proc_cache *cache, int *cac
     int stop_blocked = sqlite3_column_int(st, 6);
     int broken = sqlite3_column_int(st, 7);
 
-    if (!harness || (strcmp(harness, "claude") != 0 && strcmp(harness, "agy") != 0)) return 0;
+    if (!harness || (strcmp(harness, "claude") != 0 && strcmp(harness, "agy") != 0 && strcmp(harness, "codex") != 0)) return 0;
     if (!prompt_seen || !stop_seen || pid <= 1 || broken) return 0;
     if (!cached_process_alive(cache, cache_len, pid, harness)) return 0;
     *out_st = hook_event_state(harness, last_event, stop_blocked, at, now, needs_screen);
@@ -1377,6 +1384,7 @@ static char *show_dir(const char *path) {
 static char *scope_error(json_object *a, const char *pane, const char *name) {
     char cpar[32], *rows = NULL, *root, *croot, *err;
     if (barg(a, "cross")) return NULL;
+    if (is_reviewer(pane)) return fmt("%s is a tool reviewer; pass cross=true only if the user asked", name);
     if (TMUX(NULL, &rows, "list-panes", "-a", "-F", ROW_FMT) != 0) {
         free(rows);
         rows = strdup("");
@@ -1736,12 +1744,21 @@ static int spawn_locked(json_object *a, int wait, char id[9], char **pane_out,
         free(ceffort); free(trust); free(env); untrack(id);
         return fail(res, socket_path);
     }
+    char *croot = NULL;
+    if (*caller_pane && TMUX(NULL, &croot, "show", "-pqv", "-t", caller_pane, "@cntctr_root") != 0) *croot = '\0';
+    char *root_env = *caller_pane ? fmt("CNTCTR_ROOT=%s", *croot ? croot : caller_pane) : NULL;
+    free(croot);
     char *name_env = fmt("CNTCTR_NAME=%s", name), *socket_env = fmt("CNTCTR_TMUX=%s", socket_path);
     free(socket_path);
     const char *argv[40] = {"tmux", "new-window", "-d", "-n", name, "-c", cwd, "-P", "-F", "#{pane_id}",
-        "-e", name_env, "-e", socket_env, "sh", "-c",
-        "export CNTCTR_PANE=\"$TMUX_PANE\"; tmux set -p -t \"$CNTCTR_PANE\" @cntctr_name \"$CNTCTR_NAME\"; exec \"$@\"", "cntctr-start"};
-    n = 18;
+        "-e", name_env, "-e", socket_env};
+    n = 14;
+    if (root_env) argv[n++] = "-e", argv[n++] = root_env;
+    argv[n++] = "sh"; argv[n++] = "-c";
+    argv[n++] = root_env ?
+        "export CNTCTR_PANE=\"$TMUX_PANE\"; tmux set -p -t \"$CNTCTR_PANE\" @cntctr_name \"$CNTCTR_NAME\"; tmux set -p -t \"$CNTCTR_PANE\" @cntctr_root \"$CNTCTR_ROOT\"; exec \"$@\"" :
+        "unset CNTCTR_ROOT; export CNTCTR_PANE=\"$TMUX_PANE\"; tmux set -p -t \"$CNTCTR_PANE\" @cntctr_name \"$CNTCTR_NAME\"; exec \"$@\"";
+    argv[n++] = "cntctr-start";
     if (!agy) argv[n++] = "headroom", argv[n++] = "wrap";   /* route claude and codex API calls through headroom */
     argv[n++] = harness;
     if (!agy) argv[n++] = "--";
@@ -1752,7 +1769,7 @@ static int spawn_locked(json_object *a, int wait, char id[9], char **pane_out,
     if (agy) argv[n++] = "-i";
     argv[n++] = env;
     int rc = run(NULL, &pane, argv);
-    free(name_env); free(socket_env);
+    free(name_env); free(socket_env); free(root_env);
     free(ceffort);
     free(trust);
     free(env);
@@ -1767,11 +1784,7 @@ static int spawn_locked(json_object *a, int wait, char id[9], char **pane_out,
     free(TMUXE(NULL, "set", "-p", "-t", pane, "@cntctr_harness", harness));
     free(TMUXE(NULL, "set", "-p", "-t", pane, "@cntctr_model", model));
     if (*caller_pane) {   /* the whole spawn tree shares one root: the caller's own, else the caller itself */
-        char *croot = NULL;
         free(TMUXE(NULL, "set", "-p", "-t", pane, "@cntctr_parent", caller_pane));
-        if (TMUX(NULL, &croot, "show", "-pqv", "-t", caller_pane, "@cntctr_root") != 0) *croot = '\0';
-        free(TMUXE(NULL, "set", "-p", "-t", pane, "@cntctr_root", *croot ? croot : caller_pane));
-        free(croot);
     }
     char *title = fmt("task %s %s→%s", id, caller_name, name);
     log_history(caller_pane, title, task);
@@ -1871,6 +1884,15 @@ static int tool_kill(json_object *a, char **res) {
     if ((err = scope_error(a, pane, name))) {
         free(pane);
         return fail(res, err);
+    }
+    if (!barg(a, "cross")) {
+        char *parent = NULL;
+        TMUX(NULL, &parent, "show", "-pqv", "-t", pane, "@cntctr_parent");
+        if (!parent || !*parent) {
+            free(parent); free(pane);
+            return fail(res, fmt("%s is a session started by hand; pass cross=true if the user asked", name));
+        }
+        free(parent);
     }
     err = TMUXE(NULL, "kill-pane", "-t", pane);
     free(pane);
@@ -3770,7 +3792,7 @@ static int hook_row_get(sqlite3 *db, const char *socket, const char *pane, struc
 /* H2: an agent has hooks when its harness is claude or agy, a prompt event and a Stop event are on record, its hook
  * has not gone quiet after a wake, and both its pane and its recorded harness process are alive. */
 static int hook_row_has(const struct hook_row *r, const char *pane) {
-    return (!strcmp(r->harness, "claude") || !strcmp(r->harness, "agy")) && r->pid > 1 && r->prompt_seen && r->stop_seen && !r->broken &&
+    return (!strcmp(r->harness, "claude") || !strcmp(r->harness, "agy") || !strcmp(r->harness, "codex")) && r->pid > 1 && r->prompt_seen && r->stop_seen && !r->broken &&
            hook_process_alive(r->pid, r->harness) && pane_served(pane);
 }
 
@@ -4334,7 +4356,7 @@ static json_object *hook_attach(sqlite3 *db, const char *harness, const char *ev
 
 /* A Stop the harness reports as a normal end of the turn. Claude Code runs its Stop hook only then; agy says so in terminationReason. */
 static int stop_normal(const char *harness, const struct hook_event *event) {
-    return !strcmp(harness, "claude") || !strcmp(event->reason, "NO_TOOL_CALL");
+    return strcmp(harness, "agy") != 0 || !strcmp(event->reason, "NO_TOOL_CALL");
 }
 
 /* ---- the Stop gate (H5): what tmux knows about this agent, read in one invocation ---- */
@@ -4631,7 +4653,7 @@ static int hook_cmd(int argc, char **argv) {
         return 0;
     }
     json_object *decided = NULL;
-    if (argc >= 4 && (!strcmp(argv[2], "claude") || !strcmp(argv[2], "agy"))) {
+    if (argc >= 4 && (!strcmp(argv[2], "claude") || !strcmp(argv[2], "agy") || !strcmp(argv[2], "codex"))) {
         char *data = calloc(1, 1048577); size_t n = 0; ssize_t got;
         if (!data) { free(socket); puts("{}"); return 0; }
         while (n < 1048576 && (got = read(STDIN_FILENO, data + n, 1048576 - n)) > 0) n += (size_t)got;

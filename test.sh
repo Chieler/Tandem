@@ -243,7 +243,7 @@ f10_run() {
     pane_of() { t list-panes -a -F '#{pane_id} #{@cntctr_name}' | awk -v n="$1" '$2 == n {print $1}'; }
     popt() { t show -pqv -t "$1" "$2"; }
     gone() { for _ in $(seq 30); do has_pane "$1" || break; sleep 0.1; done; has_pane "$1" && bad "$2" || ok_; }
-    printf '#!/bin/sh\nexec cat\n' > "$TMPD/bin/claude"
+    printf '#!/bin/sh\ntmux show -pqv -t "$TMUX_PANE" @cntctr_root > "%s/start-""$CNTCTR_NAME"\nexec cat\n' "$TMPD" > "$TMPD/bin/claude"
     printf '#!/bin/sh\ntool=$2; shift 2; [ "$1" = -- ] && shift\nexec "$tool" "$@"\n' > "$TMPD/bin/headroom"
     chmod +x "$TMPD/bin/claude" "$TMPD/bin/headroom"
     UA=$(newpane f10_ua); UB=$(newpane f10_ub)
@@ -262,6 +262,22 @@ f10_run() {
     same "F10.1 and its root is still the session" "$(popt "$G" @cntctr_root)" "$UA"
     same "F10.1 the other session's worker has its own root" "$(popt "$BW" @cntctr_root)" "$UB"
     same "F10.1 a session by hand has no root option" "$(popt "$UA" @cntctr_root)" ""
+    for _ in $(seq 30); do [ -f "$TMPD/start-f10_w" ] && break; sleep 0.1; done
+    same "S4 harness observes root at startup" "$(cat "$TMPD/start-f10_w" 2>/dev/null)" "$UA"
+    # Pending reviewers are outside the tree until cross is explicit.
+    sq "$CNTCTR_DB" "INSERT INTO tools(project,name,version,status,author,description,input_schema,interpreter,script,reviewer_pane) VALUES ('tree-test','tree_review',1,'pending','author','test','{}','sh','true','$K')"
+    out=$(scall "$L" send '{"to":"f10_k","text":"review"}'); same "S1 reviewer send refused" "$(iserr "$out")" true
+    out=$(scall "$L" send '{"to":"f10_k","text":"review allowed","cross":true}'); same "S1 reviewer send with cross" "$(iserr "$out")" false
+    out=$(scall "$L" kill '{"name":"f10_k"}'); same "S1 reviewer kill refused" "$(iserr "$out")" true
+    out=$(scall "$L" kill '{"name":"f10_k","cross":true}'); same "S1 reviewer kill with cross" "$(iserr "$out")" false
+    sq "$CNTCTR_DB" "DELETE FROM tools WHERE project='tree-test'"
+    out=$(scall "$L" spawn '{"harness":"claude","name":"f10_k","task":"replacement"}'); K=$(pane_of f10_k)
+    out=$(scall "$L" kill '{"name":"f10_ua"}'); check "S2 hand-started root protected" "$(txt "$out")" "started by hand"
+    local TR TC
+    TR=$(newpane f10_temp_root)
+    out=$(scall "$TR" spawn '{"harness":"claude","name":"f10_temp_child","task":"temporary"}'); TC=$(pane_of f10_temp_child)
+    out=$(scall "$TC" kill '{"name":"f10_temp_root","cross":true}'); same "S2 root kill with cross" "$(iserr "$out")" false
+    t kill-pane -t "$TC"
     # (a) kill of your own worker, no cross
     out=$(scall "$L" kill '{"name":"f10_k"}'); same "F10.2 kill of your own worker needs no cross" "$(iserr "$out")" false
     gone "$K" "F10.2 the killed worker's pane is gone"
@@ -304,6 +320,7 @@ f10_run() {
     expect_screen "F10.7 the orphan got it" "$G" "f10 down to orphan"
     out=$(scall "$G" send '{"to":"f10_l","text":"f10 up from orphan"}'); same "F10.7 orphan to lead works" "$(iserr "$out")" false
     expect_screen "F10.7 the lead got it from the orphan" "$L" "f10 up from orphan"
+    out=$(scall "$G" send '{"to":"parent","text":"orphan"}'); check "S3 orphan names dead parent" "$(txt "$out")" "your parent $W is gone; your root is f10_ua (send to=\"f10_ua\")"
     out=$(scall "$L" kill '{"name":"f10_g"}'); same "F10.7 the lead kills the orphan" "$(iserr "$out")" false
     gone "$G" "F10.7 the orphan's pane is gone"
     # (f) two separate sessions with their own trees cannot reach each other
@@ -3339,11 +3356,11 @@ done
 check "T1 tools/list has post.urgent" "$out" '"urgent":{"type":"boolean"}'
 check "T1 tools/list has gather.wait" "$out" '"wait":{"type":"boolean"'
 
-# T2: initialize reports serverInfo.version 0.4.1; --version prints the same
+# T2: initialize reports serverInfo.version 0.5.0; --version prints the same
 out=$(rpc "$INIT" | tail -n 1)
-check "T2 initialize reports serverInfo.version 0.4.1" "$out" '"serverInfo":{"name":"cntctr","version":"0.4.1"}'
+check "T2 initialize reports serverInfo.version 0.5.0" "$out" '"serverInfo":{"name":"cntctr","version":"0.5.0"}'
 ver=$("$BIN" --version 2>&1)
-check "T2 --version prints 0.4.1" "$ver" "cntctr 0.4.1"
+check "T2 --version prints 0.5.0" "$ver" "cntctr 0.5.0"
 
 # T3: two test.sh runs use different tmux socket names
 s1=$(t display -p '#{socket_path}')
