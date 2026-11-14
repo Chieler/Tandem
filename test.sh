@@ -32,7 +32,7 @@ FSH='printf "\033[?2004h"; exec sh'   # a fake agent that is a shell, same reaso
 export HOME="$TMPD/home"   # fleet tools keep their cache under ~/.cache
 export BIN INIT CNTCTR_ENTER_DELAY_MS=50 LC_ALL=en_US.UTF-8 PATH="$TMPD/bin:$PATH" CNTCTR_DB="$TMPD/kb.db" CNTCTR_MEM_URL=
 export CNTCTR_MAX_AGENTS=${CNTCTR_MAX_AGENTS:-256}
-unset TMUX_PANE
+unset TMUX_PANE CNTCTR_PANE CNTCTR_TMUX CNTCTR_NAME   # a cntctr-spawned agent has these; they would aim the tests at its real tmux server
 
 SOCKET="cntctr-test-$$"
 t() { tmux -L "$SOCKET" -f /dev/null "$@"; }
@@ -1877,6 +1877,30 @@ if [ "${ONLY:-}" = u22 ] || [ "${ONLY:-}" = u23 ] || [ "${ONLY:-}" = u24 ] || [ 
     [ "$fail" -eq 0 ]; exit $?
 fi
 
+stale_name_run() {
+    local pane init
+    init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"claude-code"}}}'
+    pane=$(t new-window -d -P -F '#{pane_id}' cat)
+    t set -p -t "$pane" @cntctr_name "codex-mcp-client-${pane#%}"
+    t set -p -t "$pane" @cntctr_harness codex-mcp-client
+    printf '%s\n' "$init" | TMUX_PANE=$pane "$BIN" >/dev/null
+    same "stale automatic name follows new harness" "$(t show -pqv -t "$pane" @cntctr_name)" "claude-code-${pane#%}"
+    same "renamed pane records new harness" "$(t show -pqv -t "$pane" @cntctr_harness)" claude-code
+    t set -p -t "$pane" @cntctr_name librarian-1
+    t set -p -t "$pane" @cntctr_harness codex-mcp-client
+    printf '%s\n' "$init" | TMUX_PANE=$pane "$BIN" >/dev/null
+    same "spawn name is preserved" "$(t show -pqv -t "$pane" @cntctr_name)" librarian-1
+    t set -p -t "$pane" @cntctr_name "codex-mcp-client-${pane#%}"
+    t set -p -t "$pane" @cntctr_srv $$
+    printf '%s\n' "$init" | TMUX_PANE=$pane "$BIN" >/dev/null
+    same "live owner keeps automatic name" "$(t show -pqv -t "$pane" @cntctr_name)" "codex-mcp-client-${pane#%}"
+}
+if [ "${ONLY:-}" = stale-name ]; then
+    stale_name_run
+    printf '%d passed, %d failed\n' "$pass" "$fail"
+    [ "$fail" -eq 0 ]; exit $?
+fi
+
 if [ "${ONLY:-}" != "m3" ]; then
 
 u28_run
@@ -1914,6 +1938,7 @@ check "list shows b" "$(txt "$out")" "b test $B alive"
 U=$(t new-window -d -P -F '#{pane_id}' cat)
 out=$(call "$U" list '{}')
 check "untagged caller tags itself <client>-<pane number>" "$(txt "$out")" "test-${U#%} test $U alive"
+stale_name_run
 cat > "$TMPD/bin/probe" <<'EOF'
 #!/bin/sh
 # Start cntctr without TMUX_PANE, as Codex does; it must find its pane by process ancestry.

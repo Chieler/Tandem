@@ -327,17 +327,26 @@ static void find_self(void) {
     snprintf(pid, sizeof pid, "%ld", (long)getpid());
     snprintf(cmd, sizeof cmd, "set -p -t %s @cntctr_srv %s", self_pane, pid);
     char *name = NULL;
-    if (TMUX(NULL, &both, "display", "-p", "-t", self_pane, "#{@cntctr_name}\t#{@cntctr_srv}", ";",
+    int stale_name = 0;
+    if (TMUX(NULL, &both, "display", "-p", "-t", self_pane, "#{@cntctr_name}\t#{@cntctr_srv}\t#{@cntctr_harness}", ";",
              "if-shell", "-F", "-t", self_pane, "#{==:#{@cntctr_srv},}", cmd) == 0) {
         char *tab = strchr(both, '\t');
         if (tab) {
             *tab = '\0';
-            if (tab[1] && !srv_alive(tab + 1)) free(TMUXE(NULL, "set", "-p", "-t", self_pane, "@cntctr_srv", pid));
+            char *srv = tab + 1, *harness = strchr(srv, '\t');
+            if (harness) *harness++ = '\0';
+            int owns = !*srv || !strcmp(srv, pid) || !srv_alive(srv);
+            if (*srv && strcmp(srv, pid) && owns) free(TMUXE(NULL, "set", "-p", "-t", self_pane, "@cntctr_srv", pid));
+            if (harness && *harness && owns && !getenv("CNTCTR_NAME") && strcmp(harness, client_name)) {
+                size_t n = strlen(harness);
+                stale_name = strlen(both) == n + strlen(self_pane) &&
+                    !strncmp(both, harness, n) && both[n] == '-' && !strcmp(both + n + 1, self_pane + 1);
+            }
         }
         name = strdup(both);
     }
     free(both);
-    if (name && *name) {
+    if (name && *name && !stale_name) {
         snprintf(self_name, sizeof self_name, "%s", name);
     } else {
         const char *fallback = getenv("CNTCTR_NAME");
