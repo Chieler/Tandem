@@ -37,6 +37,6 @@ Record repository, intent, base revision, in-scope paths, out-of-scope work, wor
 
 ## Finish
 
-Consensus requires a complete `APPROVE` from every required seat for the current behavior diff, no open blocker or should, and no remaining concern of your own. An absent, late, or dead seat, budget expiry, unresolved disagreement, permission prompt, or model failure are incomplete or unresolved, not approval. Do not start a new review after expiry.
+Consensus requires a complete `APPROVE` from every required seat for the current behavior diff, no open blocker or should, and no remaining concern of your own. An absent, dead, or outstanding seat, budget expiry, unresolved disagreement, permission prompt, or model failure are incomplete or unresolved, not approval; a late reply collected and correlated within budget can count for its round and current diff. Do not start a new review after expiry.
 
 Report overall verdict, exact scope and current diff identity, rounds, requested versus verified model and effort per seat, findings and dispositions by seat, checks, initial and final diff size, exposed usage (or unavailable), unresolved issues and any external actions. Terminate only the reviewers created for this invocation when finished or stopped, using `kill` on their saved names; report cleanup failure. Do not use cross-tree access. Obtain task authorization before pushing, merging, posting comments or changing a PR description; review alone grants none.
