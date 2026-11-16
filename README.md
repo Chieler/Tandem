@@ -60,6 +60,127 @@ Register that path once for each harness:
 
 To upgrade or roll back, point the same entries at another version and restart the agents. Release tags (`v0.1.0`, ...) rebuild any old version.
 
+### Install the review skills
+
+From the checkout of the same release as the binary, inspect both `SKILL.md`
+files, `skills/LICENSE`, and `skills/UPSTREAM.md`. The bundle retains the MIT
+notice and upstream revision. Set `version` to the matching cntctr release;
+never reuse a published bundle version, including for a skill-only release.
+Run from the checkout:
+
+```sh
+version=0.2.0
+base="$HOME/.local/share/cntctr/skills"
+mkdir -p "$base"
+mkdir "$base/$version" || { echo "Bundle exists or cannot be created" >&2; exit 1; }
+cp -R skills/council skills/sol-loop "$base/$version/" || exit 1
+cp skills/LICENSE skills/UPSTREAM.md "$base/$version/" || exit 1
+```
+
+If copying fails, inspect and remove the incomplete version yourself before
+retrying. Keep completed bundles unchanged; updating the checkout does not
+update them. Before activation, inspect existing destinations. The following
+commands stop on any collision, including broken links, and preserve foreign
+entries. Resolve collisions yourself before retrying. Run each block in a shell
+where `exit 1` may terminate the shell. Do not run concurrent installers or
+change these destinations while the commands run.
+
+```sh
+base="$HOME/.local/share/cntctr/skills"
+version=0.2.0
+agy="$HOME/.gemini/antigravity-cli/skills"
+for name in council sol-loop; do
+  test -f "$base/$version/$name/SKILL.md" || exit 1
+done
+test -f "$base/$version/LICENSE" && test -f "$base/$version/UPSTREAM.md" || exit 1
+mkdir -p "$HOME/.agents/skills" "$HOME/.claude/skills" "$agy"
+for parent in "$HOME/.agents/skills" "$HOME/.claude/skills" "$agy"; do
+  for name in council sol-loop; do
+    dest="$parent/$name"
+    if [ -e "$dest" ] || [ -L "$dest" ]; then
+      ls -ld "$dest"; echo "Collision at $dest" >&2; exit 1
+    fi
+  done
+done
+for parent in "$HOME/.agents/skills" "$HOME/.claude/skills"; do
+  for name in council sol-loop; do
+    dest="$parent/$name"
+    if [ -e "$dest" ] || [ -L "$dest" ]; then echo "Collision: $dest" >&2; exit 1; fi
+    ln -s "$base/$version/$name" "$dest" || exit 1
+  done
+done
+for name in council sol-loop; do
+  dest="$agy/$name"
+  mkdir "$dest" || exit 1
+  cp "$base/$version/$name/SKILL.md" "$base/$version/LICENSE" "$dest/" || exit 1
+done
+```
+
+The agy adapter contains release-managed copies from the bundle, including the
+license; do not maintain them independently. For upgrade, install and register
+the matching new binary, copy its new bundle as above, and retain the old binary
+and bundle. Set `old` to the active version and `version` to the desired one.
+For rollback, use the same block with those versions reversed and repoint the
+MCP entries to the matching old binary. It checks every link and adapter copy
+before changing anything. An unexpected, missing, modified, or extra entry stops
+the operation; inspect and resolve it manually. If interrupted, inspect and
+restore a consistent set manually before retrying.
+
+```sh
+old=0.2.0
+version=0.2.1
+base="$HOME/.local/share/cntctr/skills"
+agy="$HOME/.gemini/antigravity-cli/skills"
+for name in council sol-loop; do
+  test -f "$base/$version/$name/SKILL.md" || exit 1
+done
+test -f "$base/$version/LICENSE" && test -f "$base/$version/UPSTREAM.md" || exit 1
+for parent in "$HOME/.agents/skills" "$HOME/.claude/skills"; do
+  for name in council sol-loop; do
+    dest="$parent/$name"
+    if [ ! -L "$dest" ] || [ "$(readlink "$dest")" != "$base/$old/$name" ]; then
+      echo "Unexpected destination: $dest" >&2; exit 1
+    fi
+  done
+done
+for name in council sol-loop; do
+  dest="$agy/$name"
+  if [ -L "$dest" ] || [ ! -d "$dest" ] ||
+     [ "$(ls -A "$dest")" != "$(printf "LICENSE\nSKILL.md")" ] ||
+     [ -L "$dest/SKILL.md" ] || [ -L "$dest/LICENSE" ] ||
+     ! cmp -s "$dest/SKILL.md" "$base/$old/$name/SKILL.md" ||
+     ! cmp -s "$dest/LICENSE" "$base/$old/LICENSE"; then
+    echo "Unexpected adapter: $dest" >&2; exit 1
+  fi
+done
+for parent in "$HOME/.agents/skills" "$HOME/.claude/skills"; do
+  for name in council sol-loop; do
+    dest="$parent/$name"
+    rm "$dest" || exit 1
+    if [ -e "$dest" ] || [ -L "$dest" ]; then echo "Collision: $dest" >&2; exit 1; fi
+    ln -s "$base/$version/$name" "$dest" || exit 1
+  done
+done
+for name in council sol-loop; do
+  dest="$agy/$name"
+  rm "$dest/SKILL.md" "$dest/LICENSE" || exit 1
+  rmdir "$dest" || exit 1
+  mkdir "$dest" || exit 1
+  cp "$base/$version/$name/SKILL.md" "$base/$version/LICENSE" "$dest/" || exit 1
+done
+```
+
+Restart the harnesses after changing the binary or skills. Inspect the links
+with `ls -ld ~/.agents/skills/council ~/.agents/skills/sol-loop ~/.claude/skills/council ~/.claude/skills/sol-loop`,
+compare the agy copies with the bundle, and confirm both skills in fresh
+sessions. Codex 0.169.0 app-server `skills/list` found the copied bundle through
+`.agents` links; Claude Code 2.1.325 saw both through `.claude` links. agy 1.5.9
+listed real project `.agents/skills` files but ignored directory and `SKILL.md`
+symlinks. Its `/skills` menu names `~/.gemini/antigravity-cli/skills` as a global
+path and `~/.gemini/skills` as shared; `~/.agents/skills` is not its global path.
+The personal global adapter has not been tested: check `/skills` in a fresh agy
+session before relying on it. Other harness versions may behave differently.
+
 Raise each harness's tool timeout above the longest blocking wait you plan to use:
 
 - Claude Code: aborts a tool call that sends nothing for 30 minutes. Add `"timeout": 10800000` (ms) to the cntctr entry in `~/.claude.json`, or set `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` (ms, 0 disables) for every server.
@@ -69,6 +190,8 @@ Install Codex hooks with `cntctr hooks install codex`, then start Codex and trus
 - agy: no MCP timeout setting found; keep blocking waits short or use async sends.
 
 ## Use
+
+After installing and confirming discovery, ask Claude or Codex: `Use sol-loop to review my current diff` or `Use council to review my current diff`. In agy, use the same requests after confirming the skills in `/skills`. Invoking a review does not authorize a push, merge, PR comment, or PR description change.
 
 Start a tmux session, run your leader agent in it, and ask for what you want,
 for example: "Spawn a codex worker named tests in ./api and have it write
