@@ -6,6 +6,8 @@ Releases:
 - `0.3.0`: on main, tag `v0.3.0` (2026-11-12); live in all harnesses as `~/.local/bin/cntctr-0.3.0`.
 - `0.4.0`: on main, tag `v0.4.0` (2026-11-13); Claude Code hooks, agents scoped by spawn tree.
 - `0.5.0`: on main, tag `v0.5.0` (2026-11-14); Codex hooks, spawn-tree rules.
+- `0.5.1`: council and sol-loop review skills; versioned bundles for Claude, Codex, and agy.
+
 Source: orchestrator feedback, 2026-11-07, ranked by cost.
 
 ## 0.2.0

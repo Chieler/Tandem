@@ -3356,11 +3356,11 @@ done
 check "T1 tools/list has post.urgent" "$out" '"urgent":{"type":"boolean"}'
 check "T1 tools/list has gather.wait" "$out" '"wait":{"type":"boolean"'
 
-# T2: initialize reports serverInfo.version 0.5.0; --version prints the same
+# T2: initialize reports serverInfo.version 0.5.1; --version prints the same
 out=$(rpc "$INIT" | tail -n 1)
-check "T2 initialize reports serverInfo.version 0.5.0" "$out" '"serverInfo":{"name":"cntctr","version":"0.5.0"}'
+check "T2 initialize reports serverInfo.version 0.5.1" "$out" '"serverInfo":{"name":"cntctr","version":"0.5.1"}'
 ver=$("$BIN" --version 2>&1)
-check "T2 --version prints 0.5.0" "$ver" "cntctr 0.5.0"
+check "T2 --version prints 0.5.1" "$ver" "cntctr 0.5.1"
 
 # T3: two test.sh runs use different tmux socket names
 s1=$(t display -p '#{socket_path}')

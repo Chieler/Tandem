@@ -50,13 +50,13 @@ There is no daemon. tmux carries every message, and SQLite holds the shared know
 
 Copy the build to a versioned path, so rebuilding in the repo never swaps the binary under running agents:
 
-    cp cntctr ~/.local/bin/cntctr-0.2.0
+    cp cntctr ~/.local/bin/cntctr-0.5.1
 
 Register that path once for each harness:
 
-    claude mcp add -s user cntctr -- ~/.local/bin/cntctr-0.2.0
-    codex mcp add cntctr -- ~/.local/bin/cntctr-0.2.0
-    agy mcp add cntctr ~/.local/bin/cntctr-0.2.0
+    claude mcp add -s user cntctr -- ~/.local/bin/cntctr-0.5.1
+    codex mcp add cntctr -- ~/.local/bin/cntctr-0.5.1
+    agy mcp add cntctr ~/.local/bin/cntctr-0.5.1
 
 To upgrade or roll back, point the same entries at another version and restart the agents. Release tags (`v0.1.0`, ...) rebuild any old version.
 
@@ -69,7 +69,7 @@ never reuse a published bundle version, including for a skill-only release.
 Run from the checkout:
 
 ```sh
-version=0.2.0
+version=0.5.1
 base="$HOME/.local/share/cntctr/skills"
 mkdir -p "$base"
 mkdir "$base/$version" || { echo "Bundle exists or cannot be created" >&2; exit 1; }
@@ -87,7 +87,7 @@ change these destinations while the commands run.
 
 ```sh
 base="$HOME/.local/share/cntctr/skills"
-version=0.2.0
+version=0.5.1
 agy="$HOME/.gemini/antigravity-cli/skills"
 for name in council sol-loop; do
   test -f "$base/$version/$name/SKILL.md" || exit 1
@@ -127,8 +127,8 @@ the operation; inspect and resolve it manually. If interrupted, inspect and
 restore a consistent set manually before retrying.
 
 ```sh
-old=0.2.0
-version=0.2.1
+old=0.5.1
+version=0.5.2
 base="$HOME/.local/share/cntctr/skills"
 agy="$HOME/.gemini/antigravity-cli/skills"
 for name in council sol-loop; do
