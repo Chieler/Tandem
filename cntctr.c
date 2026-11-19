@@ -1213,7 +1213,7 @@ static const struct { int tier; const char *words[12]; } RULES[] = {
 /* model, effort for each tier, per harness: claude, codex, agy */
 static const char *ROUTES[3][4][2] = {
     {{"claude-haiku-5-5", "medium"}, {"claude-sonnet-5-5", "medium"}, {"claude-opus-4-7", "high"}, {"claude-opus-5-5", "high"}},
-    {{"gpt-6.1-terra", "low"}, {"gpt-6.1-terra", "medium"}, {"gpt-6.1-sol", "high"}, {"gpt-6.1-terra", "high"}},
+    {{"gpt-6.1-terra", "low"}, {"gpt-6.2-sol", "medium"}, {"gpt-6.2-sol", "high"}, {"gpt-6.2-sol", "high"}},
     {{"gemini-3.8-flash-medium", "medium"}, {"gemini-3.8-flash-medium", "medium"}, {"gemini-3.8-flash-high", "high"}, {"gemini-3.8-flash-high", "high"}},
 };
 
