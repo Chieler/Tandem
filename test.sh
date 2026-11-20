@@ -2375,6 +2375,13 @@ out=$(CNTCTR_ROUTE_CODEX_HARD=gpt-9-sol:xhigh call "$L" spawn '{"harness":"codex
 expect_screen "route env overrides model and effort" "$(pane_of "$out")" "flags:  -m gpt-9-sol -c model_reasoning_effort=\"xhigh\""
 out=$(CNTCTR_ROUTE_CODEX_HARD=gpt-9-sol call "$L" spawn '{"harness":"codex","name":"r5p","task":"x","tier":"hard"}')
 expect_screen "route env model alone keeps the table effort" "$(pane_of "$out")" "flags:  -m gpt-9-sol -c model_reasoning_effort=\"high\""
+out=$(CNTCTR_ROUTE_CODEX_HARD="gpt-9-sol:evil;x" call "$L" spawn '{"harness":"codex","name":"r5q","task":"x","tier":"hard"}')
+expect_screen "route env with a bad effort is ignored whole" "$(pane_of "$out")" "flags:  -m gpt-6.2-sol -c model_reasoning_effort=\"high\""
+out=$(CNTCTR_ROUTE_CODEX_HARD="gpt-9-sol;" call "$L" spawn '{"harness":"codex","name":"r5u","task":"x","tier":"hard"}')
+expect_screen "route env model with a tmux separator is ignored" "$(pane_of "$out")" "flags:  -m gpt-6.2-sol -c model_reasoning_effort=\"high\""
+long130=$(printf 'm%.0s' $(seq 1 130))
+out=$(CNTCTR_ROUTE_CODEX_HARD="$long130" call "$L" spawn '{"harness":"codex","name":"r5v","task":"x","tier":"hard"}')
+expect_screen "route env model over 127 bytes is ignored, not cut" "$(pane_of "$out")" "flags:  -m gpt-6.2-sol -c model_reasoning_effort=\"high\""
 out=$(call "$L" spawn '{"harness":"agy","name":"r6b","task":"rename foo to bar"}')
 expect_screen "agy light task stays on medium" "$(pane_of "$out")" "flags:  --model gemini-3.8-flash-medium --effort medium"
 out=$(call "$L" spawn '{"harness":"agy","name":"r6","task":"Design the architecture for the new sync layer."}')

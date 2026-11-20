@@ -11,9 +11,9 @@ Get one independent Sol review of a fixed change scope, make minimal warranted f
 
 | Seat | cntctr harness | Requested model | Requested effort |
 | --- | --- | --- | --- |
-| Sol | `codex` | router `hard` tier: the best Sol model | `high` |
+| Sol | `codex` | router `hard` tier: the best Sol model | `high` (tier default) |
 
-User overrides win. Spawn the Sol seat with `tier="hard"` and no `model`, so it always gets the router's best Sol model; never name a Sol version here. Read the model and effort from the `spawn` result and record them as the requested settings. Do not substitute another model. An unavailable or incompatible seat blocks approval. Record requested settings separately from actual settings verified by runtime evidence; otherwise mark actual model and effort unverified. Router configuration alone is not runtime evidence.
+User overrides win. Spawn the Sol seat with `tier="hard"` and no `model`, so it always gets the router's best Sol model; never name a Sol version here. Record the requested tier and any user overrides as the requested settings. The resolved model and effort stay unverified unless runtime evidence exposes them: `spawn` with `wait=true` returns no launch summary, and the reviewer's own status line counts as evidence. Do not substitute another model. An unavailable or incompatible seat blocks approval. Record requested settings separately from actual settings verified by runtime evidence; otherwise mark actual model and effort unverified. Router configuration alone is not runtime evidence.
 
 ## Scope and budget
 
@@ -23,7 +23,7 @@ Record repository, intent, base revision, in-scope paths, out-of-scope work, wor
 
 ## Run the review
 
-1. Use cntctr MCP tools. Give `from` as your agent name if cntctr cannot identify your pane. Spawn one uniquely named reviewer with `harness=codex`, the explicit seat model and effort, and the repository as `cwd`. Bootstrap with a brief read-only readiness task; save the name and any returned task ID, and wait for its completed reply before the first review. If bootstrapping fails, report the seat incomplete. Do not spawn a replacement or another reviewer silently.
+1. Use cntctr MCP tools. Give `from` as your agent name if cntctr cannot identify your pane. Spawn one uniquely named reviewer with `harness=codex`, `tier="hard"` (no `model` or `effort` unless the user overrides them), and the repository as `cwd`. Bootstrap with a brief read-only readiness task; save the name and any returned task ID, and wait for its completed reply before the first review. If bootstrapping fails, report the seat incomplete. Do not spawn a replacement or another reviewer silently.
 2. Send the review as a **new task** with `send` to that reviewer, omitting `re`, `wait=true`, and `timeout=min(remaining whole seconds, 60)`. Associate an immediate answer with that call; retain any returned message/task ID, especially the pending ID on timeout. Every completed round's follow-up is another new task, also omitting `re`: `re` adds context to an open task and cannot reopen a completed reply. Count each review request as a round.
 3. For the bootstrap or review wait, use `wait=true` and a timeout no greater than `min(remaining whole seconds, 60)`. On an incomplete wait, retain the pending ID; check `list` and collect a correlated late reply from the pane or `board`, matching reviewer and message/task ID. Do not redispatch merely because a short wait expired, and do not count a prior task's answer for the current diff. Continue bounded collection only while time remains. Report `permission`, `limited`, `dead`, failed and timed-out states accurately. A permission prompt requires user action; surface it promptly, without bypassing it or waiting silently until expiry. Preserve partial findings. A missing or incomplete reply is never approval.
 4. Give the reviewer this complete brief each round, with the same scope and current diff identity:

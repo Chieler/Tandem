@@ -1227,22 +1227,40 @@ static const char *ROUTES[3][4][2] = {
     {{M_AGY_MID, "medium"}, {M_AGY_MID, "medium"}, {M_AGY_HIGH, "high"}, {M_AGY_HIGH, "high"}},
 };
 
+static const char *const EFFORTS[] = {"low", "medium", "high", "xhigh", "max", NULL};
+
+/* A route's model is a plain id: bounded, no leading '-', and no shell, tmux or flag characters. */
+static int route_model_ok(const char *m, size_t n) {
+    if (!n || n >= 128 || *m == '-') return 0;
+    for (size_t i = 0; i < n; i++)
+        if (!isalnum((unsigned char)m[i]) && !strchr("._-/", m[i])) return 0;
+    return 1;
+}
+
 /* The routed model (field 0) or effort (field 1) for harness h, tier t. Env
  * CNTCTR_ROUTE_<CLAUDE|CODEX|AGY>_<LIGHT|STANDARD|REVIEW|HARD>="model[:effort]" overrides the
- * table with no rebuild, e.g. CNTCTR_ROUTE_CODEX_HARD=gpt-6.3-sol:xhigh.
- * ponytail: env only; a config file if overrides ever outgrow a few variables. */
+ * table with no rebuild, e.g. CNTCTR_ROUTE_CODEX_HARD=gpt-6.3-sol:xhigh. A model alone keeps the table
+ * effort. An override whose model or effort is invalid is ignored whole, so the table applies.
+ * The model buffer is per thread: calls run on their own threads and each reads its own copy. */
 static const char *route_pick(int h, int t, int field) {
-    static char buf[3][4][2][128];
+    static _Thread_local char buf[3][4][128];
     static const char *const HN[] = {"CLAUDE", "CODEX", "AGY"};
-    char var[48], *dst = buf[h][t][field];
+    char var[48];
     snprintf(var, sizeof var, "CNTCTR_ROUTE_%s_%s", HN[h], TIERS[t]);
     for (char *c = var; *c; c++) *c = toupper((unsigned char)*c);
-    const char *v = getenv(var), *colon = v ? strchr(v, ':') : NULL;
-    if (!v || !*v || *v == ':' || *v == '-') return ROUTES[h][t][field];   /* unset or malformed */
-    if (field == 0) snprintf(dst, sizeof buf[0][0][0], "%.*s", (int)(colon ? colon - v : strlen(v)), v);
-    else if (colon && colon[1]) snprintf(dst, sizeof buf[0][0][0], "%s", colon + 1);
-    else return ROUTES[h][t][1];
-    return dst;
+    const char *v = getenv(var), *colon = v ? strchr(v, ':') : NULL, *effort = NULL;
+    size_t n = v ? (colon ? (size_t)(colon - v) : strlen(v)) : 0;
+    int ok = v && route_model_ok(v, n);
+    if (ok && colon) {
+        ok = 0;
+        for (int i = 0; EFFORTS[i]; i++)
+            if (strcmp(colon + 1, EFFORTS[i]) == 0) ok = 1, effort = EFFORTS[i];
+    }
+    if (!ok) return ROUTES[h][t][field];
+    if (field == 1) return effort ? effort : ROUTES[h][t][1];
+    memcpy(buf[h][t], v, n);
+    buf[h][t][n] = '\0';
+    return buf[h][t];
 }
 
 static int route(const char *task) {
@@ -1736,7 +1754,6 @@ static int spawn_locked(json_object *a, int wait, char id[9], char **pane_out,
     }
     const char *model = sarg(a, "model"), *effort = sarg(a, "effort");
     if (model && (!*model || *model == '-')) return fail(res, fmt("bad model %s", model));
-    static const char *EFFORTS[] = {"low", "medium", "high", "xhigh", "max", NULL};
     int known = !effort;
     for (int i = 0; !known && EFFORTS[i]; i++) known = strcmp(effort, EFFORTS[i]) == 0;
     if (!known) return fail(res, fmt("bad effort %s", effort));
@@ -2581,6 +2598,7 @@ static char *start_review(sqlite3 *db, const struct project *p, const char *name
     /* the other harness if it is installed, else the author's own on a model the author is not on */
     const char *other = reviewer_harness(ah), *harness = other && on_path(other) ? other : NULL;
     int tier = 2, h = harness ? (!strcmp(harness, "agy") ? 2 : !strcmp(harness, "codex")) : 0;
+    if (harness && *author_model && !strcmp(route_pick(h, tier, 0), author_model)) harness = NULL;   /* env routes gave both harnesses one model */
     if (other && !harness && *author_model && on_path(ah)) {
         static const int ORDER[] = {2, 3, 1, 0};
         h = !strcmp(ah, "agy") ? 2 : !strcmp(ah, "codex");
