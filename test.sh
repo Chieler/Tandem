@@ -3008,6 +3008,10 @@ FM=$(newpane known); t set -p -t "$FM" @cntctr_harness claude; t set -p -t "$FM"
 same "a known model falls back to the same harness" "$(PATH="$TMPD/noagy" publish "$FM" fm 'echo f')" "fm v1 pending"
 waitfor "fm approved" '[ "$(st fm)" = active ]'
 same "the fallback reviewer uses another model" "$(sq "$CNTCTR_DB" "select reviewer_model from tools where name='fm'")" claude-opus-4-7
+FM2=$(newpane known2); t set -p -t "$FM2" @cntctr_harness claude; t set -p -t "$FM2" @cntctr_model claude-sonnet-5-5
+same "a collision on one agy tier tries the other agy tiers first" "$(CNTCTR_ROUTE_AGY_REVIEW=claude-sonnet-5-5 publish "$FM2" fm2 'echo f')" "fm2 v1 pending"
+waitfor "fm2 approved" '[ "$(st fm2)" = active ]'
+same "the reviewer stays on agy with another model" "$(sq "$CNTCTR_DB" "select reviewer_model from tools where name='fm2'")" gemini-3.8-flash-high
 [ -e "$TMPD/gl/realgit/evil" ] && bad "wrote into the symlinked git dir" || ok_
 call "$FG" tool_define '{"name":"gitok","description":"t","input_schema":{"type":"object"},"interpreter":"sh","script":"echo x > other.txt; echo fine"}' >/dev/null
 same "that root is otherwise writable" "$(txt "$(call "$FG" use '{"tool":"gitok"}')")" fine

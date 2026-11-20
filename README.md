@@ -298,7 +298,7 @@ It returns JSON with `complete` and one `results` entry per task, in input order
 
 Rules are checked in the order hard, review, light; tasks over 6000 characters count as review. Pass `tier`, `model` or `effort` to override.
 
-Model names are defined once, in the `M_*` block above `ROUTES` in `cntctr.c`. To change a model without rebuilding, set `CNTCTR_ROUTE_<CLAUDE|CODEX|AGY>_<LIGHT|STANDARD|REVIEW|HARD>=model[:effort]` in the environment of the cntctr server, for example `CNTCTR_ROUTE_CODEX_HARD=gpt-6.3-sol:xhigh`. The `sol-loop` and `council` skills spawn their Sol seat with `tier="hard"` instead of naming a model, so they follow the router.
+Model names are defined once, in the `M_*` block above `ROUTES` in `cntctr.c`. To change a model without rebuilding, set `CNTCTR_ROUTE_<CLAUDE|CODEX|AGY>_<LIGHT|STANDARD|REVIEW|HARD>=model[:effort]` in the environment of the cntctr server, for example `CNTCTR_ROUTE_CODEX_HARD=gpt-6.3-sol:xhigh`. A model alone keeps the tier's effort; an override with an invalid model or effort is ignored whole and the table applies. The `sol-loop` and `council` skills spawn their Sol seat with `tier="hard"` instead of naming a model, so they follow the router.
 
 <details>
 <summary><b>Delivery and messaging details</b></summary>

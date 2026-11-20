@@ -2596,14 +2596,16 @@ static char *start_review(sqlite3 *db, const struct project *p, const char *name
         ah = strdup("");
     }
     /* the other harness if it is installed, else the author's own on a model the author is not on */
-    const char *other = reviewer_harness(ah), *harness = other && on_path(other) ? other : NULL;
-    int tier = 2, h = harness ? (!strcmp(harness, "agy") ? 2 : !strcmp(harness, "codex")) : 0;
-    if (harness && *author_model && !strcmp(route_pick(h, tier, 0), author_model)) harness = NULL;   /* env routes gave both harnesses one model */
-    if (other && !harness && *author_model && on_path(ah)) {
-        static const int ORDER[] = {2, 3, 1, 0};
-        h = !strcmp(ah, "agy") ? 2 : !strcmp(ah, "codex");
+    const char *other = reviewer_harness(ah), *harness = NULL;
+    int tier = 2, h = 0;
+    static const int ORDER[] = {2, 3, 1, 0};
+    /* first the other harness, then the author's own; on the first tier whose model is not the author's */
+    const char *cand[2] = {other && on_path(other) ? other : NULL, other && *author_model && on_path(ah) ? ah : NULL};
+    for (int c = 0; c < 2 && !harness; c++) {
+        if (!cand[c]) continue;
+        int hc = !strcmp(cand[c], "agy") ? 2 : !strcmp(cand[c], "codex");
         for (int i = 0; i < 4 && !harness; i++)
-            if (strcmp(route_pick(h, ORDER[i], 0), author_model) != 0) harness = ah, tier = ORDER[i];
+            if (strcmp(route_pick(hc, ORDER[i], 0), author_model) != 0) harness = cand[c], h = hc, tier = ORDER[i];
     }
     if (!harness) why = fmt("no reviewer on a different model");
     if (!why && (why = review_copy(p, name, version, path))) {
