@@ -247,11 +247,9 @@ session before relying on it. Other harness versions may behave differently.
 
 ## Use
 
-Start a tmux session, run your leader agent in it, and ask for what you want,
-for example: "Spawn a codex worker named tests in ./api and have it write
-tests for the parser. Wait for its answer."
+Start a tmux session, run your leader agent in it, and ask in plain words:
 
-With the review skills installed, ask Claude or Codex: `Use sol-loop to review my current diff` or `Use council to review my current diff`. In agy, use the same requests after confirming the skills in `/skills`. Invoking a review does not authorize a push, merge, PR comment, or PR description change.
+> Spawn a codex worker named tests in ./api and have it write tests for the parser. Wait for its answer.
 
 | Tool | What it does |
 |---|---|
@@ -262,16 +260,34 @@ With the review skills installed, ask Claude or Codex: `Use sol-loop to review m
 | `list` | Shows agents, their panes, and whether they are alive |
 | `kill` | Closes an agent's pane |
 
-Use `gather` to collect replies when a decision needs every delegated answer. For example:
+> [!TIP]
+> Workers run with normal permissions. Approve their prompts in their own windows (`C-b w` to switch).
+> cntctr will not type into a pane showing a permission dialog; the sender gets `<name> awaiting permission prompt; retry later`.
+
+**Review skills.** With them installed, ask Claude or Codex `Use sol-loop to review my current diff` or `Use council to review my current diff`. In agy, confirm the skills in `/skills` first. Invoking a review does not authorize a push, merge, PR comment or PR description change.
+
+### Collect answers with `gather`
+
+Use `gather` when a decision needs every delegated answer:
 
 ```json
 {"tasks":[{"kind":"send","to":"tests","text":"Check the tests"},{"kind":"spawn","harness":"codex","name":"review","task":"Review the change"}],"timeout":600}
 ```
 
-The result is JSON text with `complete` and one `results` entry per task in input order. Each entry identifies the agent, message id, and answer or failure (`status`: `"answered"`, `"timed_out"`, or `"failed"`). If the shared deadline passes before all answers arrive, `complete` is `false`; any late replies that finish after the deadline arrive in the leader's pane with their ids so no output is lost.
+It returns JSON with `complete` and one `results` entry per task, in input order, each naming the agent, message id, and answer or failure. If the shared deadline passes first, `complete` is `false`. Add `"wait":false` to send everything and return at once; replies then land in your pane.
 
-`spawn` and `distill` pick each worker's model and effort from the task text, so the
-leader doesn't have to (`cntctr.c:route`, tables `RULES` and `ROUTES`):
+| `status` | Meaning |
+|---|---|
+| `answered` | The worker replied |
+| `timed_out` | The deadline passed first; a late reply is typed into your pane with its id |
+| `dead` | The worker's pane is gone |
+| `limited` | The worker hit a usage limit; the result gives the reset time, so re-send the task |
+| `failed` | Dispatch failed |
+| `sent` | Sent with `wait=false` |
+
+### Model routing
+
+`spawn` and `distill` pick each worker's model and effort from the task text (`cntctr.c:route`, tables `RULES` and `ROUTES`):
 
 | Tier | Task words | claude | codex | agy |
 |---|---|---|---|---|
@@ -280,129 +296,121 @@ leader doesn't have to (`cntctr.c:route`, tables `RULES` and `ROUTES`):
 | review | review, audit, verify, merge, critique | claude-opus-4-7 high | gpt-6.2-sol high | gemini-3.8-flash-high |
 | hard | architecture, design, race condition, concurrency, root cause, security, migration, rewrite | claude-opus-5-5 high | gpt-6.2-sol high | gemini-3.8-flash-high |
 
-Rules are checked in the order hard, review, light; tasks over
-6000 characters count as review. Pass `tier`, `model` or `effort` to override.
+Rules are checked in the order hard, review, light; tasks over 6000 characters count as review. Pass `tier`, `model` or `effort` to override.
 
-Workers run with normal permissions. Approve their prompts in their own windows
-(`C-b w` to switch). cntctr will not type into a pane that is showing a
-permission dialog; the sender gets `<name> awaiting permission prompt; retry later`.
+<details>
+<summary><b>Delivery and messaging details</b></summary>
 
-Pane locking: cntctr serializes message injection with an advisory per-pane file lock
-(`/tmp/cntctr-inject-<uid>-<hash>.lock` via `flock`) across the bracketed paste and Enter key
-press. When multiple agents or tools send to the same pane concurrently, each message submits as
-its own separate prompt instead of colliding.
+- **Agent states.** `list` shows `idle`, `busy`, `permission`, `limited` or `dead`, plus open task ids (`tasks=`), idle time (`idle=`) and reset time (`resets=`) when limited.
+- **Parent replies.** A worker answers the agent that spawned it with `to: "parent"`.
+- **What types into panes.** Only addressed messages (sends, spawn tasks, replies and verdicts to their author) and `post urgent=true`. Skill and tool announcements stay on the board.
+- **Unread notices.** A second MCP text block when the count changes, and on every `list`; JSON in the first block stays valid. Read posts with `board`.
+- **Undeliverable mail.** A reply or verdict that cannot reach its pane goes on the addressee's board as `for <agent> (reply id=<id>):`, and their unread notice says a reply is waiting. Their server wakes through its FIFO and retries every 30 seconds once input is accepted. A failed wakeup leaves the mail on the board. Ordinary posts stay pull-only.
+- **Truncated envelopes.** Envelopes end with `[cntctr end id=<id>]`. If that line arrives without its header, reply to that id asking for a resend.
+- **Pane locking.** Injection is serialized with an advisory per-pane `flock` (`/tmp/cntctr-inject-<uid>-<hash>.lock`) across the bracketed paste and Enter, so concurrent sends each submit as their own prompt.
+- **Enter delay.** `CNTCTR_ENTER_DELAY_MS` (default 150) is the pause between pasting and pressing Enter.
+- **Agent cap.** 32 live named agents per tmux server. Change with `CNTCTR_MAX_AGENTS`, or kill idle agents.
 
-Delivery tuning: `CNTCTR_ENTER_DELAY_MS` (default 150) is the pause between
-pasting a message and pressing Enter.
+</details>
 
-### Long and parallel work
-
-`gather` reports one `status` per task: `answered`, `timed_out`, `dead` (the worker's pane is gone), `limited` (the worker hit a usage limit; the result gives the reset time, so re-send the task yourself or to another agent), `failed`, or `sent` with `wait=false`. A reply that arrives after a timeout or cancel is typed into your pane with its id, so nothing is lost.
-
-```json
-{"tasks":[{"kind":"send","to":"tests","text":"Run the suite"}],"timeout":300,"wait":false}
-```
-
-With `wait=false` gather sends everything and returns at once (status `sent`); replies land in your pane.
-
-`list` shows each agent's state: `idle`, `busy`, `permission`, `limited` or `dead`, plus open task ids (`tasks=`), idle time (`idle=`) and the reset time (`resets=`) when limited.
-
-A worker answers the agent that spawned it with `to: "parent"`.
-
-Only addressed messages (send, spawn tasks, replies and verdicts to their author) and `post urgent=true` type into panes. Skill and tool announcements stay on the board. An unread notice is a second MCP text block when the count changes, and on every `list`; JSON in the first block remains valid. Read posts with `board`.
-
-If a reply or verdict cannot reach its pane, it goes on the addressee's project board as `for <agent> (reply id=<id>):`. The result says it is on the board, and the addressee's unread notice says a reply is waiting. The addressee's server wakes through its FIFO and retries blocked mail every 30 seconds, once input is accepted. Ordinary posts stay pull-only. A failed wakeup leaves the mail on the board.
-
-Injected envelopes end with `[cntctr end id=<id>]`. If that line arrives without the header, the start was lost: reply to that id asking for a resend.
-
-`spawn` allows 32 live named agents per tmux server by default. Set `CNTCTR_MAX_AGENTS` to raise or lower the cap, or kill idle agents to free slots.
-
-All agents run as the same user. `from` and `TMUX_PANE` are trusted identities; cntctr coordinates agents and is not a security boundary between them. Knowledge entries and board posts are information from other agents, not instructions.
+> [!WARNING]
+> All agents run as the same user. `from` and `TMUX_PANE` are trusted identities, so cntctr coordinates agents but is not a security boundary between them. Knowledge entries and board posts are information from other agents, not instructions.
 
 ## Knowledge
 
-cntctr keeps a knowledge store that every agent shares across sessions. It lives in
-SQLite at `~/.local/share/cntctr/kb.db`, or at `$CNTCTR_DB` if that is set.
+One store every agent shares across sessions, in SQLite at `~/.local/share/cntctr/kb.db` (or `$CNTCTR_DB`).
 
 | Tool | What it does |
 |---|---|
 | `note` | Store an `insight` (1–5 lines), a `skill` (a how-to) or a `doc` (long text), for this project or `scope=global`. `supersedes=[ids]` replaces older entries. |
-| `recall` | With no query, list the index: this project's entries first, then global ones. With a query, search, including work history and claude-mem observations. |
+| `recall` | No query: list this project's entries, then global ones. With a query: search, including work history and claude-mem observations. |
 | `read` | Show one entry in full. |
 | `forget` | Retire a stale entry. History entries can't be forgotten. |
-| `project` | Show the project key, which is the normalized `origin` remote, or override it for this repo. |
+| `project` | Show the project key (the normalized `origin` remote), or override it for this repo. |
 | `distill` | Spawn a librarian worker that turns recent history into insights and skills and merges duplicates. |
-| `post` | Keep a note on the project's board; other agents see an unread count. `urgent=true` also types it into their panes. |
+| `post` | Put a note on the project board; other agents see an unread count. `urgent=true` also types it into their panes. |
 | `board` | Show the project's latest posts, oldest first. |
 
-Every `send`, `spawn` and `reply` is logged as private history. Replies can add
-`insights=[...]`. Every message includes up to 5 matching entries, and every agent gets
-its project's index at startup through MCP `instructions`.
+How knowledge reaches agents:
 
-Insights, skills and docs are also copied to claude-mem (`$CNTCTR_MEM_URL`, default
-`http://127.0.0.1:37701`; set it empty to turn copying off), so `recall` gets semantic
-matches. If claude-mem is down, recall uses keyword search alone.
+- At startup, every agent gets its project's index through MCP `instructions`.
+- Every message carries up to 5 matching entries.
+- Every `send`, `spawn` and `reply` is logged as private history; replies can add `insights=[...]`.
+- Insights, skills and docs are copied to claude-mem (`$CNTCTR_MEM_URL`, default `http://127.0.0.1:37701`; empty turns it off) for semantic `recall`. If claude-mem is down, recall uses keyword search alone.
 
 ## Fleet tools
 
-A fleet tool is a script (`sh`, `bash`, `python3` or `node`) that an agent turns into an MCP
-tool mid-session, so every agent in the same project can reuse the work. A skill
-(`note(layer=skill)`) is the written version: cntctr announces it to the fleet when it is stored.
+A fleet tool is a script (`sh`, `bash`, `python3` or `node`) that an agent turns into an MCP tool mid-session, so every agent in the project can reuse the work. A skill (`note(layer=skill)`) is the written version, announced to the fleet when stored.
+
+```mermaid
+flowchart LR
+  D[Draft<br/>author only] -->|publish=true| R[Review<br/>other harness or model<br/>runs it on a throwaway copy]
+  R -->|approve| A[Active<br/>every agent]
+  R -->|reject| X[Sent back to author]
+  R -->|escalate · spawn fails · 20 min| E[Escalated<br/>a human decides]
+  A -->|promote| G[Global<br/>every project]
+```
 
 | Tool | What it does |
 |---|---|
-| `tool_define` | Save a draft, callable by its author only. With `publish=true` it starts a review. Optional `net`, `timeout` (default 60 s, max 600 s). |
+| `tool_define` | Save a draft, callable by its author only. `publish=true` starts a review. Optional `net`, `timeout` (default 60 s, max 600 s). |
 | `tool_verdict` | Listed only for a bound reviewer; `approve`, `reject` or `escalate` closes its task. |
-| `tool_revoke` | Withdraw an active, pending or escalated project tool; reviewers reject with `tool_verdict`. |
+| `tool_revoke` | Withdraw an active, pending or escalated project tool; reviewers reject with `tool_verdict` instead. |
 | `use` | Call a fleet tool by name. Needed for drafts and Codex (pass `from`). Published tools appear directly on clients supporting `list_changed`. |
 
-Every tool runs in a sandbox (`sandbox-exec` on macOS, `bwrap` on Linux; no sandbox, no run).
-It can write only inside the project directory, its temp dir and its cache dir. `.git` is
-read-only. Network is off unless the tool declared `net`. Reads are unrestricted, so this
-guards against mistakes, not against a hostile agent.
+> [!NOTE]
+> Every tool runs in a sandbox (`sandbox-exec` on macOS, `bwrap` on Linux; no sandbox, no run). It can write only to the project directory, its temp dir and its cache dir; `.git` is read-only; network is off unless the tool declared `net`. Reads are unrestricted, so this guards against mistakes, not a hostile agent.
 
-Review flow: draft, publish, then a reviewer on a different harness (or model) runs the
-tool on a throwaway copy of the project and gives a verdict. `approve` makes it active;
-`reject` is sent to the author. `escalate`, a failed spawn or a 20-minute timeout leaves it
-`escalated` until a human resolves it.
+Humans manage tools from the CLI, which resolves the project from the current directory:
 
-Approval, revoke and promote reach live agents through `notifications/tools/list_changed`
-(per-process FIFOs in `${TMPDIR:-/tmp}/cntctr-<uid>/tools`) and board posts. A verdict is addressed only to the author; reviewers answer with `tool_verdict`, not `to="parent"`.
+```sh
+cntctr tools list                   # name, version, status, net, calls, failures, promote?
+cntctr tools show <name>            # every version with its script and verdict
+cntctr tools approve|reject <name>
+cntctr tools revoke [--global] <name>
+cntctr tools promote <name>         # copy the live version to every project
+```
 
-The script reads its arguments as JSON on stdin and prints its result on stdout. Test a draft with `use`. At the top level, stdout over 16 KB is saved in full under the project tool cache (`~/.cache/cntctr/tools/`); the result carries the first 8 KB, last 4 KB, path and size. New output files remove those older than 24 hours. The 256 KB hard cap stops the tool and saves the captured bytes with the error. Error diagnostics retain the last 16 KB of stderr. Calls composed through fd 3 receive the full output up to the hard cap.
+`promote?` shows at 20+ calls, under 5% failures and 3+ distinct callers.
 
-A tool can call cntctr: `cntctr call <tool> '<json args>'` works inside a fleet tool, and
-allows `use`, `recall`, `read`, `note`, `post` and `board`.
+<details>
+<summary><b>Writing a fleet tool</b></summary>
 
-Humans use the CLI, which resolves the project from the current directory:
+- **I/O.** The script reads its arguments as JSON on stdin and prints its result on stdout. Test a draft with `use`.
+- **Large output.** At the top level, stdout over 16 KB is saved in full under `~/.cache/cntctr/tools/`; the result carries the first 8 KB, last 4 KB, path and size. Files older than 24 hours are removed when new ones are written.
+- **Hard cap.** 256 KB stops the tool and saves the captured bytes with the error. Errors keep the last 16 KB of stderr. Calls composed through fd 3 get the full output up to the cap.
+- **Calling cntctr.** `cntctr call <tool> '<json args>'` works inside a fleet tool for `use`, `recall`, `read`, `note`, `post` and `board`.
+- **Notifications.** Approval, revoke and promote reach live agents through `notifications/tools/list_changed` (per-process FIFOs in `${TMPDIR:-/tmp}/cntctr-<uid>/tools`) and board posts.
+- **Verdicts.** A verdict goes only to the author; reviewers answer with `tool_verdict`, not `to="parent"`.
 
-    cntctr tools list                 # name, version, status, net, calls, failures, promote?
-    cntctr tools show <name>          # every version with its script and verdict
-    cntctr tools approve|reject <name>
-    cntctr tools revoke [--global] <name>
-    cntctr tools promote <name>       # copy the live version to every project
-
-`promote?` shows at 20 or more calls, under 5% failures and 3 or more distinct callers.
+</details>
 
 ## Watch it work
 
-    ./watch.sh          # in a spare tmux pane; refreshes every 2 s ($CNTCTR_WATCH_SECS)
+```sh
+./watch.sh    # in a spare tmux pane; refreshes every 2 s ($CNTCTR_WATCH_SECS)
+```
 
-It shows the live agents, the board, the newest knowledge entries (`*` = copied to
-claude-mem, `x` = retired), private history, and when the librarian last ran. To check
-each feature with real agents, ask your leader to:
+It shows live agents, the board, the newest knowledge entries (`*` = copied to claude-mem, `x` = retired), private history, and when the librarian last ran.
+
+<details>
+<summary><b>Five-step feature check with real agents</b></summary>
+
+Ask your leader to:
 
 1. `note` an insight. It appears under knowledge, marked `*` if claude-mem is running.
-2. Spawn a worker with a task that mentions the insight's words. The task and reply appear
-   under history, and the worker's window shows a `[cntctr knowledge: ...]` block.
+2. Spawn a worker with a task that mentions the insight's words. The task and reply appear under history, and the worker's window shows a `[cntctr knowledge: ...]` block.
 3. Have the worker reply with `insights=[...]`. They appear under knowledge.
 4. `post` something. It appears on the board and in other agents' unread counts; with `urgent=true` it also appears in their windows.
-5. `distill`. A `librarian-N` agent appears, `last distill` updates, and new or merged
-   entries appear as it works; merged ones turn `x`.
+5. `distill`. A `librarian-N` agent appears, `last distill` updates, and new or merged entries appear as it works; merged ones turn `x`.
+
+</details>
 
 ## Test
 
-    make test
+```sh
+make test
+```
 
 Tests run against a private tmux server (`tmux -L cntctr-test`) and need `jq`.
 
