@@ -1,12 +1,59 @@
-# Tandem
+<h1 align="center">Tandem</h1>
 
-Tandem lets Claude Code, Codex and agy (Antigravity CLI) work together as one team.
-A leader agent can spawn workers in any of the three harnesses, give them tasks, and
-get the answers back in its own session. All agents share one knowledge store and one
-live project board.
+<p align="center">
+  <strong>Claude Code, Codex and agy working as one team, in plain tmux.</strong>
+</p>
+
+<p align="center">
+  <a href="https://github.com/Chieler/Tandem/releases"><img alt="Release" src="https://img.shields.io/github/v/tag/Chieler/Tandem?label=release&sort=semver"></a>
+  <img alt="C11" src="https://img.shields.io/badge/C-11-00599C?logo=c&logoColor=white">
+  <img alt="MCP stdio" src="https://img.shields.io/badge/MCP-stdio-6E56CF">
+  <img alt="tmux 3.7c" src="https://img.shields.io/badge/tmux-3.7c-1BB91F?logo=tmux&logoColor=white">
+  <img alt="macOS | Linux" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey">
+</p>
+
+<p align="center">
+  <img src="assets/demo.gif" alt="A Claude leader pane delegates an audit to Codex and a fuzzing task to agy; both reply with findings and the leader stores a shared insight" width="900">
+</p>
+
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#how-it-works">How it works</a> ·
+  <a href="#use">Use</a> ·
+  <a href="#knowledge">Knowledge</a> ·
+  <a href="#fleet-tools">Fleet tools</a> ·
+  <a href="#watch-it-work">Watch it work</a>
+</p>
+
+A leader agent spawns workers in any of the three harnesses, hands them tasks, and
+gets the answers back in its own session. Every agent shares one knowledge store and
+one live project board.
 
 The server is `cntctr`, a small C11 MCP stdio server. Every agent runs its own copy.
-There is no daemon. tmux carries every message, and SQLite holds the shared knowledge.
+There is no daemon: tmux carries every message, and SQLite holds the shared knowledge.
+
+## Features
+
+- **Cross-harness delegation.** `spawn`, `send` and `gather` work between Claude Code, Codex and agy in any direction.
+- **Watchable workers.** Each worker gets its own tmux window, so you can follow it and approve its prompts.
+- **Shared memory.** Insights, skills and docs live in SQLite + FTS5 and reach every agent at startup and with every message.
+- **Fleet tools.** An agent can turn a script into a sandboxed MCP tool that, after cross-harness review, every agent in the project can call.
+- **Automatic model routing.** Each task picks a model and effort tier from its wording.
+- **No daemon, no shell.** tmux is called with an argv array. Message text reaches it only through a pipe.
+
+## Quick start
+
+```sh
+make
+cp cntctr ~/.local/bin/cntctr-0.5.1
+claude mcp add -s user cntctr -- ~/.local/bin/cntctr-0.5.1
+```
+
+Start tmux, run `claude` inside it, and ask:
+
+> Spawn a codex worker named tests in ./api and have it write tests for the parser. Wait for its answer.
+
+See [Requirements](#requirements) and [Install](#install) for Codex, agy and timeout setup.
 
 ## How it works
 
@@ -60,7 +107,22 @@ Register that path once for each harness:
 
 To upgrade or roll back, point the same entries at another version and restart the agents. Release tags (`v0.1.0`, ...) rebuild any old version.
 
+### Configure timeouts
+
+Raise each harness's tool timeout above the longest blocking wait you plan to use:
+
+- Claude Code: aborts a tool call that sends nothing for 30 minutes. Add `"timeout": 10800000` (ms) to the cntctr entry in `~/.claude.json`, or set `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` (ms, 0 disables) for every server.
+- Codex: in `~/.codex/config.toml`, under `[mcp_servers.cntctr]`, set `tool_timeout_sec = 3600`. For hand-started Codex sessions, also set `env_vars = ["TMUX", "TMUX_PANE"]` so the MCP server can identify the pane. Spawned Codex agents use their own `CNTCTR_*` environment override.
+- agy: no MCP timeout setting found; keep blocking waits short or use async sends.
+
+Install Codex hooks with `cntctr hooks install codex`, then start Codex and trust the cntctr hooks on the "Hooks need review" screen.
+
 ### Install the review skills
+
+Optional: the bundled `council` and `sol-loop` skills run multi-model code reviews.
+
+<details>
+<summary>Versioned install, upgrade and rollback steps</summary>
 
 From the checkout of the same release as the binary, inspect both `SKILL.md`
 files, `skills/LICENSE`, and `skills/UPSTREAM.md`. The bundle retains the MIT
@@ -181,21 +243,15 @@ path and `~/.gemini/skills` as shared; `~/.agents/skills` is not its global path
 The personal global adapter has not been tested: check `/skills` in a fresh agy
 session before relying on it. Other harness versions may behave differently.
 
-Raise each harness's tool timeout above the longest blocking wait you plan to use:
-
-- Claude Code: aborts a tool call that sends nothing for 30 minutes. Add `"timeout": 10800000` (ms) to the cntctr entry in `~/.claude.json`, or set `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` (ms, 0 disables) for every server.
-- Codex: in `~/.codex/config.toml`, under `[mcp_servers.cntctr]`, set `tool_timeout_sec = 3600`. For hand-started Codex sessions, also set `env_vars = ["TMUX", "TMUX_PANE"]` so the MCP server can identify the pane. Spawned Codex agents use their own `CNTCTR_*` environment override.
-
-Install Codex hooks with `cntctr hooks install codex`, then start Codex and trust the cntctr hooks on the "Hooks need review" screen.
-- agy: no MCP timeout setting found; keep blocking waits short or use async sends.
+</details>
 
 ## Use
-
-After installing and confirming discovery, ask Claude or Codex: `Use sol-loop to review my current diff` or `Use council to review my current diff`. In agy, use the same requests after confirming the skills in `/skills`. Invoking a review does not authorize a push, merge, PR comment, or PR description change.
 
 Start a tmux session, run your leader agent in it, and ask for what you want,
 for example: "Spawn a codex worker named tests in ./api and have it write
 tests for the parser. Wait for its answer."
+
+With the review skills installed, ask Claude or Codex: `Use sol-loop to review my current diff` or `Use council to review my current diff`. In agy, use the same requests after confirming the skills in `/skills`. Invoking a review does not authorize a push, merge, PR comment, or PR description change.
 
 | Tool | What it does |
 |---|---|
@@ -359,3 +415,4 @@ Tests run against a private tmux server (`tmux -L cntctr-test`) and need `jq`.
 | `watch.sh` | Live dashboard |
 | `test.sh` | End-to-end tests with fake harnesses |
 | `docs/superpowers/` | Design specs and implementation plans |
+| `assets/demo.gif` | README demo, recorded from the portfolio animation |
