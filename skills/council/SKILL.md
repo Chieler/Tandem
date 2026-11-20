@@ -12,10 +12,10 @@ Get three independent reviews of a fixed change scope across different providers
 | Seat | cntctr harness | Requested model | Requested effort |
 | --- | --- | --- | --- |
 | Claude | `claude` | `claude-opus-5-5` | `high` |
-| Codex | `codex` | `gpt-6.1-sol` | `high` |
+| Codex | `codex` | router `hard` tier: the best Sol model | `high` |
 | agy | `agy` | `gemini-3.8-flash-high` | `high` |
 
-User overrides win. Pass model and effort explicitly to `spawn` in `gather`; do not rely on routing or substitute another model. Describe the agy seat as Flash if that is what it runs; do not claim Gemini Pro or a flagship model without runtime proof. An unavailable or incompatible seat blocks approval. Record requested settings separately from actual settings verified by runtime evidence; otherwise mark actual model and effort unverified. Router configuration alone is not runtime evidence.
+User overrides win. Pass model and effort explicitly to `spawn` in `gather` for the Claude and agy seats. Spawn the Codex seat with `tier="hard"` and no `model`, so it always gets the router's best Sol model; never name a Sol version here, and record the model and effort from the `spawn` result as requested settings. Do not substitute another model. Describe the agy seat as Flash if that is what it runs; do not claim Gemini Pro or a flagship model without runtime proof. An unavailable or incompatible seat blocks approval. Record requested settings separately from actual settings verified by runtime evidence; otherwise mark actual model and effort unverified. Router configuration alone is not runtime evidence.
 
 ## Scope and budget
 

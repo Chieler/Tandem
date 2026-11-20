@@ -2371,6 +2371,10 @@ out=$(call "$L" spawn '{"harness":"codex","name":"r5r","task":"Review the retry 
 expect_screen "codex review task" "$(pane_of "$out")" "flags:  -m gpt-6.2-sol -c model_reasoning_effort=\"high\""
 out=$(call "$L" spawn '{"harness":"codex","name":"r5h","task":"Design the architecture for cross-machine sync."}')
 expect_screen "codex hard task" "$(pane_of "$out")" "flags:  -m gpt-6.2-sol -c model_reasoning_effort=\"high\""
+out=$(CNTCTR_ROUTE_CODEX_HARD=gpt-9-sol:xhigh call "$L" spawn '{"harness":"codex","name":"r5o","task":"x","tier":"hard"}')
+expect_screen "route env overrides model and effort" "$(pane_of "$out")" "flags:  -m gpt-9-sol -c model_reasoning_effort=\"xhigh\""
+out=$(CNTCTR_ROUTE_CODEX_HARD=gpt-9-sol call "$L" spawn '{"harness":"codex","name":"r5p","task":"x","tier":"hard"}')
+expect_screen "route env model alone keeps the table effort" "$(pane_of "$out")" "flags:  -m gpt-9-sol -c model_reasoning_effort=\"high\""
 out=$(call "$L" spawn '{"harness":"agy","name":"r6b","task":"rename foo to bar"}')
 expect_screen "agy light task stays on medium" "$(pane_of "$out")" "flags:  --model gemini-3.8-flash-medium --effort medium"
 out=$(call "$L" spawn '{"harness":"agy","name":"r6","task":"Design the architecture for the new sync layer."}')

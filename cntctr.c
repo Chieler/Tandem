@@ -1210,12 +1210,40 @@ static const struct { int tier; const char *words[12]; } RULES[] = {
     {2, {"review", "audit", "verify", "merge", "critique", "judge", NULL}},
     {0, {"smoke test", "rename", "typo", "format", "lookup", "look up", "list ", "summari", "transcri", "count", NULL}},
 };
+/* Model names live here and nowhere else: bump one line to move every tier that uses it.
+ * Skills (sol-loop, council) ask for tier "hard" on codex instead of naming a model. */
+#define M_CLAUDE_LIGHT "claude-haiku-5-5"
+#define M_CLAUDE_STD   "claude-sonnet-5-5"
+#define M_CLAUDE_REV   "claude-opus-4-7"
+#define M_CLAUDE_HARD  "claude-opus-5-5"
+#define M_CODEX_LIGHT  "gpt-6.1-terra"
+#define M_CODEX_SOL    "gpt-6.2-sol"   /* best codex model: standard, review, hard */
+#define M_AGY_MID      "gemini-3.8-flash-medium"
+#define M_AGY_HIGH     "gemini-3.8-flash-high"
 /* model, effort for each tier, per harness: claude, codex, agy */
 static const char *ROUTES[3][4][2] = {
-    {{"claude-haiku-5-5", "medium"}, {"claude-sonnet-5-5", "medium"}, {"claude-opus-4-7", "high"}, {"claude-opus-5-5", "high"}},
-    {{"gpt-6.1-terra", "low"}, {"gpt-6.2-sol", "medium"}, {"gpt-6.2-sol", "high"}, {"gpt-6.2-sol", "high"}},
-    {{"gemini-3.8-flash-medium", "medium"}, {"gemini-3.8-flash-medium", "medium"}, {"gemini-3.8-flash-high", "high"}, {"gemini-3.8-flash-high", "high"}},
+    {{M_CLAUDE_LIGHT, "medium"}, {M_CLAUDE_STD, "medium"}, {M_CLAUDE_REV, "high"}, {M_CLAUDE_HARD, "high"}},
+    {{M_CODEX_LIGHT, "low"}, {M_CODEX_SOL, "medium"}, {M_CODEX_SOL, "high"}, {M_CODEX_SOL, "high"}},
+    {{M_AGY_MID, "medium"}, {M_AGY_MID, "medium"}, {M_AGY_HIGH, "high"}, {M_AGY_HIGH, "high"}},
 };
+
+/* The routed model (field 0) or effort (field 1) for harness h, tier t. Env
+ * CNTCTR_ROUTE_<CLAUDE|CODEX|AGY>_<LIGHT|STANDARD|REVIEW|HARD>="model[:effort]" overrides the
+ * table with no rebuild, e.g. CNTCTR_ROUTE_CODEX_HARD=gpt-6.3-sol:xhigh.
+ * ponytail: env only; a config file if overrides ever outgrow a few variables. */
+static const char *route_pick(int h, int t, int field) {
+    static char buf[3][4][2][128];
+    static const char *const HN[] = {"CLAUDE", "CODEX", "AGY"};
+    char var[48], *dst = buf[h][t][field];
+    snprintf(var, sizeof var, "CNTCTR_ROUTE_%s_%s", HN[h], TIERS[t]);
+    for (char *c = var; *c; c++) *c = toupper((unsigned char)*c);
+    const char *v = getenv(var), *colon = v ? strchr(v, ':') : NULL;
+    if (!v || !*v || *v == ':' || *v == '-') return ROUTES[h][t][field];   /* unset or malformed */
+    if (field == 0) snprintf(dst, sizeof buf[0][0][0], "%.*s", (int)(colon ? colon - v : strlen(v)), v);
+    else if (colon && colon[1]) snprintf(dst, sizeof buf[0][0][0], "%s", colon + 1);
+    else return ROUTES[h][t][1];
+    return dst;
+}
 
 static int route(const char *task) {
     for (size_t r = 0; r < sizeof RULES / sizeof *RULES; r++)
@@ -1718,8 +1746,8 @@ static int spawn_locked(json_object *a, int wait, char id[9], char **pane_out,
         if (strcmp(tier, TIERS[i]) == 0) t = i;
     if (t < 0) return fail(res, fmt("bad tier %s", tier));
     int h = agy ? 2 : strcmp(harness, "codex") == 0;
-    if (!model) model = ROUTES[h][t][0];
-    if (!effort) effort = ROUTES[h][t][1];
+    if (!model) model = route_pick(h, t, 0);
+    if (!effort) effort = route_pick(h, t, 1);
     char dir[4096];
     if (!cwd) cwd = getcwd(dir, sizeof dir) ? dir : ".";
     new_id(id);
@@ -2557,7 +2585,7 @@ static char *start_review(sqlite3 *db, const struct project *p, const char *name
         static const int ORDER[] = {2, 3, 1, 0};
         h = !strcmp(ah, "agy") ? 2 : !strcmp(ah, "codex");
         for (int i = 0; i < 4 && !harness; i++)
-            if (strcmp(ROUTES[h][ORDER[i]][0], author_model) != 0) harness = ah, tier = ORDER[i];
+            if (strcmp(route_pick(h, ORDER[i], 0), author_model) != 0) harness = ah, tier = ORDER[i];
     }
     if (!harness) why = fmt("no reviewer on a different model");
     if (!why && (why = review_copy(p, name, version, path))) {
@@ -2618,7 +2646,7 @@ static char *start_review(sqlite3 *db, const struct project *p, const char *name
         untrack(sid);   /* the reviewer answers with tool_verdict, not reply */
         const char *hold = getenv("CNTCTR_TEST_HOLD_BIND");
         if (hold) sleep((unsigned)atoi(hold));
-        if (kb_tool_bind(db, p->key, name, version, pane, ROUTES[h][tier][0], path) != 1) {
+        if (kb_tool_bind(db, p->key, name, version, pane, route_pick(h, tier, 0), path) != 1) {
             review_cleanup(pane, path);   /* a supersede or revoke won; its status stays */
             r = fmt("%s v%d was superseded or revoked before its review started", name, version);
         } else {

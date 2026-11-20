@@ -11,9 +11,9 @@ Get one independent Sol review of a fixed change scope, make minimal warranted f
 
 | Seat | cntctr harness | Requested model | Requested effort |
 | --- | --- | --- | --- |
-| Sol | `codex` | `gpt-6.1-sol` | `high` |
+| Sol | `codex` | router `hard` tier: the best Sol model | `high` |
 
-User overrides win. Pass model and effort explicitly to `spawn`; do not rely on routing or substitute another model. An unavailable or incompatible seat blocks approval. Record requested settings separately from actual settings verified by runtime evidence; otherwise mark actual model and effort unverified. Router configuration alone is not runtime evidence.
+User overrides win. Spawn the Sol seat with `tier="hard"` and no `model`, so it always gets the router's best Sol model; never name a Sol version here. Read the model and effort from the `spawn` result and record them as the requested settings. Do not substitute another model. An unavailable or incompatible seat blocks approval. Record requested settings separately from actual settings verified by runtime evidence; otherwise mark actual model and effort unverified. Router configuration alone is not runtime evidence.
 
 ## Scope and budget
 
