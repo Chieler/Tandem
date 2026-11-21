@@ -1067,7 +1067,8 @@ u5p2_run() {
     same "U8 a new turn with no delivery makes staged mail pending again" "$(mstate "$m")" "pending/1/0"
     sqx "$CNTCTR_DB" "UPDATE mail SET presentations=2 WHERE post=$m" # a second line was typed for it
     ans=$(c_prompt "$P" "$(pointer "$m")")
-    check "U8 the mail comes again" "$(ctx_c "$ans")" "maybe seen mail"
+    refute "U8 repeat omits the full body" "$(ctx_c "$ans")" "maybe seen mail"
+    check "U8 repeat points to board" "$(ctx_c "$ans")" "board"
     check "U8 and says it may be a repeat" "$(ctx_c "$ans")" "(may be a repeat)"
     same "U8 the repeat is staged, still counted twice" "$(mstate "$m")" "staged/2/0"
     c_stop "$P" >/dev/null
@@ -1078,6 +1079,23 @@ u5p2_run() {
     a_pre "$Q" 0 "$(pointer "$m")" >/dev/null
     a_pre "$Q" 0 "an unrelated question" >/dev/null
     same "U8 agy: a new turn with no delivery makes staged mail pending again" "$(mstate "$m")" "pending/1/0"
+
+    # A pointer may have been typed for a different prompt: its count alone is not a full presentation.
+    P=$(hk_agent claude repeat_pointer)
+    m=$(mailput "$P" e1000001 "$(mail_text e1000001 'pointer-only body')" 1)
+    ans=$(c_stop "$P")
+    check "pointer-only wake still gets its full body" "$(printf '%s' "$ans" | jq -r '.reason')" "pointer-only body"
+    refute "pointer-only wake is not a repeat" "$(printf '%s' "$ans" | jq -r '.reason')" "may be a repeat"
+
+    # A blocked Stop and its continuation retain the turn token. An error Stop re-pends it.
+    Q=$(hk_agent agy repeat_block)
+    m=$(mailput "$Q" e1000002 "$(mail_text e1000002 'blocked-stop body')" 0)
+    ans=$(a_stop "$Q" NO_TOOL_CALL)
+    check "blocked Stop first shows the body" "$(printf '%s' "$ans" | jq -r '.reason')" "blocked-stop body"
+    a_stop "$Q" ERROR >/dev/null
+    ans=$(a_pre "$Q" 0 "$(pointer "$m")")
+    refute "blocked Stop does not show the body twice" "$(ctx_a "$ans")" "blocked-stop body"
+    check "blocked Stop repeat has a board pointer" "$(ctx_a "$ans")" "board"
 
     # U10: mail staged by the prompt hook is not presented again by the Stop of the same turn
     P=$(hk_agent claude u5_d5)
@@ -1301,7 +1319,12 @@ u5p4_run() {
     wait_mstate "U11 the first line is typed and counted" "$id" "pending/1/0"
     for i in 1 2 3; do
         ans=$(a_pre "$Q" 0 "$(pointer "$id")")
-        check "U11 presentation $i attaches the mail" "$(ctx_a "$ans")" "mail that is never delivered"
+        if [ "$i" -eq 1 ]; then
+            check "U11 first presentation attaches the mail" "$(ctx_a "$ans")" "mail that is never delivered"
+        else
+            refute "U11 repeat $i omits the body" "$(ctx_a "$ans")" "mail that is never delivered"
+            check "U11 repeat $i points to board" "$(ctx_a "$ans")" "[cntctr mail id=$id] (may be a repeat); call board"
+        fi
         same "U11 presentation $i is staged" "$(mstate "$id")" "staged/$i/0"
         a_stop "$Q" ERROR >/dev/null
         if [ "$i" -lt 3 ]; then wait_mstate "U11 after an error Stop the retry thread types the line again" "$id" "pending/$((i + 1))/0"; fi
@@ -1656,10 +1679,12 @@ f6_5() {
     lines=$(screen "$P" | grep -c '\[cntctr mail id=')   # cat shows each typed line twice
     same "F5 the pointer is on the screen twice, typed twice" "$lines" 4
     ans=$(c_prompt "$P" "$(pointer "$id")")
-    check "F5 the second presentation attaches it again" "$(ctx_c "$ans")" "mail whose turn is cancelled"
+    refute "F5 release does not repeat the full body" "$(ctx_c "$ans")" "mail whose turn is cancelled"
+    check "F5 release points to the stored mail" "$(ctx_c "$ans")" "board"
     wait_mstate "F5 again no Stop: pending, typed a third time" "$id" "pending/3/0"
     ans=$(c_prompt "$P" "$(pointer "$id")")
-    check "F5 the third presentation attaches it" "$(ctx_c "$ans")" "mail whose turn is cancelled"
+    refute "F5 third presentation omits the full body" "$(ctx_c "$ans")" "mail whose turn is cancelled"
+    check "F5 third presentation points to the stored mail" "$(ctx_c "$ans")" "board"
     wait_mstate "F5 the third presentation ended without delivery: stalled" "$id" "stalled/3/0"
     same "F5 the sender is told once" "$(notices "$id")" 1
     sleep 3

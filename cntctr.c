@@ -4310,7 +4310,7 @@ static int answer_fits(const char *harness, const char *event, enum hook_answer_
 }
 
 static char *mail_piece(const struct mrow *r, const char *body) {
-    return r->repeat ? fmt("(may be a repeat)\n%s", body) : strdup(body);
+    return r->repeat ? fmt("[cntctr mail id=%lld] (may be a repeat); call board for the full mail", r->id) : strdup(body);
 }
 
 /* The text for a hook answer: as many of the rows (oldest first) as the harness budget takes, then `extra`.
@@ -4354,7 +4354,7 @@ static char *fit_mail(const char *harness, const char *event, enum hook_answer_k
 static int pending_rows(sqlite3 *db, const char *socket, const char *pane, long long server_start, long long own, struct mrow *rows, int max) {
     sqlite3_stmt *st = NULL;
     int n = 0;
-    if (sqlite3_prepare_v2(db, "SELECT mail.post, posts.text, mail.presentations FROM mail JOIN posts ON posts.rowid=mail.post "
+    if (sqlite3_prepare_v2(db, "SELECT mail.post, posts.text, mail.staged_turn FROM mail JOIN posts ON posts.rowid=mail.post "
                                "WHERE mail.pane=?1 AND mail.socket=?5 AND mail.socket!='' AND mail.state='pending' AND mail.delivered=0 AND (mail.presentations<3 OR mail.post=?4) "
                                "AND ?2>0 AND posts.at>?2 ORDER BY mail.post LIMIT ?3", -1, &st, NULL) != SQLITE_OK) return 0;   /* only mail of this pane on this tmux server, stored after the server started */
     sqlite3_bind_text(st, 1, pane, -1, SQLITE_TRANSIENT);
@@ -4365,7 +4365,8 @@ static int pending_rows(sqlite3 *db, const char *socket, const char *pane, long 
     while (sqlite3_step(st) == SQLITE_ROW) {
         rows[n].id = sqlite3_column_int64(st, 0);
         rows[n].text = strdup((const char *)sqlite3_column_text(st, 1));
-        rows[n].repeat = sqlite3_column_int(st, 2) - (rows[n].id == own) > 0;
+        /* A wake line increments presentations without showing the body. Only staging records a hook presentation. */
+        rows[n].repeat = sqlite3_column_type(st, 2) != SQLITE_NULL;
         n++;
     }
     sqlite3_finalize(st);
