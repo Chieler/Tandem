@@ -4300,6 +4300,7 @@ static char *excerpt(const char *text, const char *path, size_t head, size_t tai
 }
 
 struct mrow { long long id; char *text; int repeat; };
+static json_object *hook_trace;
 
 static int answer_fits(const char *harness, const char *event, enum hook_answer_kind kind, const char *text) {
     json_object *a = hook_answer(harness, event, kind, text);
@@ -4395,7 +4396,10 @@ static json_object *hook_attach(sqlite3 *db, const char *harness, const char *ev
     char *text = n ? fit_mail(harness, event, HOOK_ATTACH, rows, n, NULL, &taken) : NULL;
     if (taken) stage_rows(db, rows, taken, own, token);
     if (hook_commit(db, taken > 0)) {
-        if (taken) answer = hook_answer(harness, event, HOOK_ATTACH, text);
+        if (taken) {
+            answer = hook_answer(harness, event, HOOK_ATTACH, text);
+            if (hook_trace) json_object_object_add(hook_trace, "attached", json_object_new_int(taken));
+        }
     }
     for (int i = 0; i < n; i++) free(rows[i].text);
     free(text);
@@ -4569,7 +4573,8 @@ static json_object *hook_stop(sqlite3 *db, const char *socket, const char *pane,
         sqlite3_bind_text(st, 2, token, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 3, normal ? "delivered" : "pending", -1, SQLITE_STATIC);
         sqlite3_bind_int(st, 4, normal);
-        sqlite3_step(st);
+        if (sqlite3_step(st) == SQLITE_DONE && hook_trace && normal)
+            json_object_object_add(hook_trace, "delivered", json_object_new_int(sqlite3_changes(db)));
     }
     sqlite3_finalize(st);
     struct gate g;
@@ -4602,7 +4607,10 @@ static json_object *hook_stop(sqlite3 *db, const char *socket, const char *pane,
             sqlite3_finalize(st);
         }
         if (hook_commit(db, taken || named)) {
-            if (taken || named) answer = hook_answer(harness, event->kind, HOOK_BLOCK, text);
+            if (taken || named) {
+                answer = hook_answer(harness, event->kind, HOOK_BLOCK, text);
+                if (hook_trace) json_object_object_add(hook_trace, "re_presented", json_object_new_int(taken));
+            }
         } else {
             begun = 0;   /* the commit failed and was rolled back: no reminder was given */
         }
@@ -4644,6 +4652,7 @@ static json_object *hook_decide(sqlite3 *db, const char *socket, const char *pan
     }
     sqlite3_finalize(st);
     if (!token) return NULL;
+    if (hook_trace) json_object_object_add(hook_trace, "token", json_object_new_string(token));
     if (server_start <= 0) {   /* no SessionStart was recorded (agy sends none): read the server's start once, keep it with the session */
         char *out = NULL;
         if (TMUX(NULL, &out, "display", "-p", "#{start_time}") == 0 && atoll(out) > 0) {
@@ -4688,6 +4697,40 @@ static json_object *hook_decide(sqlite3 *db, const char *socket, const char *pan
     return answer;
 }
 
+/* Snapshots contain only routing and state metadata, never mail text. */
+static json_object *trace_snapshot(sqlite3 *db, const char *socket, const char *pane) {
+    json_object *snap = json_object_new_object(), *mail = json_object_new_array();
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT turn,last_event,stop_blocked FROM hook_sessions WHERE socket=?1 AND pane=?2", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, socket, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, pane, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            json_object *session = json_object_new_object();
+            json_object_object_add(session, "turn", json_object_new_int64(sqlite3_column_int64(st, 0)));
+            json_object_object_add(session, "last_event", json_object_new_string((const char *)sqlite3_column_text(st, 1)));
+            json_object_object_add(session, "stop_blocked", json_object_new_int(sqlite3_column_int(st, 2)));
+            json_object_object_add(snap, "session", session);
+        }
+    }
+    sqlite3_finalize(st); st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT post,state,staged_turn,presentations,socket FROM mail WHERE pane=?1 AND delivered=0 ORDER BY post", -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(st, 1, pane, -1, SQLITE_TRANSIENT);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            json_object *row = json_object_new_object();
+            json_object_object_add(row, "post", json_object_new_int64(sqlite3_column_int64(st, 0)));
+            json_object_object_add(row, "state", json_object_new_string((const char *)sqlite3_column_text(st, 1)));
+            const unsigned char *turn = sqlite3_column_text(st, 2);
+            json_object_object_add(row, "staged_turn", turn ? json_object_new_string((const char *)turn) : NULL);
+            json_object_object_add(row, "presentations", json_object_new_int(sqlite3_column_int(st, 3)));
+            json_object_object_add(row, "socket", json_object_new_string((const char *)sqlite3_column_text(st, 4)));
+            json_object_array_add(mail, row);
+        }
+    }
+    sqlite3_finalize(st);
+    json_object_object_add(snap, "mail", mail);
+    return snap;
+}
+
 static int hook_cmd(int argc, char **argv) {
     struct sigaction sa = {0}; sa.sa_handler = hook_alarm; sigemptyset(&sa.sa_mask); sigaction(SIGALRM, &sa, NULL);
     struct itimerval timer = {{0, 0}, {1, 800000}}; setitimer(ITIMER_REAL, &timer, NULL);
@@ -4701,7 +4744,25 @@ static int hook_cmd(int argc, char **argv) {
         return 0;
     }
     json_object *decided = NULL;
+    char *trace_log = NULL;
     if (argc >= 4 && (!strcmp(argv[2], "claude") || !strcmp(argv[2], "agy") || !strcmp(argv[2], "codex"))) {
+        const char *home = getenv("HOME");
+        if (home && *home) {
+            char *marker = fmt("%s/.local/share/cntctr/hook-trace", home);
+            if (access(marker, F_OK) == 0) {
+                trace_log = fmt("%s/.local/share/cntctr/hook-trace.log", home);
+                hook_trace = json_object_new_object();
+                struct timeval tv; gettimeofday(&tv, NULL);
+                json_object_object_add(hook_trace, "timestamp_us", json_object_new_int64((long long)tv.tv_sec * 1000000 + tv.tv_usec));
+                json_object_object_add(hook_trace, "pid", json_object_new_int64(getpid()));
+                json_object_object_add(hook_trace, "harness", json_object_new_string(argv[2]));
+                json_object_object_add(hook_trace, "event", json_object_new_string(argv[3]));
+                json_object_object_add(hook_trace, "attached", json_object_new_int(0));
+                json_object_object_add(hook_trace, "delivered", json_object_new_int(0));
+                json_object_object_add(hook_trace, "re_presented", json_object_new_int(0));
+            }
+            free(marker);
+        }
         char *data = calloc(1, 1048577); size_t n = 0; ssize_t got;
         if (!data) { free(socket); puts("{}"); return 0; }
         while (n < 1048576 && (got = read(STDIN_FILENO, data + n, 1048576 - n)) > 0) n += (size_t)got;
@@ -4727,9 +4788,14 @@ static int hook_cmd(int argc, char **argv) {
             if ((!pane || !*pane || !*socket) && !strcmp(argv[2], "claude")) hook_session_identity(pid, found_pane, &socket);
             if ((!pane || !*pane) && !*found_pane && had_socket) hook_ancestor_pane(found_pane);
             if (!pane || !*pane) pane = found_pane;
+            if (hook_trace) {
+                json_object_object_add(hook_trace, "pane", json_object_new_string(pane));
+                json_object_object_add(hook_trace, "session_id", json_object_new_string(event.session));
+            }
             if (*pane && *socket && !hook_nested(procs, pid, pane)) {   /* an event from a nested agent records and answers nothing */
                 char *err = NULL; sqlite3 *db = kb_timed(&err, 1000); free(err);
                 if (db) {
+                    if (hook_trace) json_object_object_add(hook_trace, "before", trace_snapshot(db, socket, pane));
                     long long started = 0;
                     if (!strcmp(event.kind, "SessionStart")) {   /* the one tmux read of this event: mail older than the server is not ours */
                         char *out = NULL;
@@ -4738,12 +4804,31 @@ static int hook_cmd(int argc, char **argv) {
                     }
                     record_hook(db, socket, pane, argv[2], pid, &event, started);
                     decided = hook_decide(db, socket, pane, argv[2], &event);
+                    if (hook_trace) json_object_object_add(hook_trace, "after", trace_snapshot(db, socket, pane));
                     sqlite3_close(db);
                 }
             }
             free(procs);
         }
         if (input) json_object_put(input);
+    }
+    if (hook_trace) {
+        json_object *a = NULL, *d = NULL, *r = NULL;
+        json_object_object_get_ex(hook_trace, "attached", &a);
+        json_object_object_get_ex(hook_trace, "delivered", &d);
+        json_object_object_get_ex(hook_trace, "re_presented", &r);
+        int attached = json_object_get_int(a), delivered = json_object_get_int(d), repeated = json_object_get_int(r);
+        json_object_object_add(hook_trace, "action", json_object_new_string(
+            attached ? "attached" : delivered && repeated ? "marked delivered and re-presented" :
+            delivered ? "marked delivered" : repeated ? "re-presented" : "nothing"));
+        int fd = open(trace_log, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0600);
+        if (fd >= 0) {
+            char *line = fmt("%s\n", json_object_to_json_string_ext(hook_trace, JSON_C_TO_STRING_PLAIN));
+            (void)write(fd, line, strlen(line));
+            free(line); close(fd);
+        }
+        json_object_put(hook_trace); hook_trace = NULL;
+        free(trace_log);
     }
     free(socket);
     json_object *answer = decided ? decided : hook_answer(argc > 2 ? argv[2] : "", argc > 3 ? argv[3] : "", HOOK_NEUTRAL, NULL);

@@ -988,6 +988,31 @@ u5p2_run() {
     local P S Q m m2 ans out
     P=$(hk_agent claude u5_d1)
     S=$(newpane u5_d1_sender)
+    mkdir -p "$HOME/.local/share/cntctr"
+    m=$(mailput "$P" d1000099 "$(mail_text d1000099 'trace-private-body')" 1)
+    c_prompt "$P" "$(pointer "$m")" >/dev/null
+    [ ! -e "$HOME/.local/share/cntctr/hook-trace.log" ] && ok_ || bad "trace is disabled without marker"
+    c_stop "$P" >/dev/null
+    : > "$HOME/.local/share/cntctr/hook-trace"
+    m=$(mailput "$P" d1000098 "$(mail_text d1000098 'trace-private-body')" 1)
+    c_prompt "$P" "$(pointer "$m")" >/dev/null
+    c_stop "$P" >/dev/null
+    local log="$HOME/.local/share/cntctr/hook-trace.log"
+    same "trace writes one line per invocation" "$(wc -l < "$log" | tr -d ' ')" 2
+    jq -e --argjson id "$m" 'select(.event == "UserPromptSubmit" and .attached == 1 and (.before.mail | any(.post == $id and .state == "pending")) and (.after.mail | any(.post == $id and .state == "staged")))' "$log" >/dev/null && ok_ || bad "trace records attachment and mail transition"
+    jq -e 'select(.event == "Stop" and .delivered == 1 and .token != null and .after.session.last_event == "Stop")' "$log" >/dev/null && ok_ || bad "trace records delivery and token"
+    m=$(mailput "$P" d1000097 "$(mail_text d1000097 'trace-stop-body')" 0)
+    c_stop "$P" >/dev/null
+    jq -e --argjson id "$m" 'select(.event == "Stop" and .re_presented == 1 and .action == "re-presented" and (.before.mail | any(.post == $id and .state == "pending")) and (.after.mail | any(.post == $id and .state == "staged")))' "$log" >/dev/null && ok_ || bad "trace records Stop presentation"
+    c_stop "$P" true >/dev/null
+    refute "trace excludes body" "$(cat "$log")" "trace-private-body"
+    refute "trace excludes Stop body" "$(cat "$log")" "trace-stop-body"
+    rm "$HOME/.local/share/cntctr/hook-trace"
+    local lines
+    lines=$(wc -l < "$log")
+    c_prompt "$P" hello >/dev/null
+    same "trace stops when marker is removed" "$(wc -l < "$log")" "$lines"
+    c_stop "$P" >/dev/null
     # U7: a normal Stop of the staging turn delivers
     m=$(mailput "$P" d1000001 "$(mail_text d1000001 'normal stop mail')" 1)
     c_prompt "$P" "$(pointer "$m")" >/dev/null
