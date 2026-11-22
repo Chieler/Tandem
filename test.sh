@@ -1716,6 +1716,66 @@ f6_1() {
     exec 24>&- 25<&-; kill "$HK_PID_c2" 2>/dev/null; wait "$HK_PID_c2" 2>/dev/null
     t2 kill-server 2>/dev/null
 
+    # A second server on the same project cannot use a recycled name to get mail.
+    local shared_dir="$TMPD/f6_shared_project" saved_scope="$U5_SCOPE"
+    mkdir "$shared_dir"
+    git -C "$shared_dir" init -q
+    W=$(hk_agent claude f6_shared_name)
+    t respawn-pane -k -t "$W" -c "$shared_dir" cat
+    t set -p -t "$W" @cntctr_name f6_shared_name
+    U5_SCOPE=$(txt "$(call "$W" project '{}')" | sed -n 's/^project \(.*\) (root .*/\1/p')
+    m=$(mailput "$W" f6a00002 "$(mail_text f6a00002 'first socket private body')" 0)
+    t2 new-session -d -s shared -c "$shared_dir" cat
+    sock2=$(t2 display -p '#{socket_path}')
+    U=$(t2 display -p '#{pane_id}')
+    t2 set -p -t "$U" @cntctr_name f6_shared_name
+    t2 set -p -t "$U" @cntctr_srv $$
+    ans=$(TMUX="$sock2,0,0" call_raw "$U" list '{}')
+    refute "foreign socket mail does not count as an unread board post" "$(notice "$ans")" "unread board post"
+    ans=$(TMUX="$sock2,0,0" call_raw "$U" board '{}')
+    refute "recent board hides same-name mail from a different socket" "$(txt "$ans")" "first socket private body"
+    same "recent board cannot acknowledge foreign-socket mail" "$(mstate "$m")" "pending/0/0"
+    sqx "$CNTCTR_DB" "UPDATE mail SET state='pending', delivered=0, shown=0, presentations=0 WHERE post=$m"
+
+    # Run its retry watcher and wait for an eligible control to prove the scan ran.
+    local first_socket retry_control wake_control
+    first_socket=$(t display -p '#{socket_path}')
+    retry_control=$(mailput "$W" f6a00003 "$(mail_text f6a00003 'second socket retry control')" 0)
+    sqx "$CNTCTR_DB" "UPDATE mail SET socket='$sock2',pane='$U' WHERE post=$retry_control"
+    TMUX="$sock2,0,0" daemon_start "$U"
+    daemon_hello
+    wait_mstate "second socket retry delivers its positive control" "$retry_control" "delivered/0/1"
+    refute "terminal retry skips same-name mail from a different socket" "$(t2 capture-pane -p -J -t "$U")" "first socket private body"
+    same "terminal retry cannot acknowledge foreign-socket mail" "$(mstate "$m")" "pending/0/0"
+    daemon_stop
+    sqx "$CNTCTR_DB" "UPDATE mail SET state='pending', delivered=0, shown=0, presentations=0 WHERE post=$m"
+
+    rm -f "$TMPD/hk_claude2_in" "$TMPD/hk_claude2_out"
+    mkfifo "$TMPD/hk_claude2_in" "$TMPD/hk_claude2_out"
+    TMUX="$sock2,0,0" "$TMPD/hook_harness/claude" "$BIN" claude < "$TMPD/hk_claude2_in" > "$TMPD/hk_claude2_out" &
+    HK_PID_c2=$!
+    exec 24> "$TMPD/hk_claude2_in" 25< "$TMPD/hk_claude2_out"
+    read -r n <&25
+    t2 set -p -t "$U" @cntctr_srv $$
+    hk claude2 UserPromptSubmit "$U" '{"session_id":"foreign","hook_event_name":"UserPromptSubmit","prompt":"hello"}' >/dev/null
+    hk claude2 Stop "$U" '{"session_id":"foreign","hook_event_name":"Stop","stop_hook_active":false}' >/dev/null
+    wake_control=$(mailput "$W" f6a00004 "$(mail_text f6a00004 'second socket wake control')" 0)
+    sqx "$CNTCTR_DB" "UPDATE mail SET socket='$sock2',pane='$U' WHERE post=$wake_control"
+    t2 set -p -t "$U" @cntctr_srv $$
+    TMUX="$sock2,0,0" daemon_start "$U"
+    daemon_hello
+    wait_mstate "second socket hook wakes for its positive control" "$wake_control" "pending/1/0"
+    refute "hook wake skips same-name mail from a different socket" "$(t2 capture-pane -p -J -t "$U")" "$(pointer "$m")"
+    same "hook wake leaves foreign-socket mail unchanged" "$(mstate "$m")" "pending/0/0"
+    same "original mail remains on the first socket" "$(sqx "$CNTCTR_DB" "SELECT socket FROM mail WHERE post=$m")" "$first_socket"
+    daemon_stop
+    exec 24>&- 25<&-
+    kill "$HK_PID_c2" 2>/dev/null
+    wait "$HK_PID_c2" 2>/dev/null
+    t2 kill-server 2>/dev/null
+
+    U5_SCOPE="$saved_scope"
+
     # (b) a session whose SessionStart was never recorded, after a restart, with old mail for a dead agent
     U=$(newpane f6_user); t set -p -t "$U" @cntctr_harness claude
     sqx "$CNTCTR_DB" "INSERT INTO posts(scope,sender,text,at) VALUES('$U5_SCOPE','sender','for builder (reply id=b0ld0001):

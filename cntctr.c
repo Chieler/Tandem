@@ -2180,11 +2180,22 @@ static int unread_count(const char *pane, const char *name) {
     long long after = seen_of(name), newest = after;
     int count = 0;
     char *key = pane_key(self_socket, pane);
-    free(kb_unread(db, p.key, name, key, server_start, after, &newest, &count));
+    free(kb_unread(db, p.key, name, key, self_socket, server_start, after, &newest, &count));
     free(key);
     sqlite3_close(db);
     if (!count && newest > after) set_seen(name, newest);   /* only our own posts were new */
     return count;
+}
+
+static void bind_mail_recipient(sqlite3_stmt *st, const char *scope, const char *name,
+                                const char *socket, const char *pane) {
+    char *key = pane_key(socket, pane);
+    sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, scope, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, key, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 4, server_start);
+    sqlite3_bind_text(st, 5, socket, -1, SQLITE_TRANSIENT);
+    free(key);
 }
 
 static int mail_waiting(const char *pane, const char *name) {
@@ -2196,11 +2207,8 @@ static int mail_waiting(const char *pane, const char *name) {
     resolve_project(db, pane, &p);
     sqlite3_stmt *st = NULL;
     int waiting = 0;
-    if (sqlite3_prepare_v2(db, "SELECT 1 FROM mail JOIN posts ON posts.rowid=mail.post WHERE (name=?1 OR (socket || char(10) || pane=?3 AND posts.at>?4 AND ?3 != '')) AND scope=?2 AND delivered=0 LIMIT 1", -1, &st, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 2, p.key, -1, SQLITE_TRANSIENT);
-        { char *pk = pane_key(self_socket, pane); sqlite3_bind_text(st, 3, pk, -1, SQLITE_TRANSIENT); free(pk); }
-        sqlite3_bind_int64(st, 4, server_start);
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM mail JOIN posts ON posts.rowid=mail.post WHERE " KB_MAIL_FOR("mail", "?1", "?2", "?5", "?3", "?4") " AND posts.scope=?2 AND delivered=0 LIMIT 1", -1, &st, NULL) == SQLITE_OK) {
+        bind_mail_recipient(st, p.key, name, self_socket, pane);
         waiting = sqlite3_step(st) == SQLITE_ROW;
     }
     sqlite3_finalize(st);
@@ -2314,8 +2322,7 @@ static int board_lookup(sqlite3 *db, const char *scope, json_object *a, json_obj
     int complete = 0, bad_offset = 0;
     const char *sql = "SELECT length(CAST(posts.text AS BLOB)), substr(CAST(posts.text AS BLOB), ?5 + 1, ?6) "
                       "FROM posts JOIN mail ON mail.post=posts.rowid WHERE mail.post=?1 "
-                      "AND ((mail.name=?2 AND ?2!='' AND posts.scope=?7 AND mail.socket IN (?8,'')) "
-                      "OR (mail.socket || char(10) || mail.pane=?3 AND ?3!='' AND posts.at>?4))";
+                      "AND " KB_MAIL_FOR("mail", "?2", "?7", "?8", "?3", "?4");
     int rc = sqlite3_prepare_v2(db, sql, -1, &st, NULL);
     if (rc == SQLITE_OK) {
         sqlite3_bind_int64(st, 1, id);
@@ -2374,12 +2381,12 @@ static int tool_board(json_object *a, char **res) {
         return fail(res, fmt("cannot read board snapshot"));
     }
     char *key = pane_key(self_socket, caller_pane);
-    char *out = kb_board(db, p.key, caller_name, key, server_start, limit);
+    char *out = kb_board(db, p.key, caller_name, key, self_socket, server_start, limit);
     long long after = seen_of(caller_name), newest = 0;
     int unseen = 0;
-    free(kb_unread(db, p.key, caller_name, key, server_start, after, &newest, &unseen));
-    int omitted = kb_omitted(db, p.key, caller_name, key, server_start, after, limit);
-    char *shown = kb_board_mail(db, p.key, caller_name, key, server_start, limit);
+    free(kb_unread(db, p.key, caller_name, key, self_socket, server_start, after, &newest, &unseen));
+    int omitted = kb_omitted(db, p.key, caller_name, key, self_socket, server_start, after, limit);
+    char *shown = kb_board_mail(db, p.key, caller_name, key, self_socket, server_start, limit);
     free(key);
     if (sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
         free(out);
@@ -3426,11 +3433,8 @@ static int redeliver_for(const char *pane, const char *name) {
         sqlite3_close(db);
         return waiting;
     }
-    if (sqlite3_prepare_v2(db, "SELECT post FROM mail JOIN posts ON posts.rowid=mail.post WHERE (name=?1 OR (socket || char(10) || pane=?3 AND posts.at>?4 AND ?3 != '')) AND scope=?2 AND delivered=0 AND state IN ('pending','staged') AND shown<3", -1, &st, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 2, p.key, -1, SQLITE_TRANSIENT);
-        { char *pk = pane_key(socket, pane); sqlite3_bind_text(st, 3, pk, -1, SQLITE_TRANSIENT); free(pk); }
-        sqlite3_bind_int64(st, 4, server_start);
+    if (sqlite3_prepare_v2(db, "SELECT post FROM mail JOIN posts ON posts.rowid=mail.post WHERE " KB_MAIL_FOR("mail", "?1", "?2", "?5", "?3", "?4") " AND posts.scope=?2 AND delivered=0 AND state IN ('pending','staged') AND shown<3", -1, &st, NULL) == SQLITE_OK) {
+        bind_mail_recipient(st, p.key, name, socket, pane);
         json_object *ids = json_object_new_array();
         int step;
         while ((step = sqlite3_step(st)) == SQLITE_ROW)
@@ -3448,8 +3452,10 @@ static int redeliver_for(const char *pane, const char *name) {
             int paste_failed = 0;
             int rc = sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
             if (rc == SQLITE_OK && sqlite3_prepare_v2(db, "SELECT posts.text, mail.hooked, mail.shown, "
-                    "(SELECT harness FROM hook_sessions WHERE socket=mail.socket AND pane=mail.pane) FROM posts JOIN mail ON posts.rowid=mail.post WHERE post=?1 AND delivered=0 AND state IN ('pending','staged') AND shown<3", -1, &st, NULL) == SQLITE_OK) {
-                sqlite3_bind_int64(st, 1, id);
+                    "(SELECT harness FROM hook_sessions WHERE socket=mail.socket AND pane=mail.pane) FROM posts JOIN mail ON posts.rowid=mail.post WHERE post=?6 AND delivered=0 AND state IN ('pending','staged') AND shown<3 "
+                    "AND posts.scope=?2 AND " KB_MAIL_FOR("mail", "?1", "?2", "?5", "?3", "?4"), -1, &st, NULL) == SQLITE_OK) {
+                bind_mail_recipient(st, p.key, name, socket, pane);
+                sqlite3_bind_int64(st, 6, id);
                 step = sqlite3_step(st);
                 char *body = step == SQLITE_ROW ? strdup((const char *)sqlite3_column_text(st, 0)) : NULL;
                 int shown = body ? sqlite3_column_int(st, 2) : 0;
@@ -4286,10 +4292,7 @@ static void release_unended(sqlite3 *db, const char *socket, const char *pane, c
     sqlite3_stmt *st = NULL;
     int staged = 0;
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 2, scope, -1, SQLITE_TRANSIENT);
-        { char *pk = pane_key(socket, pane); sqlite3_bind_text(st, 3, pk, -1, SQLITE_TRANSIENT); free(pk); }
-        sqlite3_bind_int64(st, 4, server_start);
+        bind_mail_recipient(st, scope, name, socket, pane);
         staged = sqlite3_step(st) == SQLITE_ROW;
     }
     sqlite3_finalize(st);
@@ -4321,10 +4324,7 @@ static void release_unended(sqlite3 *db, const char *socket, const char *pane, c
     sql = fmt("UPDATE mail SET state='pending' WHERE post IN (SELECT mail.post FROM mail JOIN posts ON posts.rowid=mail.post WHERE %s AND state='staged')", own);
     st = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 2, scope, -1, SQLITE_TRANSIENT);
-        { char *pk = pane_key(socket, pane); sqlite3_bind_text(st, 3, pk, -1, SQLITE_TRANSIENT); free(pk); }
-        sqlite3_bind_int64(st, 4, server_start);
+        bind_mail_recipient(st, scope, name, socket, pane);
         sqlite3_step(st);
     }
     sqlite3_finalize(st);
@@ -4339,16 +4339,13 @@ static void release_unended(sqlite3 *db, const char *socket, const char *pane, c
 /* The retry thread's turn for an agent that has hooks: wake it for its oldest pending mail.
  * Returns 1 while mail of this agent still waits for a hook, so the thread looks again. */
 static int wake_pending(sqlite3 *db, const char *socket, const char *pane, const char *name, const char *scope) {
-    const char *own = "(name=?1 OR (socket || char(10) || pane=?3 AND posts.at>?4 AND ?3 != '')) AND scope=?2 AND delivered=0";
+    const char *own = "" KB_MAIL_FOR("mail", "?1", "?2", "?5", "?3", "?4") " AND posts.scope=?2 AND delivered=0";
     release_unended(db, socket, pane, name, scope, own);
     char *sql = fmt("SELECT post FROM mail JOIN posts ON posts.rowid=mail.post WHERE %s AND state='pending' AND shown<3 ORDER BY post LIMIT 1", own);
     sqlite3_stmt *st = NULL;
     long long mail = 0;
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 2, scope, -1, SQLITE_TRANSIENT);
-        { char *pk = pane_key(socket, pane); sqlite3_bind_text(st, 3, pk, -1, SQLITE_TRANSIENT); free(pk); }
-        sqlite3_bind_int64(st, 4, server_start);
+        bind_mail_recipient(st, scope, name, socket, pane);
         if (sqlite3_step(st) == SQLITE_ROW) mail = sqlite3_column_int64(st, 0);
     }
     sqlite3_finalize(st);
@@ -4358,10 +4355,7 @@ static int wake_pending(sqlite3 *db, const char *socket, const char *pane, const
     int waiting = 0;
     st = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 2, scope, -1, SQLITE_TRANSIENT);
-        { char *pk = pane_key(socket, pane); sqlite3_bind_text(st, 3, pk, -1, SQLITE_TRANSIENT); free(pk); }
-        sqlite3_bind_int64(st, 4, server_start);
+        bind_mail_recipient(st, scope, name, socket, pane);
         waiting = sqlite3_step(st) == SQLITE_ROW;
     }
     sqlite3_finalize(st);
@@ -4744,7 +4738,7 @@ static char *task_reminder(sqlite3 *db, const struct gate *g, const char *socket
     long long newest = 0;
     int unread = 0;
     char *key = pane_key(socket, pane);
-    free(kb_unread(db, proj.key, g->name, key, server_start, g->seen, &newest, &unread));
+    free(kb_unread(db, proj.key, g->name, key, socket, server_start, g->seen, &newest, &unread));
     free(key);
     char *count = unread ? fmt(" %d unread board posts;", unread) : strdup("");
     char *text = fmt("[cntctr] you have not answered task %s;%s read the board, then reply with that id", list, count);
