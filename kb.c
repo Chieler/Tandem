@@ -120,7 +120,8 @@ static const struct { const char *table, *name, *def; } MIGRATIONS[] = {
 /* PRAGMA user_version of a database that has this file's SCHEMA and every column of MIGRATIONS: 1 for the 13 columns above, one
  * more for each column added later. A database stamped at or above it is opened as is and is never stamped down. A new table
  * in SCHEMA has no entry in MIGRATIONS: lower the 12 below by one for it, or databases stamped before it never get the table. */
-#define KB_SCHEMA_VERSION ((int)(sizeof MIGRATIONS / sizeof *MIGRATIONS) - 12)
+/* Version 4 also backfills data, without adding a column. */
+#define KB_SCHEMA_VERSION ((int)(sizeof MIGRATIONS / sizeof *MIGRATIONS) - 11)
 
 sqlite3 *kb_open_timeout(const char *path, char **err, int timeout_ms) {
     sqlite3 *db = NULL;
@@ -146,6 +147,10 @@ sqlite3 *kb_open_timeout(const char *path, char **err, int timeout_ms) {
     if (rc == SQLITE_OK) rc = sqlite3_exec(db, SCHEMA, NULL, NULL, NULL);
     for (size_t i = 0; rc == SQLITE_OK && i < sizeof MIGRATIONS / sizeof *MIGRATIONS; i++)
         rc = ensure_column(db, MIGRATIONS[i].table, MIGRATIONS[i].name, MIGRATIONS[i].def);
+    /* Legacy staging tokens prove an attempt and give no evidence of a full payload. */
+    if (rc == SQLITE_OK)
+        rc = sqlite3_exec(db, "UPDATE mail SET shown=1, staged_full=0 WHERE shown=0 AND staged_turn IS NOT NULL",
+                          NULL, NULL, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_exec(db, machine, NULL, NULL, NULL);
     if (rc == SQLITE_OK) {
         char stamp[48];

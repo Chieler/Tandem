@@ -1906,7 +1906,7 @@ f6_9() {
     sockpath=$(t display -p '#{socket_path}')
     rm -f "$d" "$d-wal" "$d-shm"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
-    same "F9 a new database carries a schema version" "$(sqx "$d" 'PRAGMA user_version')" 3
+    same "F9 a new database carries a schema version" "$(sqx "$d" 'PRAGMA user_version')" 4
     same "F9 and the machine row" "$(sqx "$d" "SELECT count(*) FROM meta WHERE k='machine'")" 1
     sqx "$d" "DELETE FROM meta WHERE k='machine'"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
@@ -1914,7 +1914,7 @@ f6_9() {
     sqx "$d" "ALTER TABLE mail DROP COLUMN socket; ALTER TABLE task_gate DROP COLUMN answered; PRAGMA user_version=0"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
     same "F9 an older database gets its columns back" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")$(sqx "$d" "SELECT count(*) FROM pragma_table_info('task_gate') WHERE name='answered'")" 11
-    same "F9 and the current version" "$(sqx "$d" 'PRAGMA user_version')" 3
+    same "F9 and the current version" "$(sqx "$d" 'PRAGMA user_version')" 4
 }
 
 # ---- fix round 7 (F7_1 to F7_6) ----
@@ -1973,7 +1973,7 @@ f7_2() {
     same "F7.2 and is not migrated by this build" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")" 0
     sqx "$d" "PRAGMA user_version=0"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
-    same "F7.2 an older database is migrated and stamped" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")$(sqx "$d" 'PRAGMA user_version')" 13
+    same "F7.2 an older database is migrated and stamped" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")$(sqx "$d" 'PRAGMA user_version')" 14
 }
 
 # f7_3: staged mail is released after a cancelled turn only for a spawned worker; a user's own session is left to its next prompt event
@@ -2090,9 +2090,18 @@ f8_4() {
     sqlite3 "$old" < tests/schema_v0.1.0.sql   # what a 0.1.0 database holds
     CNTCTR_DB=$old TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null   # opening migrates it
     sqlite3 "$stamped" < tests/schema_stamp1.sql   # a database stamped version 1, the schema of that version
-    sqx "$stamped" "INSERT INTO mail(post,name,pane,staged_turn) VALUES(1,'legacy','%1','old-turn')"
+    sqx "$stamped" "INSERT INTO mail(post,name,pane,staged_turn,presentations)
+        VALUES(1,'legacy','%1','old-turn',0),(2,'wake_only','%2',NULL,9);"
     CNTCTR_DB=$stamped TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
-    same "F8.4 existing mail starts with zero shown" "$(sqx "$stamped" "SELECT shown FROM mail WHERE post=1")" 0
+    same "F8.4 legacy staging token preserves one body attempt" "$(sqx "$stamped" "SELECT shown FROM mail WHERE post=1")" 1
+    same "F8.4 legacy token does not prove a full body" "$(sqx "$stamped" "SELECT staged_full FROM mail WHERE post=1")" 0
+    same "F8.4 pointer-only history keeps zero body attempts" "$(sqx "$stamped" "SELECT shown FROM mail WHERE post=2")" 0
+    sqx "$stamped" "UPDATE mail SET shown=2, staged_full=1 WHERE post=1;
+        INSERT INTO mail(post,name,pane,staged_turn) VALUES(3,'legacy_v3','%3','old-turn');
+        PRAGMA user_version=3;"
+    CNTCTR_DB=$stamped TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
+    same "F8.4 migration preserves existing count and full-body flag" "$(sqx "$stamped" "SELECT shown||'/'||staged_full FROM mail WHERE post=1")" "2/1"
+    same "F8.4 v3 token with zero attempts is backfilled" "$(sqx "$stamped" "SELECT shown||'/'||staged_full FROM mail WHERE post=3")" "1/0"
     CNTCTR_DB=$fresh TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
     same "F8.4 the stamped database has the tables and columns of a new one" "$(sqx "$stamped" "$cols")" "$(sqx "$fresh" "$cols")"
     same "F8.4 the migrated database has the tables and columns of a new one" "$(sqx "$old" "$cols")" "$(sqx "$fresh" "$cols")"
