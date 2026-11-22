@@ -554,7 +554,8 @@ int main(int argc, char **argv) {
     puts("READY");
     while (fgets(line, sizeof line, stdin)) {
         char event[128] = "", path[2048] = "", pane[64] = "", answer[2048] = "";
-        int n = sscanf(line, "%127s %2047s %63s %2047s", event, path, pane, answer);
+        char mode[16] = "";
+        int n = sscanf(line, "%127s %2047s %63s %2047s %15s", event, path, pane, answer, mode);
         if (n < 2) continue;
         pid_t child = fork();
         if (!child) {
@@ -565,7 +566,8 @@ int main(int argc, char **argv) {
             _exit(127);
         }
         int st;
-        waitpid(child, &st, 0);
+        if (strcmp(mode, "async")) waitpid(child, &st, 0);
+        while (waitpid(-1, &st, WNOHANG) > 0) {}
         puts("DONE");
     }
     return 0;
@@ -817,7 +819,7 @@ hk_boot() {
     for h in claude agy; do
         rm -f "$TMPD/hk_${h}_in" "$TMPD/hk_${h}_out"
         mkfifo "$TMPD/hk_${h}_in" "$TMPD/hk_${h}_out"
-        "$TMPD/hook_harness/$h" "$BIN" "$h" < "$TMPD/hk_${h}_in" > "$TMPD/hk_${h}_out" &
+        CNTCTR_TEST_STOP_PAUSE="$TMPD/hold_stop" "$TMPD/hook_harness/$h" "$BIN" "$h" < "$TMPD/hk_${h}_in" > "$TMPD/hk_${h}_out" &
         eval "HK_PID_$h=$!"
     done
     exec 20> "$TMPD/hk_claude_in" 21< "$TMPD/hk_claude_out" 22> "$TMPD/hk_agy_in" 23< "$TMPD/hk_agy_out"
@@ -1997,7 +1999,7 @@ f6_9() {
     sockpath=$(t display -p '#{socket_path}')
     rm -f "$d" "$d-wal" "$d-shm"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
-    same "F9 a new database carries a schema version" "$(sqx "$d" 'PRAGMA user_version')" 4
+    same "F9 a new database carries a schema version" "$(sqx "$d" 'PRAGMA user_version')" 6
     same "F9 and the machine row" "$(sqx "$d" "SELECT count(*) FROM meta WHERE k='machine'")" 1
     sqx "$d" "DELETE FROM meta WHERE k='machine'"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
@@ -2005,7 +2007,7 @@ f6_9() {
     sqx "$d" "ALTER TABLE mail DROP COLUMN socket; ALTER TABLE task_gate DROP COLUMN answered; PRAGMA user_version=0"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
     same "F9 an older database gets its columns back" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")$(sqx "$d" "SELECT count(*) FROM pragma_table_info('task_gate') WHERE name='answered'")" 11
-    same "F9 and the current version" "$(sqx "$d" 'PRAGMA user_version')" 4
+    same "F9 and the current version" "$(sqx "$d" 'PRAGMA user_version')" 6
 }
 
 # ---- fix round 7 (F7_1 to F7_6) ----
@@ -2064,7 +2066,7 @@ f7_2() {
     same "F7.2 and is not migrated by this build" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")" 0
     sqx "$d" "PRAGMA user_version=0"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
-    same "F7.2 an older database is migrated and stamped" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")$(sqx "$d" 'PRAGMA user_version')" 14
+    same "F7.2 an older database is migrated and stamped" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")$(sqx "$d" 'PRAGMA user_version')" 16
 }
 
 # f7_3: staged mail is released after a cancelled turn only for a spawned worker; a user's own session is left to its next prompt event
@@ -2199,12 +2201,56 @@ f8_4() {
     check "F8.4 (and the list is not empty)" "$(sqx "$fresh" "$cols")" "mail.socket"
 }
 
+# W1-3: hold a recorded Stop while the same harness records the next turn.
+f8_5() {
+    local P id ans ready
+    P=$(hk_agent claude late_stop)
+    c_prompt "$P" 'turn N' >/dev/null
+    id=$(mailput "$P" f8000005 "$(mail_text f8000005 'mail for turn N plus one')" 1)
+    printf '%s' '{"session_id":"S1","hook_event_name":"Stop","stop_hook_active":false}' > "$TMPD/late_stop_event"
+    touch "$TMPD/hold_stop"
+    printf 'Stop %s %s %s async\n' "$TMPD/late_stop_event" "$P" "$TMPD/late_stop_answer" >&20
+    read -r ready <&21
+    waitfor_hook_pause "$TMPD/hold_stop.ready"
+    ans=$(c_prompt "$P" "$(pointer "$id")")
+    same "newer prompt stages the exact mail body" "$(ctx_c "$ans")" "$(mail_text f8000005 'mail for turn N plus one')"
+    rm -f "$TMPD/hold_stop"
+    waitfor_hook_pause "$TMPD/late_stop_answer"
+    ans=$(cat "$TMPD/late_stop_answer")
+    emptyans "$ans" && ok_ || bad "displaced Stop returns a neutral answer" "  got: $ans"
+    same "old Stop cannot acknowledge mail staged in the newer turn" "$(mstate "$id")" "staged/1/0"
+    c_stop "$P" >/dev/null
+    same "Stop of the newer turn acknowledges its own mail" "$(mstate "$id")" "delivered/1/1"
+
+    # A new SessionStart can reuse the same session ID and turn number.
+    local old_token new_token
+    c_start "$P" >/dev/null
+    id=$(mailput "$P" f8000006 "$(mail_text f8000006 'mail across session restart')" 1)
+    c_prompt "$P" "$(pointer "$id")" >/dev/null
+    old_token=$(sqx "$CNTCTR_DB" "SELECT staged_turn FROM mail WHERE post=$id")
+    c_start "$P" >/dev/null
+    ans=$(c_prompt "$P" "$(pointer "$id")")
+    same "new generation can restage mail left by the old generation" "$(ctx_c "$ans")" "$(mail_text f8000006 'mail across session restart')"
+    new_token=$(sqx "$CNTCTR_DB" "SELECT staged_turn FROM mail WHERE post=$id")
+    [ -n "$old_token" ] && [ -n "$new_token" ] && [ "$old_token" != "$new_token" ] && ok_ || bad "new generation has a distinct turn token"
+
+}
+
+waitfor_hook_pause() {
+    local i
+    for i in $(seq 100); do
+        [ -s "$1" ] && return
+        sleep 0.01
+    done
+    bad "hook synchronization timed out for $1"
+}
+
 u5p6_run() {
     export CNTCTR_PASTE_WAIT_MS=100
     local f
     for f in ${F6:-1 2 3 4 5 6 7 8 9}; do declare -F "f6_$f" >/dev/null && "f6_$f"; done
     for f in ${F7:-1 2 3 4 5 6}; do declare -F "f7_$f" >/dev/null && "f7_$f"; done
-    for f in ${F8:-1 2 3 4}; do declare -F "f8_$f" >/dev/null && "f8_$f"; done
+    for f in ${F8:-1 2 3 4 5}; do declare -F "f8_$f" >/dev/null && "f8_$f"; done
     unset CNTCTR_PASTE_WAIT_MS
 }
 

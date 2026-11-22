@@ -7,7 +7,7 @@ cntctr: cntctr.c kb.c kb.h fleet.c fleet.h hooks.c hooks.h
 	$(CC) $(CFLAGS) $(FLAGS) -o $@ cntctr.c kb.c fleet.c hooks.c $(LIBS)
 
 cntctr-test: cntctr.c kb.c kb.h fleet.c fleet.h hooks.c hooks.h
-	$(CC) -std=c11 -g -O1 -Wall -Wextra -Werror -fsanitize=address,undefined $(FLAGS) -o $@ cntctr.c kb.c fleet.c hooks.c $(LIBS)
+	$(CC) -std=c11 -g -O1 -Wall -Wextra -Werror -DCNTCTR_TEST_HOOKS -fsanitize=address,undefined $(FLAGS) -o $@ cntctr.c kb.c fleet.c hooks.c $(LIBS)
 
 test: cntctr-test
 	BIN=./cntctr-test bash test.sh
