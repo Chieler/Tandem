@@ -2276,6 +2276,67 @@ static int tool_post(json_object *a, char **res) {
     return strncmp(r, "posted to", 9) ? fail(res, r) : ok(res, r);
 }
 
+/* A prefix must end before the first byte of a character that does not fit. */
+static size_t utf8_prefix(const char *text, size_t end) {
+    while (end && ((unsigned char)text[end] & 0xc0) == 0x80) end--;
+    return end;
+}
+
+enum { BOARD_PAGE_BYTES = 32768 };
+
+static int board_lookup(sqlite3 *db, json_object *a, json_object *v, char **res) {
+    long long id = json_object_get_int64(v), offset = 0;
+    if (json_object_get_type(v) != json_type_int || id <= 0)
+        return fail(res, fmt("board id must be a positive integer"));
+    if (json_object_object_get_ex(a, "offset", &v) &&
+        (json_object_get_type(v) != json_type_int || (offset = json_object_get_int64(v)) < 0))
+        return fail(res, fmt("board offset must be a nonnegative integer"));
+
+    sqlite3_stmt *st = NULL;
+    char *key = pane_key(self_socket, caller_pane), *out = NULL;
+    int complete = 0, bad_offset = 0;
+    const char *sql = "SELECT length(CAST(posts.text AS BLOB)), substr(CAST(posts.text AS BLOB), ?5 + 1, ?6) "
+                      "FROM posts JOIN mail ON mail.post=posts.rowid WHERE mail.post=?1 "
+                      "AND ((mail.name=?2 AND ?2!='') OR (mail.socket || char(10) || mail.pane=?3 AND ?3!='' AND posts.at>?4))";
+    int rc = sqlite3_prepare_v2(db, sql, -1, &st, NULL);
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, id);
+        sqlite3_bind_text(st, 2, caller_name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 3, key, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 4, server_start);
+        sqlite3_bind_int64(st, 5, offset);
+        sqlite3_bind_int(st, 6, BOARD_PAGE_BYTES + 1);
+        rc = sqlite3_step(st);
+        if (rc == SQLITE_ROW) {
+            long long len = sqlite3_column_int64(st, 0);
+            const char *page = sqlite3_column_blob(st, 1);
+            if (offset > len || (offset < len && ((unsigned char)page[0] & 0xc0) == 0x80)) bad_offset = 1;
+            else if (len - offset <= BOARD_PAGE_BYTES) {
+                complete = offset == 0;
+                out = fmt("%.*s", (int)(len - offset), page ? page : "");
+            } else {
+                size_t count = utf8_prefix(page, BOARD_PAGE_BYTES);
+                long long next = offset + (long long)count;
+                out = fmt("%.*s\n[%lld bytes remain; call board id=%lld offset=%lld]",
+                          (int)count, page, len - next, id, next);
+            }
+        }
+    }
+    sqlite3_finalize(st);
+    free(key);
+    if (complete) {   /* match regular board's delivery rule only when this answer contains the entire post */
+        st = NULL;
+        if (sqlite3_prepare_v2(db, "UPDATE mail SET delivered=1, state='delivered' WHERE post=?1 AND delivered=0 AND (hooked=1 OR presentations>0)", -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(st, 1, id);
+            sqlite3_step(st);
+        }
+        sqlite3_finalize(st);
+    }
+    if (out) return ok(res, out);
+    if (bad_offset) return fail(res, fmt("board offset is outside the mail or splits UTF-8"));
+    return fail(res, fmt(rc == SQLITE_DONE ? "mail not found" : "cannot read mail"));
+}
+
 static int tool_board(json_object *a, char **res) {
     json_object *v;
     int limit = json_object_object_get_ex(a, "limit", &v) ? json_object_get_int(v) : 20;
@@ -2283,6 +2344,11 @@ static int tool_board(json_object *a, char **res) {
     struct project p;
     sqlite3 *db = kb_for_caller(&p, res);
     if (!db) return 1;
+    if (json_object_object_get_ex(a, "id", &v)) {
+        int err = board_lookup(db, a, v, res);
+        sqlite3_close(db);
+        return err;
+    }
     if (sqlite3_exec(db, "BEGIN", NULL, NULL, NULL) != SQLITE_OK) {
         sqlite3_close(db);
         return fail(res, fmt("cannot read board snapshot"));
@@ -3120,8 +3186,8 @@ static const char TOOLS[] =
     "urgent=true also types it into every agent's pane now.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"},\"urgent\":{\"type\":\"boolean\"},"
     "\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"}},\"required\":[\"text\"]}},"
-    "{\"name\":\"board\",\"description\":\"Read the latest posts on this project's board, oldest first.\","
-    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"limit\":{\"type\":\"integer\",\"description\":\"Default 20, at most 200\"}," KFROM "}}}"
+    "{\"name\":\"board\",\"description\":\"Read recent posts or mail by id.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},\"offset\":{\"type\":\"integer\"},\"limit\":{\"type\":\"integer\",\"description\":\"Default 20, at most 200\"}," KFROM "}}}"
     ",{\"name\":\"use\",\"description\":\"Run a fleet tool by name with arguments. Needed for drafts and from Codex (pass from). Published tools also appear directly on clients that support list_changed.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"tool\":{\"type\":\"string\"},\"args\":{\"type\":\"object\"}," KFROM "},"
     "\"required\":[\"tool\"]}}"
@@ -3906,7 +3972,7 @@ static int hook_seen(const char *harness) {
 
 /* ---- mail by reference (H3): storing, the wake line ---- */
 
-#define WAKE_FMT "[cntctr mail id=%lld] body attached; if you see none, call board"
+#define WAKE_FMT "[cntctr mail id=%lld] body attached; if missing, call board id=%lld"
 
 /* The socket the hook rows of this server are keyed by. */
 static char *tmux_socket(void) {
@@ -4051,7 +4117,7 @@ static int wake_agent(sqlite3 *db, const char *socket, const char *pane, const c
     enum pstate on_screen = pane_state_screen(tail, NULL);
     free(tail);
     if (on_screen == P_IDLE) {
-        char *line = fmt(WAKE_FMT, mail);
+        char *line = fmt(WAKE_FMT, mail, mail);
         err = inject_ex(pane, name, line, 0);
         free(line);
     }
@@ -4227,7 +4293,7 @@ static int broken_pointer(sqlite3 *db, const char *socket, const char *pane, con
         stall_overdue(db, socket, pane);
         return 0;
     }
-    char *line = fmt(WAKE_FMT, mail), *err = inject_ex(pane, name, line, 0);
+    char *line = fmt(WAKE_FMT, mail, mail), *err = inject_ex(pane, name, line, 0);
     free(line);
     if (!err) {
         st = NULL;
@@ -4248,10 +4314,15 @@ static int broken_pointer(sqlite3 *db, const char *socket, const char *pane, con
 static long long pointer_id(const char *prompt) {
     long long id = 0;
     if (!prompt || sscanf(prompt, "[cntctr mail id=%lld]", &id) != 1 || id <= 0) return 0;
-    char *want = fmt(WAKE_FMT, id), *got = strdup(prompt);
+    char *want = fmt(WAKE_FMT, id, id), *got = strdup(prompt);
     size_t n = strlen(got);
     while (n && strchr("\r\n \t", got[n - 1])) got[--n] = '\0';
     int same = !strcmp(want, got);
+    if (!same) {   /* a wake may already be in the pane when the binary changes */
+        char *old = fmt("[cntctr mail id=%lld] body attached; if you see none, call board", id);
+        same = !strcmp(old, got);
+        free(old);
+    }
     free(want), free(got);
     return same ? id : 0;
 }
@@ -4310,7 +4381,7 @@ static int answer_fits(const char *harness, const char *event, enum hook_answer_
 }
 
 static char *mail_piece(const struct mrow *r, const char *body) {
-    return r->repeat ? fmt("[cntctr mail id=%lld] (may be a repeat); call board for the full mail", r->id) : strdup(body);
+    return r->repeat ? fmt("[cntctr mail id=%lld] (may be a repeat); call board id=%lld for the full mail", r->id, r->id) : strdup(body);
 }
 
 /* The text for a hook answer: as many of the rows (oldest first) as the harness budget takes, then `extra`.

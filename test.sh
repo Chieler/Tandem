@@ -872,7 +872,7 @@ mailput() {
     sqx "$CNTCTR_DB" "INSERT INTO posts(scope,sender,text,at) VALUES('$U5_SCOPE','sender',CAST(readfile('$f') AS TEXT),${5:-strftime('%s','now')}); INSERT INTO mail(post,name,pane,task,hooked,presentations,socket) VALUES(last_insert_rowid(),'$name','$1','$2',1,${4:-0},'$(t display -p '#{socket_path}')'); SELECT last_insert_rowid();"
 }
 mstate() { sqx "$CNTCTR_DB" "SELECT state||'/'||presentations||'/'||delivered FROM mail WHERE post=$1"; }
-pointer() { printf '[cntctr mail id=%s] body attached; if you see none, call board' "$1"; }
+pointer() { printf '[cntctr mail id=%s] body attached; if missing, call board id=%s' "$1" "$1"; }
 ctx_c() { printf '%s' "$1" | jq -r '.hookSpecificOutput.additionalContext // empty'; }
 ctx_a() { printf '%s' "$1" | jq -r '.injectSteps[0].systemMessage.systemMessage // empty'; }
 emptyans() { [ "$(printf '%s' "$1" | jq -c . 2>/dev/null)" = '{}' ]; }
@@ -985,7 +985,7 @@ u5p1_run() {
 undelivered() { [ "$(sqx "$CNTCTR_DB" "SELECT delivered FROM mail WHERE post=$1")" = 0 ]; }
 
 u5p2_run() {
-    local P S Q m m2 ans out
+    local P S Q m m2 ans out body
     P=$(hk_agent claude u5_d1)
     S=$(newpane u5_d1_sender)
     mkdir -p "$HOME/.local/share/cntctr"
@@ -1097,6 +1097,31 @@ u5p2_run() {
     refute "blocked Stop does not show the body twice" "$(ctx_a "$ans")" "blocked-stop body"
     check "blocked Stop repeat has a board pointer" "$(ctx_a "$ans")" "board"
 
+    # An exact mail lookup must work after the mail falls outside the recent board window.
+    P=$(hk_agent claude lookup_owner)
+    Q=$(hk_agent claude lookup_other)
+    m=$(mailput "$P" e1000010 "$(mail_text e1000010 'old lookup body')" 0)
+    sqx "$CNTCTR_DB" "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<205)
+        INSERT INTO posts(scope,sender,text,at) SELECT '$U5_SCOPE','sender','newer',strftime('%s','now') FROM n"
+    out=$(txt "$(call "$P" board "{\"id\":$m}")")
+    check "board id retrieves old mail beyond 200 posts" "$out" "old lookup body"
+    ans=$(call "$Q" board "{\"id\":$m}")
+    same "board id rejects another agent's mail" "$(iserr "$ans")" true
+    same "board id does not disclose another agent's mail" "$(txt "$ans")" "mail not found"
+
+    # Exact lookup pages large mail without marking a partial response delivered.
+    P=$(hk_agent claude lookup_large)
+    body=$(head -c 70000 /dev/zero | tr '\0' x)
+    m=$(mailput "$P" e1000012 "$(mail_text e1000012 "$body")" 0)
+    out=$(txt "$(call "$P" board "{\"id\":$m}")")
+    [ "${#out}" -lt 33000 ] && ok_ || bad "board id limits response size" "  got ${#out} bytes"
+    check "board id reports next offset" "$out" "offset=32768"
+    same "partial board lookup does not deliver" "$(mstate "$m")" "pending/0/0"
+    ans=$(call "$P" board "{\"id\":$m,\"offset\":65536}")
+    out=$(txt "$ans")
+    check "last board page contains end marker" "$out" "[cntctr end id=e1000012]"
+    same "last page alone does not mark full lookup delivered" "$(mstate "$m")" "pending/0/0"
+
     # U10: mail staged by the prompt hook is not presented again by the Stop of the same turn
     P=$(hk_agent claude u5_d5)
     m=$(mailput "$P" d5000001 "$(mail_text d5000001 'first in the turn')" 1)
@@ -1140,7 +1165,7 @@ u5p3_run() {
     refute "U6 send to a hook agent is not reported as board only" "$out" "on board"
     task=${out#sent id=}
     id=$(mailid "$task")
-    expect_screen "U6 the pane gets the pointer line" "$P" "[cntctr mail id=$id] body attached; if you see none, call board"
+    expect_screen "U6 the pane gets the pointer line" "$P" "$(pointer "$id")"
     same "U6 the pane holds that one line and nothing else" "$(screen_lines "$P")" "$(pointer "$id")"
     same "U6 the stored mail is pending with one presentation" "$(mstate "$id")" "pending/1/0"
     same "U6 the wake is reserved" "$(sqx "$CNTCTR_DB" "SELECT wake_reserved FROM hook_sessions WHERE pane='$P'")" 1
@@ -1262,7 +1287,7 @@ u5p3_run() {
     P=$(hk_agent claude u5_h1); R=$(newpane u5_h1r)
     out=$(txt "$(call "$S" send '{"to":"u5_h1","text":"mail that no hook presents"}')")
     task=${out#sent id=}; id=$(mailid "$task")
-    expect_screen "U16 the pane has the line" "$P" "[cntctr mail id=$id] body attached; if you see none, call board"
+    expect_screen "U16 the pane has the line" "$P" "$(pointer "$id")"
     same "U16 no hook event came; the mail is pending" "$(mstate "$id")" "pending/1/0"
     refute "U16 another agent's board does not list it" "$(txt "$(call "$R" board '{}')")" "mail that no hook presents"
     refute "U16 the sender's board does not list it" "$(txt "$(call "$S" board '{}')")" "mail that no hook presents"
