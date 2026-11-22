@@ -1083,9 +1083,12 @@ u5p2_run() {
     # A pointer may have been typed for a different prompt: its count alone is not a full presentation.
     P=$(hk_agent claude repeat_pointer)
     m=$(mailput "$P" e1000001 "$(mail_text e1000001 'pointer-only body')" 1)
+    same "pointer-only wake has not shown mail" "$(sq "$CNTCTR_DB" "SELECT shown FROM mail WHERE post=$m")" 0
     ans=$(c_stop "$P")
     check "pointer-only wake still gets its full body" "$(printf '%s' "$ans" | jq -r '.reason')" "pointer-only body"
     refute "pointer-only wake is not a repeat" "$(printf '%s' "$ans" | jq -r '.reason')" "may be a repeat"
+
+    same "first hook body increments shown" "$(sq "$CNTCTR_DB" "SELECT shown FROM mail WHERE post=$m")" 1
 
     # A blocked Stop and its continuation retain the turn token. An error Stop re-pends it.
     Q=$(hk_agent agy repeat_block)
@@ -1095,7 +1098,8 @@ u5p2_run() {
     a_stop "$Q" ERROR >/dev/null
     ans=$(a_pre "$Q" 0 "$(pointer "$m")")
     refute "blocked Stop does not show the body twice" "$(ctx_a "$ans")" "blocked-stop body"
-    check "blocked Stop repeat has a board pointer" "$(ctx_a "$ans")" "board"
+    same "second hook presentation is a repeat" "$(ctx_a "$ans")" "[cntctr mail id=$m] (may be a repeat); call board id=$m for the full mail"
+    same "compact repeat has no second body" "$(sq "$CNTCTR_DB" "SELECT shown FROM mail WHERE post=$m")" 1
 
     # An exact mail lookup must work after the mail falls outside the recent board window.
     P=$(hk_agent claude lookup_owner)
@@ -1739,7 +1743,7 @@ f6_9() {
     sockpath=$(t display -p '#{socket_path}')
     rm -f "$d" "$d-wal" "$d-shm"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
-    same "F9 a new database carries a schema version" "$(sqx "$d" 'PRAGMA user_version')" 1
+    same "F9 a new database carries a schema version" "$(sqx "$d" 'PRAGMA user_version')" 2
     same "F9 and the machine row" "$(sqx "$d" "SELECT count(*) FROM meta WHERE k='machine'")" 1
     sqx "$d" "DELETE FROM meta WHERE k='machine'"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
@@ -1747,7 +1751,7 @@ f6_9() {
     sqx "$d" "ALTER TABLE mail DROP COLUMN socket; ALTER TABLE task_gate DROP COLUMN answered; PRAGMA user_version=0"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
     same "F9 an older database gets its columns back" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")$(sqx "$d" "SELECT count(*) FROM pragma_table_info('task_gate') WHERE name='answered'")" 11
-    same "F9 and the current version" "$(sqx "$d" 'PRAGMA user_version')" 1
+    same "F9 and the current version" "$(sqx "$d" 'PRAGMA user_version')" 2
 }
 
 # ---- fix round 7 (F7_1 to F7_6) ----
@@ -1806,7 +1810,7 @@ f7_2() {
     same "F7.2 and is not migrated by this build" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")" 0
     sqx "$d" "PRAGMA user_version=0"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
-    same "F7.2 an older database is migrated and stamped" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")$(sqx "$d" 'PRAGMA user_version')" 11
+    same "F7.2 an older database is migrated and stamped" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")$(sqx "$d" 'PRAGMA user_version')" 12
 }
 
 # f7_3: staged mail is released after a cancelled turn only for a spawned worker; a user's own session is left to its next prompt event
@@ -1923,7 +1927,9 @@ f8_4() {
     sqlite3 "$old" < tests/schema_v0.1.0.sql   # what a 0.1.0 database holds
     CNTCTR_DB=$old TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null   # opening migrates it
     sqlite3 "$stamped" < tests/schema_stamp1.sql   # a database stamped version 1, the schema of that version
+    sqx "$stamped" "INSERT INTO mail(post,name,pane,staged_turn) VALUES(1,'legacy','%1','old-turn')"
     CNTCTR_DB=$stamped TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
+    same "F8.4 existing mail starts with zero shown" "$(sqx "$stamped" "SELECT shown FROM mail WHERE post=1")" 0
     CNTCTR_DB=$fresh TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
     same "F8.4 the stamped database has the tables and columns of a new one" "$(sqx "$stamped" "$cols")" "$(sqx "$fresh" "$cols")"
     same "F8.4 the migrated database has the tables and columns of a new one" "$(sqx "$old" "$cols")" "$(sqx "$fresh" "$cols")"

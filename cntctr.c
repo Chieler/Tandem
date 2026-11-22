@@ -4425,7 +4425,7 @@ static char *fit_mail(const char *harness, const char *event, enum hook_answer_k
 static int pending_rows(sqlite3 *db, const char *socket, const char *pane, long long server_start, long long own, struct mrow *rows, int max) {
     sqlite3_stmt *st = NULL;
     int n = 0;
-    if (sqlite3_prepare_v2(db, "SELECT mail.post, posts.text, mail.staged_turn FROM mail JOIN posts ON posts.rowid=mail.post "
+    if (sqlite3_prepare_v2(db, "SELECT mail.post, posts.text, mail.shown FROM mail JOIN posts ON posts.rowid=mail.post "
                                "WHERE mail.pane=?1 AND mail.socket=?5 AND mail.socket!='' AND mail.state='pending' AND mail.delivered=0 AND (mail.presentations<3 OR mail.post=?4) "
                                "AND ?2>0 AND posts.at>?2 ORDER BY mail.post LIMIT ?3", -1, &st, NULL) != SQLITE_OK) return 0;   /* only mail of this pane on this tmux server, stored after the server started */
     sqlite3_bind_text(st, 1, pane, -1, SQLITE_TRANSIENT);
@@ -4436,8 +4436,7 @@ static int pending_rows(sqlite3 *db, const char *socket, const char *pane, long 
     while (sqlite3_step(st) == SQLITE_ROW) {
         rows[n].id = sqlite3_column_int64(st, 0);
         rows[n].text = strdup((const char *)sqlite3_column_text(st, 1));
-        /* A wake line increments presentations without showing the body. Only staging records a hook presentation. */
-        rows[n].repeat = sqlite3_column_type(st, 2) != SQLITE_NULL;
+        rows[n].repeat = sqlite3_column_int(st, 2) > 0;
         n++;
     }
     sqlite3_finalize(st);
@@ -4448,10 +4447,11 @@ static int pending_rows(sqlite3 *db, const char *socket, const char *pane, long 
 static void stage_rows(sqlite3 *db, const struct mrow *rows, int taken, long long own, const char *token) {
     for (int i = 0; i < taken; i++) {
         sqlite3_stmt *st = NULL;
-        if (sqlite3_prepare_v2(db, "UPDATE mail SET state='staged', hooked=1, staged_turn=?2, presentations=presentations+?3 WHERE post=?1 AND state='pending'", -1, &st, NULL) != SQLITE_OK) continue;
+        if (sqlite3_prepare_v2(db, "UPDATE mail SET state='staged', hooked=1, staged_turn=?2, presentations=presentations+?3, shown=shown+?4 WHERE post=?1 AND state='pending'", -1, &st, NULL) != SQLITE_OK) continue;
         sqlite3_bind_int64(st, 1, rows[i].id);
         sqlite3_bind_text(st, 2, token, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(st, 3, rows[i].id != own);
+        sqlite3_bind_int(st, 4, !rows[i].repeat);   /* repeat currently emits a pointer without body text */
         sqlite3_step(st);
         sqlite3_finalize(st);
     }
