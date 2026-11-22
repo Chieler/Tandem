@@ -374,13 +374,14 @@ long long kb_mail_insert(sqlite3 *db, const char *scope, const char *pane, const
 }
 
 int kb_mail_claim(sqlite3 *db, long long post, const char *socket, const char *pane, long long server_start,
-                  const char *token, int full, int presentations, time_t now, time_t until) {
+                  const char *token, int full, int presentations, time_t now, time_t until, int new_post) {
     sqlite3_stmt *st = prep(db, "UPDATE mail SET shown=shown+1,state='staged',staged_turn=?2,staged_full=?3,"
                                " presentations=presentations+?4,lease_until=?9,hooked=max(hooked,?2 IS NOT NULL)"
                                " WHERE post=?1 AND delivered=0 AND shown<3"
                                " AND (state='pending' OR (?2 IS NOT NULL AND state='staged' AND lease_until<?8))"
                                " AND EXISTS (SELECT 1 FROM posts WHERE posts.rowid=mail.post AND "
-                               KB_MAIL_ATTACHED("mail", "?5", "?6", "?7") ") RETURNING shown");
+                               KB_MAIL_BOUND("mail", "?5", "?6", "?7")
+        " AND (posts.at>?7 OR (?10 AND posts.at=?7))) RETURNING shown");
     sqlite3_bind_int64(st, 1, post);
     sqlite3_bind_text(st, 2, token, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(st, 3, full);
@@ -390,6 +391,7 @@ int kb_mail_claim(sqlite3 *db, long long post, const char *socket, const char *p
     sqlite3_bind_int64(st, 7, server_start);
     sqlite3_bind_int64(st, 8, now);
     sqlite3_bind_int64(st, 9, until);
+    sqlite3_bind_int(st, 10, new_post);
     int rc = sqlite3_step(st), attempt = 0;
     if (rc == SQLITE_ROW) {
         attempt = sqlite3_column_int(st, 0);

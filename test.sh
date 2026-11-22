@@ -2520,6 +2520,26 @@ lease_ordinary_prompt() {
     daemon_stop
 }
 
+lease_start_second() {
+    local P S old id epoch out
+    P=$(newpane lease_start_second); S=$(newpane lease_start_second_sender)
+    epoch=$(t display -p '#{start_time}')
+    old=$(mailput "$P" l0000081 "$(mail_text l0000081 'old ambiguous same-second row')" 0 "$epoch")
+    sqx "$CNTCTR_DB" "CREATE TRIGGER send_at_server_start AFTER INSERT ON posts
+        WHEN NEW.text LIKE '%fresh same-second body%' BEGIN UPDATE posts SET at=$epoch WHERE rowid=NEW.rowid; END"
+    out=$(txt "$(call "$S" send '{"to":"lease_start_second","text":"fresh same-second body"}')")
+    sqx "$CNTCTR_DB" "DROP TRIGGER send_at_server_start"
+    id=$(mailid "${out#sent id=}")
+    same "new send is stamped in the server start second" "$(sqx "$CNTCTR_DB" "SELECT at FROM posts WHERE rowid=$id")" "$epoch"
+    same "direct send finishes the new row in the start second" "$(mstate "$id")" delivered/0/1
+    check "recipient receives fresh same-second body" "$(screen "$P")" "fresh same-second body"
+    daemon_start "$P"
+    daemon_hello
+    daemon_stop
+    same "watcher leaves an ambiguous old same-second row pending" "$(mstate "$old")" pending/0/0
+    refute "old same-second body stays off terminal" "$(screen "$P")" "old ambiguous same-second row"
+}
+
 lease_late_terminal() {
     local S P bar job id out reconciling=${1:-0}
     S=$(newpane lease_terminal_sender); P=$(newpane "lease_late_$reconciling")
@@ -2641,6 +2661,7 @@ lease_deadlines() {
 f8_6() {
     lease_early_prompt
     lease_ordinary_prompt
+    lease_start_second
     lease_late_terminal
     lease_late_terminal 1
     lease_failed_stop

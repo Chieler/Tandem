@@ -3466,9 +3466,19 @@ static int mail_hook_mode(sqlite3 *db, const char *socket, const char *pane, lon
     return mode;
 }
 
+static int mail_at_epoch(sqlite3 *db, long long id, long long epoch) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT at=?1 FROM posts WHERE rowid=?2", -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int64(st, 1, epoch);
+    sqlite3_bind_int64(st, 2, id);
+    int equal = sqlite3_step(st) == SQLITE_ROW && sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return equal;
+}
+
 /* The row lock spans claim, submission (including Enter), and compare-and-finish. */
 static int terminal_mail(sqlite3 *db, const char *socket, const char *pane, const char *name,
-                         long long epoch, long long id, const char *text, int shown, const char *quiet, int unserved) {
+                         long long epoch, long long id, const char *text, int shown, const char *quiet, int unserved, int new_post) {
     int lock = lock_mail(socket, id, LOCK_NB, NULL);
     if (lock < 0) return 0;
     struct mrow row = {.id = id, .text = (char *)text, .shown = shown, .complete = 1};
@@ -3486,14 +3496,17 @@ static int terminal_mail(sqlite3 *db, const char *socket, const char *pane, cons
             if (!awaiting_permission(pane)) {
                 err = paste_ready(pane, row.complete || strchr(body, '\n'));
                 if (err) pointer = *quiet != 0;
-                else if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK) {
-                    time_t now = time(NULL);
-                    int attempt = (unserved || mail_hook_mode(db, socket, pane, epoch, NULL) == 0) ?
-                        kb_mail_claim(db, id, socket, pane, epoch, NULL, row.complete, 0, now, now + MAIL_LEASE_SEC) : 0;
-                    if (attempt == shown + 1 && sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK) {
-                        err = inject_locked(pane, body, row.complete);
-                        if (!err) finished = kb_mail_finish(db, id, KB_MAIL_TERMINAL, attempt, NULL, time(NULL)) == 1;
-                    } else sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+                else {
+                    int allow_equal = new_post && mail_at_epoch(db, id, epoch) && pane_epoch(pane) == epoch;
+                    if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK) {
+                        time_t now = time(NULL);
+                        int attempt = (unserved || mail_hook_mode(db, socket, pane, epoch, NULL) == 0) ?
+                            kb_mail_claim(db, id, socket, pane, epoch, NULL, row.complete, 0, now, now + MAIL_LEASE_SEC, allow_equal) : 0;
+                        if (attempt == shown + 1 && sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK) {
+                            err = inject_locked(pane, body, row.complete);
+                            if (!err) finished = kb_mail_finish(db, id, KB_MAIL_TERMINAL, attempt, NULL, time(NULL)) == 1;
+                        } else sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+                    }
                 }
             }
             close(input);
@@ -3541,7 +3554,7 @@ static void redeliver_for(sqlite3 *db, const char *pane, const char *name) {
             const char *body = json_object_get_string(json_object_array_get_idx(row, 1));
             const char *message = !strncmp(body, "for ", 4) ? strchr(body, '\n') : NULL;
             terminal_mail(db, socket, pane, name, epoch, id, message ? message + 1 : body,
-                                      json_object_get_int(json_object_array_get_idx(row, 2)), quiet, unserved);
+                                      json_object_get_int(json_object_array_get_idx(row, 2)), quiet, unserved, 0);
         }
         json_object_put(rows);
     }
@@ -4385,7 +4398,7 @@ static int route_mail(const char *pane, const char *name, const char *scope, con
     if (mail > 0) {
         if (mode > 0) result = wake_agent(db, socket, pane, name, mail, NULL) < 0;
         else {
-            int finished = epoch && mode == 0 ? terminal_mail(db, socket, pane, name, epoch, mail, text, 0, quiet, unserved) : 0;
+            int finished = epoch && mode == 0 ? terminal_mail(db, socket, pane, name, epoch, mail, text, 0, quiet, unserved, 1) : 0;
             result = !finished;
         }
         if (mode > 0 || result) notify_all();
@@ -4603,7 +4616,7 @@ static int stage_rows(sqlite3 *db, const char *socket, const char *pane, const s
     time_t now = time(NULL);
     for (int i = 0; i < taken; i++) {
         int attempt = kb_mail_claim(db, rows[i].id, socket, pane, record->server_start, token, rows[i].complete,
-                                    rows[i].id != own, now, now + MAIL_LEASE_SEC);
+                                    rows[i].id != own, now, now + MAIL_LEASE_SEC, 0);
         if (attempt != rows[i].shown + 1) return 0;
     }
     return 1;
