@@ -3489,7 +3489,7 @@ static int paste_tracked_mail(sqlite3 *db, const char *socket, const char *pane,
     int taken = 0;
     char *piece = fit_mail(harness, event, HOOK_ATTACH, &row, 1, NULL, &taken);
     const char *reserve = "UPDATE mail SET shown=shown+1, state='pending' "
-                          "WHERE post=?1 AND shown=?2 AND shown<3 AND delivered=0 AND state IN ('pending','staged')";
+        "WHERE post=?1 AND shown=?2 AND shown<3 AND delivered=0 AND state='pending'";
     if (!taken || !update_paste_attempt(db, reserve, id, shown) ||
         sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
         sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
@@ -3511,6 +3511,32 @@ static int paste_tracked_mail(sqlite3 *db, const char *socket, const char *pane,
     }
     const char *deliver = "UPDATE mail SET state='delivered', delivered=1 WHERE post=?1 AND shown=?2 AND state='pending' AND delivered=0";
     return !row.complete || !update_paste_attempt(db, deliver, id, shown + 1);
+}
+
+/* The caller holds the mail lock and write transaction. A prompt can stage mail
+ * before has_hooks() sees the first Stop of that generation. */
+static int release_orphaned_stage(sqlite3 *db, long long id) {
+    const char *sql = "SELECT mail.pane, h.harness, h.harness_pid FROM mail LEFT JOIN hook_sessions h"
+        " ON h.socket=mail.socket AND h.pane=mail.pane AND h.generation!=''"
+        " AND mail.staged_turn=h.generation || ':' || h.turn WHERE mail.post=?1 AND mail.state='staged'";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return SQLITE_ERROR;
+    sqlite3_bind_int64(st, 1, id);
+    int step = sqlite3_step(st);
+    int owned = step == SQLITE_ROW && sqlite3_column_type(st, 1) != SQLITE_NULL
+        && hook_process_alive(sqlite3_column_int64(st, 2), (const char *)sqlite3_column_text(st, 1))
+        && pane_served((const char *)sqlite3_column_text(st, 0));
+    sqlite3_finalize(st);
+    if (step == SQLITE_DONE) return SQLITE_OK;
+    if (step != SQLITE_ROW) return SQLITE_ERROR;
+    if (owned) return SQLITE_BUSY;
+
+    if (sqlite3_prepare_v2(db, "UPDATE mail SET state='pending' WHERE post=?1 AND state='staged'", -1, &st, NULL) != SQLITE_OK)
+        return SQLITE_ERROR;
+    sqlite3_bind_int64(st, 1, id);
+    step = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return step == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
 }
 
 /* Only the FIFO watcher retries mail, sleeping indefinitely when its queue is empty. */
@@ -3551,8 +3577,9 @@ static int redeliver_for(const char *pane, const char *name) {
             /* Reserve the DB write before typing, so another writer cannot prevent the delivered mark. */
             int paste_failed = 0;
             int rc = sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
+            if (rc == SQLITE_OK) rc = release_orphaned_stage(db, id);
             if (rc == SQLITE_OK && sqlite3_prepare_v2(db, "SELECT posts.text, mail.hooked, mail.shown, "
-                    "(SELECT harness FROM hook_sessions WHERE socket=mail.socket AND pane=mail.pane) FROM posts JOIN mail ON posts.rowid=mail.post WHERE post=?6 AND delivered=0 AND state IN ('pending','staged') AND shown<3 "
+                    "(SELECT harness FROM hook_sessions WHERE socket=mail.socket AND pane=mail.pane) FROM posts JOIN mail ON posts.rowid=mail.post WHERE post=?6 AND delivered=0 AND state='pending' AND shown<3 "
                     "AND posts.scope=?2 AND " KB_MAIL_FOR("mail", "?1", "?2", "?5", "?3", "?4"), -1, &st, NULL) == SQLITE_OK) {
                 bind_mail_recipient(st, p.key, name, socket, pane);
                 sqlite3_bind_int64(st, 6, id);

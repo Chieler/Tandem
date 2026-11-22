@@ -1508,6 +1508,22 @@ u5p3_run() {
     sleep 2
     same "the retry thread types nothing into a busy hook agent" "$(screen "$P")" "$before"
     daemon_stop
+
+    # A prompt can claim mail before the new hook generation sees its first Stop.
+    P=$(hk_agent claude u5_first_stop)
+    c_start "$P" >/dev/null
+    id=$(mailput "$P" j3000001 "$(mail_text j3000001 'first Stop owns this body')" 1)
+    ans=$(c_prompt "$P" "$(pointer "$id")")
+    check "fresh generation attaches body before first Stop" "$(ctx_c "$ans")" "first Stop owns this body"
+    before=$(screen "$P")
+    daemon_start "$P"
+    daemon_hello
+    sleep 2
+    same "watcher leaves body owned by fresh hook generation" "$(mstate "$id")" "staged/1/0"
+    same "watcher does not paste an already attached body" "$(screen "$P")" "$before"
+    c_stop "$P" >/dev/null
+    same "first Stop acknowledges its own attachment" "$(mstate "$id")" "delivered/1/1"
+    daemon_stop
 }
 
 # list_call: the long-lived server (daemon_start) learns its agent's identity, which starts its mail retry thread
