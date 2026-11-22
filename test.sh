@@ -1080,13 +1080,20 @@ u5p2_run() {
 
     # A pointer may have been typed for a different prompt: its count alone is not a full presentation.
     P=$(hk_agent claude repeat_pointer)
-    m=$(mailput "$P" e1000001 "$(mail_text e1000001 'pointer-only body')" 1)
+    local wake_body
+    wake_body=$(mail_text e1000001 "$(head -c 1800 /dev/zero | tr '\0' x)")
+    m=$(mailput "$P" e1000001 "$wake_body" 1)
     same "pointer-only wake has not shown mail" "$(sq "$CNTCTR_DB" "SELECT shown FROM mail WHERE post=$m")" 0
     ans=$(c_stop "$P")
-    check "pointer-only wake still gets its full body" "$(printf '%s' "$ans" | jq -r '.reason')" "pointer-only body"
-    refute "pointer-only wake is not a repeat" "$(printf '%s' "$ans" | jq -r '.reason')" "may be a repeat"
-
+    same "pointer-only wake first presents the entire large envelope" "$(printf '%s' "$ans" | jq -r '.reason')" "$wake_body"
     same "first hook body increments shown" "$(sq "$CNTCTR_DB" "SELECT shown FROM mail WHERE post=$m")" 1
+
+    out=$(txt "$(call "$P" board "{\"id\":$m}")")
+    same "board id returns the exact staged body" "$out" "$wake_body"
+    same "complete exact lookup acknowledges staged mail" "$(mstate "$m")" "delivered/2/1"
+    out=$(txt "$(call "$P" board "{\"id\":$m}")")
+    same "board id still returns the exact delivered body" "$out" "$wake_body"
+    same "looking up delivered mail preserves its status" "$(mstate "$m")" "delivered/2/1"
 
     # A blocked Stop and its continuation retain the turn token. An error Stop re-pends it.
     Q=$(hk_agent agy repeat_block)
@@ -1226,18 +1233,28 @@ u5p2_run() {
     t set -p -t "$P" @cntctr_name lookup_owner
     same "board id permits the bound pane after its cwd changes" "$(txt "$(call "$P" board "{\"id\":$m}")")" "$(mail_text e1000010 'old lookup body')"
 
-    # Exact lookup pages large mail without marking a partial response delivered.
+    # The first page must stop before the two-byte character at its boundary.
     P=$(hk_agent claude lookup_large)
-    body=$(head -c 70000 /dev/zero | tr '\0' x)
-    m=$(mailput "$P" e1000012 "$(mail_text e1000012 "$body")" 0)
-    out=$(txt "$(call "$P" board "{\"id\":$m}")")
-    [ "${#out}" -lt 33000 ] && ok_ || bad "board id limits response size" "  got ${#out} bytes"
-    check "board id reports next offset" "$out" "offset=32768"
-    same "partial board lookup does not deliver" "$(mstate "$m")" "pending/0/0"
-    ans=$(call "$P" board "{\"id\":$m,\"offset\":65536}")
-    out=$(txt "$ans")
-    check "last board page contains end marker" "$out" "[cntctr end id=e1000012]"
-    same "last page alone does not mark full lookup delivered" "$(mstate "$m")" "pending/0/0"
+    local page1 page2 page3 original replies
+    body=$(printf '%sé%s' "$(head -c 32767 /dev/zero | tr '\0' x)" "$(head -c 37000 /dev/zero | tr '\0' y)")
+    m=$(mailput "$P" e1000012 "$body" 0)
+    replies=$(SKIP=1 session "$P" 5 "$INIT" \
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"board\",\"arguments\":{\"id\":$m}}}" \
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"board\",\"arguments\":{\"id\":$m,\"offset\":32768}}}" \
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"board\",\"arguments\":{\"id\":$m,\"offset\":32767}}}" \
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"board\",\"arguments\":{\"id\":$m,\"offset\":65535}}}")
+    out=$(printf '%s\n' "$replies" | jq -r 'select(.id == 2) | .result.content[0].text')
+    same "first page reports the exact UTF-8 continuation offset" "${out##*$'\n'}" "[37002 bytes remain; call board id=$m offset=32767]"
+    page1=${out%$'\n'*}
+    out=$(printf '%s\n' "$replies" | jq -r 'select(.id == 3) | .result.content[0].text')
+    same "board rejects an offset inside the multibyte character" "$out" "board offset is outside the mail or splits UTF-8"
+    out=$(printf '%s\n' "$replies" | jq -r 'select(.id == 4) | .result.content[0].text')
+    same "second page reports the next exact byte offset" "${out##*$'\n'}" "[4234 bytes remain; call board id=$m offset=65535]"
+    page2=${out%$'\n'*}
+    page3=$(printf '%s\n' "$replies" | jq -r 'select(.id == 5) | .result.content[0].text')
+    original="$page1$page2$page3"
+    [ "$original" = "$body" ] && ok_ || bad "all UTF-8 board pages reconstruct the exact original bytes"
+    same "paginated lookups leave the mail unread" "$(mstate "$m")" "pending/0/0"
 
     # U10: mail staged by the prompt hook is not presented again by the Stop of the same turn
     P=$(hk_agent claude u5_d5)
