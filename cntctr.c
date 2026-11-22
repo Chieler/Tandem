@@ -4144,7 +4144,7 @@ static int ack_hook(sqlite3 *db, const char *socket, const char *pane, const str
     return rc == SQLITE_DONE ? count : -1;
 }
 
-static int record_hook(sqlite3 *db, const char *socket, const char *pane, const char *harness, long pid, const struct hook_event *event, long long server_start, const struct recorded_hook *entry, struct recorded_hook *record) {
+static int record_hook(sqlite3 *db, const char *socket, const char *pane, const char *harness, long pid, const struct hook_event *event, long long server_start, long long pointer, const struct recorded_hook *entry, struct recorded_hook *record) {
     #define FRESH "(?9 OR hook_sessions.session_id!=excluded.session_id OR hook_sessions.harness!=excluded.harness OR hook_sessions.harness_pid!=excluded.harness_pid OR (?13>0 AND hook_sessions.server_start!=?13))"
     const char *sql = "INSERT INTO hook_sessions(socket,pane,harness,session_id,harness_pid,last_event,at,prompt_seen,stop_seen,stop_blocked,turn,server_start,generation,event_seq) "
         "VALUES(?1,?2,?3,?4,?5,?6,strftime('%s','now'),?7,?8,?10,?11,?13,lower(hex(randomblob(16))),1) "
@@ -4153,8 +4153,8 @@ static int record_hook(sqlite3 *db, const char *socket, const char *pane, const 
         "event_seq=hook_sessions.event_seq+1,"
         "prompt_seen=CASE WHEN " FRESH " THEN excluded.prompt_seen ELSE max(hook_sessions.prompt_seen,excluded.prompt_seen) END,"
         "stop_seen=CASE WHEN " FRESH " THEN excluded.stop_seen ELSE max(hook_sessions.stop_seen,excluded.stop_seen) END,"
-        "wake_reserved=CASE WHEN " FRESH " THEN 0 ELSE hook_sessions.wake_reserved END,"
-        "wake_at=CASE WHEN " FRESH " THEN NULL ELSE hook_sessions.wake_at END,"
+        "wake_reserved=CASE WHEN (?7 AND ?16=0) OR " FRESH " THEN 0 ELSE hook_sessions.wake_reserved END,"
+        "wake_at=CASE WHEN (?7 AND ?16=0) OR " FRESH " THEN NULL ELSE hook_sessions.wake_at END,"
         "broken=CASE WHEN ?7 OR " FRESH " THEN 0 ELSE hook_sessions.broken END,"
         "turn=CASE WHEN " FRESH " THEN excluded.turn "
         "WHEN ?11 AND NOT (?12 AND hook_sessions.last_event='Stop' AND hook_sessions.stop_blocked) THEN hook_sessions.turn+1 "
@@ -4188,6 +4188,7 @@ static int record_hook(sqlite3 *db, const char *socket, const char *pane, const 
     sqlite3_bind_int64(st, 13, server_start);
     sqlite3_bind_text(st, 14, entry ? entry->generation : NULL, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 15, entry ? entry->seq : 0);
+    sqlite3_bind_int64(st, 16, pointer);
     int rc = step_hook_record(st, record);
     int current = rc == SQLITE_ROW;
     if (current) rc = sqlite3_step(st);
@@ -4874,30 +4875,23 @@ static json_object *hook_stop(sqlite3 *db, const char *socket, const char *pane,
     return answer;
 }
 
-/* After the event is recorded: what the hook prints, or NULL for the neutral answer. */
-static json_object *hook_decide(sqlite3 *db, const char *socket, const char *pane, const char *harness,
-                                    const struct hook_event *event, const struct recorded_hook *record, long long epoch) {
-    const char *token = record->token;
-    if (hook_trace) json_object_object_add(hook_trace, "token", json_object_new_string(token));
-    json_object *answer = NULL;
-    if (!strcmp(event->kind, "UserPromptSubmit") || !strcmp(event->kind, "PreInvocation")) {
-        long long own = pointer_id(event->prompt);
-        int served = epoch > 0 && own && !event->loop && pane_served(pane);
-        sqlite3_stmt *st = NULL;
-        int mine = 0;
-        if (served && sqlite3_prepare_v2(db, "SELECT 1 FROM mail JOIN posts ON posts.rowid=mail.post WHERE post=?1 AND " KB_MAIL_ATTACHED("mail", "?3", "?2", "?4"), -1, &st, NULL) == SQLITE_OK) {
-            sqlite3_bind_int64(st, 1, own);
-            sqlite3_bind_text(st, 2, pane, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(st, 3, socket, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(st, 4, epoch);
-            mine = sqlite3_step(st) == SQLITE_ROW;
-        }
-        sqlite3_finalize(st);
-        /* agy calls this before every model step: only the first call of a turn attaches */
-        if (mine) answer = hook_attach(db, harness, event->kind, socket, pane, record, own);
+/* A matching pointer defers reservation consumption until the body claim. */
+static long long hook_pointer(sqlite3 *db, const char *socket, const char *pane, const char *harness,
+                              const struct hook_event *event, long long epoch) {
+    long long id = pointer_id(event->prompt);
+    if (epoch <= 0 || !id || event->loop || !turn_start(harness, event) || !pane_served(pane)) return 0;
+    sqlite3_stmt *st = NULL;
+    int mine = 0;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM mail JOIN posts ON posts.rowid=mail.post WHERE post=?1 AND "
+                          KB_MAIL_ATTACHED("mail", "?3", "?2", "?4"), -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, id);
+        sqlite3_bind_text(st, 2, pane, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 3, socket, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 4, epoch);
+        mine = sqlite3_step(st) == SQLITE_ROW;
     }
-    if (!strcmp(event->kind, "Stop")) answer = hook_stop(db, socket, pane, harness, event, record);
-    return answer;
+    sqlite3_finalize(st);
+    return mine ? id : 0;
 }
 
 /* Snapshots contain only routing and state metadata, never mail text. */
@@ -5022,10 +5016,13 @@ static int hook_cmd(int argc, char **argv) {
 #endif
                     if (hook_trace) json_object_object_add(hook_trace, "before", trace_snapshot(db, socket, pane));
                     long long started = stop ? 0 : pane_epoch(pane);
+                    long long pointer = hook_pointer(db, socket, pane, argv[2], &event, started);
                     if ((captured == SQLITE_ROW || captured == SQLITE_DONE) &&
-                        record_hook(db, socket, pane, argv[2], pid, &event, started,
+                        record_hook(db, socket, pane, argv[2], pid, &event, started, pointer,
                                     captured == SQLITE_ROW ? &entry : NULL, &record)) {
-                        decided = hook_decide(db, socket, pane, argv[2], &event, &record, started);
+                        if (hook_trace) json_object_object_add(hook_trace, "token", json_object_new_string(record.token));
+                        if (stop) decided = hook_stop(db, socket, pane, argv[2], &event, &record);
+                        else if (pointer) decided = hook_attach(db, argv[2], event.kind, socket, pane, &record, pointer);
                     }
                     if (decided) {
                         puts(json_object_to_json_string_ext(decided, JSON_C_TO_STRING_PLAIN));

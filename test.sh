@@ -2490,6 +2490,30 @@ lease_early_prompt() {
     done
 }
 
+lease_ordinary_prompt() {
+    local S P id now out before
+    S=$(newpane lease_prompt_sender); P=$(hk_agent claude lease_prompt_live)
+    out=$(txt "$(call "$S" send '{"to":"lease_prompt_live","text":"keep queued after ordinary prompt"}')")
+    id=$(mailid "${out#sent id=}")
+    same "wake is reserved before an ordinary prompt" "$(sqx "$CNTCTR_DB" "SELECT wake_reserved FROM hook_sessions WHERE pane='$P'")" 1
+    # Put the original deadline one second away under the watcher interval.
+    now=$(date +%s)
+    sqx "$CNTCTR_DB" "UPDATE hook_sessions SET wake_at=$((now-2)) WHERE pane='$P'"
+    before=$(screen "$P")
+    out=$(c_prompt "$P" 'ordinary user prompt')
+    emptyans "$out" && ok_ || bad "ordinary prompt does not attach mail" "  got: $out"
+    same "ordinary prompt clears wake reservation and timestamp" \
+        "$(sqx "$CNTCTR_DB" "SELECT wake_reserved||'/'||(wake_at IS NULL) FROM hook_sessions WHERE pane='$P'")" 0/1
+    sleep 2
+    CNTCTR_WAKE_SEC=3 daemon_start "$P"
+    daemon_hello
+    same "responsive generation stays healthy across the old wake deadline" \
+        "$(sqx "$CNTCTR_DB" "SELECT broken FROM hook_sessions WHERE pane='$P'")" 0
+    same "old deadline submits no terminal body" "$(screen "$P")" "$before"
+    same "mail remains queued without a body claim" "$(mstate "$id")" pending/1/0
+    daemon_stop
+}
+
 lease_late_terminal() {
     local S P bar job id out reconciling=${1:-0}
     S=$(newpane lease_terminal_sender); P=$(newpane "lease_late_$reconciling")
@@ -2610,6 +2634,7 @@ lease_deadlines() {
 
 f8_6() {
     lease_early_prompt
+    lease_ordinary_prompt
     lease_late_terminal
     lease_late_terminal 1
     lease_failed_stop
