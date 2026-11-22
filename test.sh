@@ -2540,6 +2540,22 @@ lease_start_second() {
     refute "old same-second body stays off terminal" "$(screen "$P")" "old ambiguous same-second row"
 }
 
+lease_failed_spill() {
+    local P id out payload before after
+    P=$(hk_agent claude lease_failed_spill)
+    payload=$(head -c 18000 /dev/zero | tr '\0' x)
+    id=$(mailput "$P" l0000082 "$(mail_text l0000082 "$payload")" 1)
+    before=$(find "$HOME/.cache" -name 'mail-*' -type f 2>/dev/null | wc -l | tr -d ' ')
+    sqx "$CNTCTR_DB" "CREATE TRIGGER fail_spill_claim BEFORE UPDATE OF state ON mail
+        WHEN NEW.post=$id AND NEW.state='staged' BEGIN SELECT RAISE(ABORT,'failed spill claim'); END"
+    out=$(c_prompt "$P" "$(pointer "$id")")
+    emptyans "$out" && ok_ || bad "failed oversized claim returns neutral output"
+    same "failed oversized claim leaves mail pending" "$(mstate "$id")" pending/1/0
+    after=$(find "$HOME/.cache" -name 'mail-*' -type f 2>/dev/null | wc -l | tr -d ' ')
+    same "failed oversized claim leaves no orphan spill" "$after" "$before"
+    sqx "$CNTCTR_DB" "DROP TRIGGER fail_spill_claim"
+}
+
 lease_late_terminal() {
     local S P bar job id out reconciling=${1:-0}
     S=$(newpane lease_terminal_sender); P=$(newpane "lease_late_$reconciling")
@@ -2662,6 +2678,7 @@ f8_6() {
     lease_early_prompt
     lease_ordinary_prompt
     lease_start_second
+    lease_failed_spill
     lease_late_terminal
     lease_late_terminal 1
     lease_failed_stop

@@ -3436,7 +3436,7 @@ static int wake_sec(void);
 static void broken_pointer(sqlite3 *db, const char *socket, const char *pane, const char *name, long long mail);
 struct mrow { long long id; char *text; int shown, complete; };
 static char *fit_mail(const char *harness, const char *event, enum hook_answer_kind kind,
-                      struct mrow *rows, int n, const char *extra, int *taken);
+                      struct mrow *rows, int n, const char *extra, int *taken, char **spill);
 enum { MAIL_LEASE_SEC = 300 };
 
 static long long pane_epoch(const char *pane) {
@@ -3482,11 +3482,11 @@ static int terminal_mail(sqlite3 *db, const char *socket, const char *pane, cons
     int lock = lock_mail(socket, id, LOCK_NB, NULL);
     if (lock < 0) return 0;
     struct mrow row = {.id = id, .text = (char *)text, .shown = shown, .complete = 1};
-    int taken = 1, finished = 0, pointer = 0;
-    char *piece = NULL;
+    int taken = 1, finished = 0, pointer = 0, committed = 0;
+    char *piece = NULL, *spill = NULL;
     if (*quiet) {
         const char *event = !strcmp(quiet, "agy") ? "PreInvocation" : "UserPromptSubmit";
-        piece = fit_mail(quiet, event, HOOK_ATTACH, &row, 1, NULL, &taken);
+        piece = fit_mail(quiet, event, HOOK_ATTACH, &row, 1, NULL, &taken, &spill);
     }
     const char *body = piece ? piece : text;
     if (taken && epoch > 0) {
@@ -3503,6 +3503,7 @@ static int terminal_mail(sqlite3 *db, const char *socket, const char *pane, cons
                         int attempt = (unserved || mail_hook_mode(db, socket, pane, epoch, NULL) == 0) ?
                             kb_mail_claim(db, id, socket, pane, epoch, NULL, row.complete, 0, now, now + MAIL_LEASE_SEC, allow_equal) : 0;
                         if (attempt == shown + 1 && sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK) {
+                            committed = 1;
                             err = inject_locked(pane, body, row.complete);
                             if (!err) finished = kb_mail_finish(db, id, KB_MAIL_TERMINAL, attempt, NULL, time(NULL)) == 1;
                         } else sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
@@ -3513,6 +3514,8 @@ static int terminal_mail(sqlite3 *db, const char *socket, const char *pane, cons
         }
         free(err);
     }
+    if (spill && !committed) unlink(spill);
+    free(spill);
     free(piece);
     close(lock);
     if (pointer) broken_pointer(db, socket, pane, name, id);
@@ -4539,7 +4542,7 @@ static char *mail_piece(const struct mrow *r, int *complete) {
 /* The text for a hook answer: as many of the rows (oldest first) as the harness budget takes, then `extra`.
  * A first mail that cannot fit alone goes to a file and is cut; later mail that does not fit stays pending.
  * *taken is how many rows went in. NULL when nothing fits. */
-static char *fit_mail(const char *harness, const char *event, enum hook_answer_kind kind, struct mrow *rows, int n, const char *extra, int *taken) {
+static char *fit_mail(const char *harness, const char *event, enum hook_answer_kind kind, struct mrow *rows, int n, const char *extra, int *taken, char **spill) {
     char *out = strdup("");
     *taken = 0;
     for (int i = 0; i < n; i++) {
@@ -4561,8 +4564,9 @@ static char *fit_mail(const char *harness, const char *event, enum hook_answer_k
                 else free(p2);
                 free(full);
             }
-            free(path);
             fits = cand != NULL;
+            if (fits) *spill = path;
+            else if (path) { unlink(path); free(path); }
             rows[i].complete = 0;
         }
         if (!fits) { free(cand); break; }
@@ -4629,7 +4633,8 @@ static json_object *hook_attach(sqlite3 *db, const char *harness, const char *ev
                                 const char *pane, const struct recorded_hook *record, long long own) {
     struct mrow rows[MAIL_ROWS];
     int n = pending_rows(db, socket, pane, record->server_start, NULL, rows, MAIL_ROWS), taken = 0;
-    char *text = n ? fit_mail(harness, event, HOOK_ATTACH, rows, n, NULL, &taken) : NULL;
+    char *spill = NULL;
+    char *text = n ? fit_mail(harness, event, HOOK_ATTACH, rows, n, NULL, &taken, &spill) : NULL;
     json_object *answer = text ? hook_answer(harness, event, HOOK_ATTACH, text) : NULL;
     if (begin_hook_event(db, socket, pane, record)) {
         sqlite3_stmt *st = NULL;
@@ -4651,6 +4656,8 @@ static json_object *hook_attach(sqlite3 *db, const char *harness, const char *ev
         json_object_put(answer);
         answer = NULL;
     }
+    if (spill && !taken) unlink(spill);
+    free(spill);
     for (int i = 0; i < n; i++) free(rows[i].text);
     free(text);
     return answer;
@@ -4839,7 +4846,8 @@ static json_object *hook_stop(sqlite3 *db, const char *socket, const char *pane,
         int n = pending_rows(db, socket, pane, record->server_start, record->token, rows, MAIL_ROWS);
         int taken = 0, named = 0;
         char *extra = worker ? task_reminder(db, &g, socket, pane, record->server_start, &named) : NULL;
-        char *text = n || extra ? fit_mail(harness, event->kind, HOOK_BLOCK, rows, n, extra, &taken) : NULL;
+        char *spill = NULL;
+        char *text = n || extra ? fit_mail(harness, event->kind, HOOK_BLOCK, rows, n, extra, &taken, &spill) : NULL;
         json_object *candidate = text ? hook_answer(harness, event->kind, HOOK_BLOCK, text) : NULL;
         begun = begin_hook_event(db, socket, pane, record);
         int staged = begun && stage_rows(db, socket, pane, record, rows, taken, 0);
@@ -4862,6 +4870,8 @@ static json_object *hook_stop(sqlite3 *db, const char *socket, const char *pane,
             candidate = NULL;
             if (hook_trace) json_object_object_add(hook_trace, "re_presented", json_object_new_int(taken));
         }
+        if (spill && !answer) unlink(spill);
+        free(spill);
         if (candidate) json_object_put(candidate);
         for (int i = 0; i < n; i++) free(rows[i].text);
         free(text), free(extra);
