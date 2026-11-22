@@ -2491,27 +2491,40 @@ lease_early_prompt() {
 }
 
 lease_late_terminal() {
-    local S P bar job id out
-    S=$(newpane lease_terminal_sender); P=$(newpane lease_late)
-    bar="$TMPD/terminal-enter"
+    local S P bar job id out reconciling=${1:-0}
+    S=$(newpane lease_terminal_sender); P=$(newpane "lease_late_$reconciling")
+    bar="$TMPD/terminal-enter-$reconciling"
     : > "$bar"
     CNTCTR_TEST_MAIL_ENTER="$bar" CNTCTR_TEST_MAIL_WHEN=before \
-        call "$S" send '{"to":"lease_late","text":"late submission lease body"}' > "$bar.out" &
+        call "$S" send "{\"to\":\"lease_late_$reconciling\",\"text\":\"late submission lease body\"}" > "$bar.out" &
     job=$!
     wait_for_mail_enter "$bar.ready"
     id=$(sqx "$CNTCTR_DB" "SELECT max(post) FROM mail WHERE pane='$P'")
     same "terminal attempt is durable before Enter" \
         "$(sqx "$CNTCTR_DB" "SELECT state||'/'||shown||'/'||(lease_until>strftime('%s','now')) FROM mail WHERE post=$id")" staged/1/1
+    if [ "$reconciling" -eq 0 ]; then
+        sqx "$CNTCTR_DB" "CREATE TRIGGER defer_terminal_reconcile BEFORE UPDATE OF state ON mail
+            WHEN OLD.post=$id AND NEW.state='pending' BEGIN SELECT RAISE(IGNORE); END"
+    fi
     expire_mail "$id"
-    c_start "$P" >/dev/null
-    out=$(c_prompt "$P" "$(pointer "$id")")
-    emptyans "$out" && ok_ || bad "terminal row lock protects the paused emitter" "  got: $out"
+    if [ "$reconciling" -eq 1 ]; then
+        c_start "$P" >/dev/null
+        out=$(c_prompt "$P" "$(pointer "$id")")
+        emptyans "$out" && ok_ || bad "terminal row lock protects the paused emitter" "  got: $out"
+    fi
     rm -f "$bar"
     wait "$job" || bad "paused terminal sender failed"
     check "late Enter finishes submitting the body" "$(screen "$P")" "late submission lease body"
     check "sender sees the expired submission left on board" "$(txt "$(cat "$bar.out")")" "on board"
-    same "late terminal submission cannot finish an expired claim" \
-        "$(sqx "$CNTCTR_DB" "SELECT state||'/'||shown FROM mail WHERE post=$id")" pending/1
+    if [ "$reconciling" -eq 1 ]; then
+        same "late terminal submission cannot finish a reclaimed row" "$(mstate "$id")" pending/0/0
+    else
+        same "late terminal submission cannot finish before reconcile" \
+            "$(sqx "$CNTCTR_DB" "SELECT state||'/'||shown||'/'||delivered FROM mail WHERE post=$id")" staged/1/0
+        sqx "$CNTCTR_DB" "DROP TRIGGER defer_terminal_reconcile"
+        c_start "$P" >/dev/null
+        same "hook entry makes the expired claim reclaimable" "$(mstate "$id")" pending/0/0
+    fi
     out=$(c_prompt "$P" "$(pointer "$id")")
     check "next hook can claim the re-pended terminal body" "$(ctx_c "$out")" "late submission lease body"
     c_stop "$P" >/dev/null
@@ -2598,6 +2611,7 @@ lease_deadlines() {
 f8_6() {
     lease_early_prompt
     lease_late_terminal
+    lease_late_terminal 1
     lease_failed_stop
     lease_legacy_stage
     lease_deadlines

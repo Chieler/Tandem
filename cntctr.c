@@ -3492,7 +3492,7 @@ static int terminal_mail(sqlite3 *db, const char *socket, const char *pane, cons
                         kb_mail_claim(db, id, socket, pane, epoch, NULL, row.complete, 0, now, now + MAIL_LEASE_SEC) : 0;
                     if (attempt == shown + 1 && sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK) {
                         err = inject_locked(pane, body, row.complete);
-                        if (!err) finished = kb_mail_finish(db, id, KB_MAIL_TERMINAL, attempt, NULL, 0) == 1;
+                        if (!err) finished = kb_mail_finish(db, id, KB_MAIL_TERMINAL, attempt, NULL, time(NULL)) == 1;
                     } else sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
                 }
             }

@@ -405,13 +405,13 @@ int kb_mail_finish(sqlite3 *db, long long post, enum kb_mail_finish outcome, int
                        " AND state IN ('pending','staged','stalled')";
     const char *ack = "UPDATE mail SET delivered=1,state='delivered',lease_until=0 WHERE post=?1 AND delivered=0"
                       " AND state='staged' AND shown=?2 AND staged_turn IS ?3 AND staged_full=1"
-                      " AND (?4=0 OR lease_until>?4)";
+                      " AND lease_until>?4";
     sqlite3_stmt *st = prep(db, outcome == KB_MAIL_READ ? read : ack);
     sqlite3_bind_int64(st, 1, post);
     if (outcome != KB_MAIL_READ) {
         sqlite3_bind_int(st, 2, attempt);
         sqlite3_bind_text(st, 3, token, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(st, 4, outcome == KB_MAIL_STOP ? now : 0);
+        sqlite3_bind_int64(st, 4, now);
     }
     int rc = sqlite3_step(st) == SQLITE_DONE ? sqlite3_changes(db) : -1;
     sqlite3_finalize(st);
