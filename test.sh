@@ -1377,6 +1377,7 @@ u5p3_run() {
     expect_screen "U6 the pane gets the pointer line" "$P" "$(pointer "$id")"
     same "U6 the pane holds that one line and nothing else" "$(screen_lines "$P")" "$(pointer "$id")"
     same "U6 the stored mail is pending with one presentation" "$(mstate "$id")" "pending/1/0"
+    same "U6 the pointer spends one wake charge" "$(sqx "$CNTCTR_DB" "SELECT wake_attempts FROM mail WHERE post=$id")" 1
     same "U6 the wake is reserved" "$(sqx "$CNTCTR_DB" "SELECT wake_reserved FROM hook_sessions WHERE pane='$P'")" 1
     ans=$(c_prompt "$P" "$(pointer "$id")")
     ctx=$(ctx_c "$ans")
@@ -1607,6 +1608,8 @@ u5p4_run() {
         same "U11 presentation $i has the full small envelope" "$(ctx_a "$ans")" "$(sq "$CNTCTR_DB" "SELECT text FROM posts WHERE rowid=$id")"
         same "U11 presentation $i is staged" "$(mstate "$id")" "staged/$i/0"
         a_stop "$Q" ERROR >/dev/null
+        expire_mail "$id"
+        a_stop "$Q" ERROR >/dev/null # Reconcile the expired lease during an event.
         if [ "$i" -lt 3 ]; then wait_mstate "U11 after an error Stop the retry thread types the line again" "$id" "pending/$((i + 1))/0"; fi
     done
     wait_mstate "U11 the third presentation went unanswered: stalled" "$id" "stalled/3/0"
@@ -1637,13 +1640,14 @@ u5p4_run() {
         ans=$(c_prompt "$P" "$(pointer "$id")")
         same "stale replay body $i" "$(ctx_c "$ans")" "$envelope"
         same "stale replay charges body $i" "$(sq "$CNTCTR_DB" "SELECT shown FROM mail WHERE post=$id")" "$i"
+        expire_mail "$id"
     done
     sqx "$CNTCTR_DB" "CREATE TRIGGER fail_stall_notice BEFORE INSERT ON posts
         WHEN NEW.sender='cntctr' AND NEW.text LIKE '%undelivered after 3 attempts: $id to %'
         BEGIN SELECT RAISE(ABORT, 'injected notice error'); END;"
     ans=$(c_prompt "$P" "$(pointer "$id")")
     emptyans "$ans" && ok_ || bad "fourth stale replay attaches nothing" "  got: $ans"
-    same "stall stays pending while the notice fails" "$(mstate "$id")" "pending/9/0"
+    same "failed stall notice rolls back lease expiry" "$(mstate "$id")" "staged/9/0"
     same "failed notice leaves no partial board post" "$(notices "$id")" 0
     sqx "$CNTCTR_DB" "DROP TRIGGER fail_stall_notice"
     ans=$(c_prompt "$P" "$(pointer "$id")")

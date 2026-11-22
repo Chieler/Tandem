@@ -4197,7 +4197,7 @@ static int ack_hook(sqlite3 *db, const char *socket, const char *pane, const str
 }
 
 static int record_hook(sqlite3 *db, const char *socket, const char *pane, const char *harness, long pid, const struct hook_event *event, long long server_start, struct recorded_hook *record) {
-    #define FRESH "(?9 OR hook_sessions.session_id!=excluded.session_id OR hook_sessions.harness!=excluded.harness OR hook_sessions.harness_pid!=excluded.harness_pid)"
+    #define FRESH "(?9 OR hook_sessions.session_id!=excluded.session_id OR hook_sessions.harness!=excluded.harness OR hook_sessions.harness_pid!=excluded.harness_pid OR (?13>0 AND hook_sessions.server_start!=?13))"
     const char *sql = "INSERT INTO hook_sessions(socket,pane,harness,session_id,harness_pid,last_event,at,prompt_seen,stop_seen,stop_blocked,turn,server_start,generation,event_seq) "
         "VALUES(?1,?2,?3,?4,?5,?6,strftime('%s','now'),?7,?8,?10,?11,?13,lower(hex(randomblob(16))),1) "
         "ON CONFLICT(socket,pane) DO UPDATE SET "
@@ -4205,7 +4205,8 @@ static int record_hook(sqlite3 *db, const char *socket, const char *pane, const 
         "event_seq=hook_sessions.event_seq+1,"
         "prompt_seen=CASE WHEN " FRESH " THEN excluded.prompt_seen ELSE max(hook_sessions.prompt_seen,excluded.prompt_seen) END,"
         "stop_seen=CASE WHEN " FRESH " THEN excluded.stop_seen ELSE max(hook_sessions.stop_seen,excluded.stop_seen) END,"
-        "wake_reserved=0,wake_at=NULL,"   /* a wake ends at the agent's next hook event */
+        "wake_reserved=CASE WHEN " FRESH " THEN 0 ELSE hook_sessions.wake_reserved END,"
+        "wake_at=CASE WHEN " FRESH " THEN NULL ELSE hook_sessions.wake_at END,"
         "broken=CASE WHEN ?7 OR " FRESH " THEN 0 ELSE hook_sessions.broken END,"
         "turn=CASE WHEN " FRESH " THEN excluded.turn "
         "WHEN ?11 AND NOT (?12 AND hook_sessions.last_event='Stop' AND hook_sessions.stop_blocked) THEN hook_sessions.turn+1 "
@@ -4253,7 +4254,7 @@ static int record_hook(sqlite3 *db, const char *socket, const char *pane, const 
     sqlite3_finalize(st);
     time_t now = time(NULL);
     int acked = 0;
-    if (ok) ok = kb_mail_reconcile(db, now, 0) == SQLITE_OK;
+    if (ok) ok = kb_mail_reconcile(db, now, wake_sec()) == SQLITE_OK;
     if (ok && !strcmp(event->kind, "Stop") && stop_normal(harness, event)) {
         acked = ack_hook(db, socket, pane, record, event->loop, now);
         ok = acked >= 0;
@@ -4418,11 +4419,9 @@ static void stall_overdue(sqlite3 *db, const char *socket, const char *pane) {
 }
 
 /* The watcher and hook must agree on which pane can attach the row. */
-#define ATTACHABLE_MAIL(socket, pane, start) \
-    "mail.socket=" socket " AND mail.pane=" pane " AND mail.socket!='' AND " start ">0 AND posts.at>" start
 #define WAKE_MAIL \
     " FROM mail JOIN posts ON posts.rowid=mail.post JOIN hook_sessions h ON h.socket=?1 AND h.pane=?2 WHERE " \
-    ATTACHABLE_MAIL("?1", "?2", "h.server_start") " AND mail.delivered=0"
+    KB_MAIL_ATTACHED("mail", "?1", "?2", "h.server_start") " AND mail.delivered=0"
 #define SCOPED_WAKE_MAIL WAKE_MAIL " AND posts.scope=?3"
 #define WAKE_ELIGIBLE "mail.state='pending' AND mail.shown<3 AND mail.wake_attempts<3"
 
@@ -4433,18 +4432,19 @@ static void bind_wake_owner(sqlite3_stmt *st, const char *socket, const char *pa
 }
 
 static int reserve_hook_wake(sqlite3 *db, const char *socket, const char *pane,
-                             long long mail, const struct hook_row *r, time_t now) {
+                             long long mail, const struct hook_row *r, time_t now, long long epoch) {
     if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) return 0;
     sqlite3_stmt *q = NULL;
     int reserved = 0;
     const char *session = "UPDATE hook_sessions SET wake_reserved=1, wake_at=?3"
-        " WHERE socket=?1 AND pane=?2 AND wake_reserved=0 AND broken=0 AND generation=?4 AND event_seq=?5";
+        " WHERE socket=?1 AND pane=?2 AND wake_reserved=0 AND generation=?4 AND event_seq=?5 AND server_start=?6";
     if (sqlite3_prepare_v2(db, session, -1, &q, NULL) == SQLITE_OK) {
         sqlite3_bind_text(q, 1, socket, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(q, 2, pane, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(q, 3, now);
         sqlite3_bind_text(q, 4, r->generation, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(q, 5, r->seq);
+        sqlite3_bind_int64(q, 6, epoch);
         reserved = sqlite3_step(q) == SQLITE_DONE && sqlite3_changes(db) == 1;
     }
     sqlite3_finalize(q);
@@ -4470,38 +4470,29 @@ static int wake_agent(sqlite3 *db, const char *socket, const char *pane, const c
                       long long mail, char **why) {
     struct hook_row r;
     time_t now = time(NULL);
-    if (!hook_row_get(db, socket, pane, &r) || r.wake_reserved || !hook_row_has(&r, pane)) return 0;
+    if (!hook_row_get(db, socket, pane, &r) || r.wake_reserved || (!r.broken && !hook_row_has(&r, pane))) return 0;
     int needs_screen;
     enum pstate st = hook_event_state(r.harness, r.last_event, r.stop_blocked, r.at, now, &needs_screen);
     const char *max_age = getenv("CNTCTR_HOOK_MAX_AGE_SEC");
-    if (st != P_IDLE && now - r.at <= (max_age ? atoi(max_age) : 120)) return 0;
+    if (!r.broken && st != P_IDLE && now - r.at <= (max_age ? atoi(max_age) : 120)) return 0;
     char *tail = pane_tail(pane);
     enum pstate on_screen = pane_state_screen(tail, NULL);
     free(tail);
-    if (on_screen != P_IDLE || !reserve_hook_wake(db, socket, pane, mail, &r, now)) return 0;
-
+    if (on_screen != P_IDLE) return 0;
+    char *start = NULL;
+    long long epoch = TMUX(NULL, &start, "display", "-p", "-t", pane, "#{start_time}") == 0 ? atoll(start) : 0;
+    free(start);
+    if (!epoch || !reserve_hook_wake(db, socket, pane, mail, &r, time(NULL), epoch)) return 0;
     char *line = fmt(WAKE_FMT, mail, mail);
     char *err = inject_ex(pane, name, line, 0);
     free(line);
-    sqlite3_stmt *q = NULL;
-    if (!err) {
-        if (sqlite3_prepare_v2(db, "UPDATE mail SET presentations=presentations+1 WHERE post=?1", -1, &q, NULL) == SQLITE_OK) {
-            sqlite3_bind_int64(q, 1, mail);
-            sqlite3_step(q);
-        }
-    } else {
-        /* A failed paste can be partial. Keep its durable charge and release the session reservation. */
-        if (sqlite3_prepare_v2(db, "UPDATE hook_sessions SET wake_reserved=0, wake_at=NULL"
-                               " WHERE socket=?1 AND pane=?2 AND wake_at=?3 AND generation=?4 AND event_seq=?5", -1, &q, NULL) == SQLITE_OK) {
-            sqlite3_bind_text(q, 1, socket, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(q, 2, pane, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(q, 3, now);
-            sqlite3_bind_text(q, 4, r.generation, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(q, 5, r.seq);
-            sqlite3_step(q);
-        }
+    sqlite3_stmt *st_count = NULL;
+    if (!err && sqlite3_prepare_v2(db, "UPDATE mail SET presentations=presentations+1 WHERE post=?1",
+                                   -1, &st_count, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st_count, 1, mail);
+        sqlite3_step(st_count);
     }
-    sqlite3_finalize(q);
+    sqlite3_finalize(st_count);
     int rc = err ? -1 : 1;
     if (why) *why = err; else free(err);
     return rc;
@@ -4610,29 +4601,7 @@ static int wake_pending(sqlite3 *db, const char *socket, const char *pane, const
 static void broken_pointer(sqlite3 *db, const char *socket, const char *pane, const char *name, long long mail) {
     struct hook_row r;
     if (!*socket || !hook_row_get(db, socket, pane, &r) || !r.broken) return;
-    sqlite3_stmt *st = NULL;
-    const char *eligible = "post=?1 AND delivered=0 AND state IN ('pending','staged') AND shown<3 AND presentations<3";
-    char *sql = fmt("SELECT 1 FROM mail WHERE %s", eligible);
-    int waiting = 0;
-    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
-        sqlite3_bind_int64(st, 1, mail);
-        waiting = sqlite3_step(st) == SQLITE_ROW;
-    }
-    sqlite3_finalize(st);
-    free(sql);
-    if (!waiting) return;
-    char *line = fmt(WAKE_FMT, mail, mail), *err = inject_ex(pane, name, line, 0);
-    free(line);
-    if (!err) {
-        sql = fmt("UPDATE mail SET presentations=presentations+1 WHERE %s", eligible);
-        if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
-            sqlite3_bind_int64(st, 1, mail);
-            sqlite3_step(st);
-        }
-        sqlite3_finalize(st);
-        free(sql);
-    }
-    free(err);
+    wake_agent(db, socket, pane, name, mail, NULL);
 }
 
 /* ---- mail by reference (H3): the pointer line, what a hook attaches, and where a body that is too big goes ---- */
@@ -4788,7 +4757,7 @@ static int pending_rows(sqlite3 *db, const char *socket, const char *pane, long 
     sqlite3_stmt *st = NULL;
     int n = 0;
     if (sqlite3_prepare_v2(db, "SELECT mail.post, posts.text, mail.shown FROM mail JOIN posts ON posts.rowid=mail.post "
-                               "WHERE " ATTACHABLE_MAIL("?5", "?1", "?2")
+                               "WHERE " KB_MAIL_ATTACHED("mail", "?5", "?1", "?2")
                           " AND mail.state='pending' AND mail.delivered=0 AND mail.shown<3 "
                                "AND (?4 IS NULL OR instr(mail.staged_turn,?4||':') IS NOT 1) ORDER BY mail.post LIMIT ?3", -1, &st, NULL) != SQLITE_OK) return 0;   /* only mail of this pane on this tmux server, stored after the server started */
     sqlite3_bind_text(st, 1, pane, -1, SQLITE_TRANSIENT);
@@ -4837,15 +4806,26 @@ static json_object *hook_attach(sqlite3 *db, const char *harness, const char *ev
     int n = pending_rows(db, socket, pane, record->server_start, NULL, rows, MAIL_ROWS), taken = 0;
     char *text = n ? fit_mail(harness, event, HOOK_ATTACH, rows, n, NULL, &taken) : NULL;
     json_object *answer = text ? hook_answer(harness, event, HOOK_ATTACH, text) : NULL;
-    if (taken && begin_hook_event(db, socket, pane, record)) {
-        if (!stage_rows(db, socket, pane, record, rows, taken, own))
-            sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
-        else if (hook_commit(db, 1)) {
-            if (hook_trace) json_object_object_add(hook_trace, "attached", json_object_new_int(taken));
-            taken = 0;
+    if (begin_hook_event(db, socket, pane, record)) {
+        sqlite3_stmt *st = NULL;
+        int ok = sqlite3_prepare_v2(db, "UPDATE hook_sessions SET wake_reserved=0,wake_at=NULL WHERE socket=?1 AND pane=?2",
+                                    -1, &st, NULL) == SQLITE_OK;
+        if (ok) {
+            sqlite3_bind_text(st, 1, socket, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(st, 2, pane, -1, SQLITE_TRANSIENT);
+            ok = sqlite3_step(st) == SQLITE_DONE;
         }
+        sqlite3_finalize(st);
+        if (!ok || !stage_rows(db, socket, pane, record, rows, taken, own)) {
+            sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+            taken = 0;
+        } else if (!hook_commit(db, 1)) taken = 0;
+        if (hook_trace) json_object_object_add(hook_trace, "attached", json_object_new_int(taken));
+    } else taken = 0;
+    if (!taken && answer) {
+        json_object_put(answer);
+        answer = NULL;
     }
-    if (taken && answer) { json_object_put(answer); answer = NULL; }
     for (int i = 0; i < n; i++) free(rows[i].text);
     free(text);
     return answer;
@@ -5083,36 +5063,20 @@ static json_object *hook_stop(sqlite3 *db, const char *socket, const char *pane,
 
 /* After the event is recorded: what the hook prints, or NULL for the neutral answer. */
 static json_object *hook_decide(sqlite3 *db, const char *socket, const char *pane, const char *harness,
-                                    const struct hook_event *event, struct recorded_hook *record) {
+                                    const struct hook_event *event, const struct recorded_hook *record, long long epoch) {
     const char *token = record->token;
     if (hook_trace) json_object_object_add(hook_trace, "token", json_object_new_string(token));
-    if (record->server_start <= 0) {   /* no SessionStart was recorded (agy sends none): read the server's start once, keep it with the session */
-        char *out = NULL;
-        if (TMUX(NULL, &out, "display", "-p", "#{start_time}") == 0 && atoll(out) > 0 &&
-            begin_hook_event(db, socket, pane, record)) {
-            record->server_start = atoll(out);
-            sqlite3_stmt *st = NULL;
-            if (sqlite3_prepare_v2(db, "UPDATE hook_sessions SET server_start=?3 WHERE socket=?1 AND pane=?2", -1, &st, NULL) == SQLITE_OK) {
-                sqlite3_bind_text(st, 1, socket, -1, SQLITE_TRANSIENT);
-                sqlite3_bind_text(st, 2, pane, -1, SQLITE_TRANSIENT);
-                sqlite3_bind_int64(st, 3, record->server_start);
-                sqlite3_step(st);
-            }
-            sqlite3_finalize(st);
-            if (!hook_commit(db, 0)) record->server_start = 0;
-        }
-        free(out);
-    }
     json_object *answer = NULL;
     if (!strcmp(event->kind, "UserPromptSubmit") || !strcmp(event->kind, "PreInvocation")) {
         long long own = pointer_id(event->prompt);
-        int served = own && !event->loop && pane_served(pane);
+        int served = epoch > 0 && own && !event->loop && pane_served(pane);
         sqlite3_stmt *st = NULL;
         int mine = 0;
-        if (served && sqlite3_prepare_v2(db, "SELECT 1 FROM mail WHERE post=?1 AND pane=?2 AND socket=?3 AND socket!=''", -1, &st, NULL) == SQLITE_OK) {
+        if (served && sqlite3_prepare_v2(db, "SELECT 1 FROM mail JOIN posts ON posts.rowid=mail.post WHERE post=?1 AND " KB_MAIL_ATTACHED("mail", "?3", "?2", "?4"), -1, &st, NULL) == SQLITE_OK) {
             sqlite3_bind_int64(st, 1, own);
             sqlite3_bind_text(st, 2, pane, -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(st, 3, socket, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(st, 4, epoch);
             mine = sqlite3_step(st) == SQLITE_ROW;
         }
         sqlite3_finalize(st);
@@ -5238,7 +5202,7 @@ static int hook_cmd(int argc, char **argv) {
                 if (db) {
                     if (hook_trace) json_object_object_add(hook_trace, "before", trace_snapshot(db, socket, pane));
                     long long started = 0;
-                    if (!strcmp(event.kind, "SessionStart")) {   /* the one tmux read of this event: mail older than the server is not ours */
+                    if (strcmp(event.kind, "Stop")) { /* A Stop acknowledges from its captured turn without waiting on tmux. */
                         char *out = NULL;
                         if (TMUX(NULL, &out, "display", "-p", "#{start_time}") == 0) started = atoll(out);
                         free(out);
@@ -5248,7 +5212,7 @@ static int hook_cmd(int argc, char **argv) {
 #ifdef CNTCTR_TEST_HOOKS
                         pause_recorded_stop(&event);
 #endif
-                        decided = hook_decide(db, socket, pane, argv[2], &event, &record);
+                        decided = hook_decide(db, socket, pane, argv[2], &event, &record, started);
                     }
                     if (decided) {
                         puts(json_object_to_json_string_ext(decided, JSON_C_TO_STRING_PLAIN));
