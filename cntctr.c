@@ -3522,7 +3522,18 @@ static int terminal_mail(sqlite3 *db, const char *socket, const char *pane, cons
     return finished;
 }
 
-static void redeliver_for(sqlite3 *db, const char *pane, const char *name) {
+static int redeliver_for(sqlite3 *db, const char *pane, const char *name) {
+    sqlite3_stmt *check = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM mail JOIN posts ON posts.rowid=mail.post WHERE "
+        KB_MAIL_ATTACHED("mail", "?1", "?2", "?3") " AND state='pending' AND delivered=0 AND shown<3 LIMIT 1",
+        -1, &check, NULL) != SQLITE_OK) return 1;
+    sqlite3_bind_text(check, 1, self_socket, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(check, 2, pane, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(check, 3, server_start);
+    int waiting = sqlite3_step(check);
+    sqlite3_finalize(check);
+    if (waiting != SQLITE_ROW) return waiting != SQLITE_DONE;
+
     struct project p;
     resolve_project(db, pane, &p);
     char *socket = tmux_socket(), quiet[16] = "";
@@ -3562,36 +3573,48 @@ static void redeliver_for(sqlite3 *db, const char *pane, const char *name) {
         json_object_put(rows);
     }
     free(socket);
+    return 1;
 }
 
-/* Scan deadlines even when this process has no deliverable row or registered pane. */
+static sqlite3_int64 mail_deadline(sqlite3 *db, int interval) {
+    sqlite3_stmt *st = NULL;
+    sqlite3_int64 deadline = -1;
+    if (sqlite3_prepare_v2(db, "SELECT coalesce(min(deadline),0) FROM ("
+        " SELECT min(lease_until)+1 AS deadline FROM mail WHERE state='staged' AND delivered=0"
+        " UNION ALL SELECT min(wake_at)+?1 FROM hook_sessions WHERE wake_reserved=1"
+        " UNION ALL SELECT 1 FROM mail WHERE state='pending' AND delivered=0 AND shown>=3)",
+        -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int(st, 1, interval);
+        if (sqlite3_step(st) == SQLITE_ROW) deadline = sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    return deadline;
+}
+
+/* Read first so idle watchers sleep on the FIFO without a writer or pane probe. */
 static int redeliver_mail(void) {
-    int interval = wake_sec(), seconds = interval;
+    int interval = wake_sec(), seconds = -1;
     char *err = NULL;
     sqlite3 *db = kb(&err);
     free(err);
     if (db) {
-        int reconciled = kb_mail_reconcile(db, time(NULL), interval) == SQLITE_OK;
+        time_t now = time(NULL);
+        sqlite3_int64 deadline = mail_deadline(db, interval);
+        int due = deadline > 0 && deadline <= now, waiting = 0;
+        if (due) kb_mail_reconcile(db, now, interval);
         pthread_mutex_lock(&mail_mu);
         struct mail_identity *identities = mail_identities;
         pthread_mutex_unlock(&mail_mu);
-        for (struct mail_identity *it = identities; it; it = it->next) redeliver_for(db, it->pane, it->name);
-
-        sqlite3_stmt *st = NULL;
-        if (reconciled && sqlite3_prepare_v2(db, "SELECT min(deadline) FROM ("
-            " SELECT min(lease_until)+1 AS deadline FROM mail WHERE state='staged' AND delivered=0"
-            " UNION ALL SELECT min(wake_at)+?1 FROM hook_sessions WHERE wake_reserved=1)",
-            -1, &st, NULL) == SQLITE_OK) {
-            sqlite3_bind_int(st, 1, interval);
-            if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_type(st, 0) != SQLITE_NULL) {
-                sqlite3_int64 left = sqlite3_column_int64(st, 0) - time(NULL);
-                if (left < seconds) seconds = left > 0 ? (int)left : 0;
-            }
-        }
-        sqlite3_finalize(st);
+        for (struct mail_identity *it = identities; it; it = it->next)
+            waiting |= redeliver_for(db, it->pane, it->name);
+        if (due || waiting) deadline = mail_deadline(db, interval);
+        time_t scanned = time(NULL);
+        if (waiting || deadline < 0 || (deadline > 0 && deadline <= now)) seconds = interval;
+        if (deadline > now && (seconds < 0 || deadline - scanned < seconds))
+            seconds = deadline <= scanned ? 0 : deadline - scanned > INT_MAX ? INT_MAX : (int)(deadline - scanned);
         sqlite3_close(db);
-    }
-    return seconds > INT_MAX / 1000 ? INT_MAX : seconds * 1000;
+    } else seconds = interval;
+    return seconds > INT_MAX / 1000 ? INT_MAX : seconds < 0 ? -1 : seconds * 1000;
 }
 
 static void learn_mail_identity(const char *pane, const char *name) {

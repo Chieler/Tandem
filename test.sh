@@ -39,6 +39,9 @@ if [ -n "\${CNTCTR_TEST_MAIL_ENTER:-}" ]; then
             ;;
     esac
 fi
+if [ -n "\${CNTCTR_TEST_IDLE_LOG:-}" ]; then
+    printf '%s\n' "\$*" >> "\$CNTCTR_TEST_IDLE_LOG"
+fi
 exec "$REAL_TMUX" "\$@"
 EOF
 chmod +x "$TMPD/bin/tmux"
@@ -2636,6 +2639,19 @@ lease_legacy_stage() {
         "$(sqx "$db" "SELECT state||'/'||shown||'/'||lease_until FROM mail WHERE post=$id")" pending/1/0
 }
 
+lease_idle_watcher() {
+    local P log before
+    P=$(newpane lease_idle_watcher)
+    log="$TMPD/idle-tmux.log"
+    CNTCTR_WAKE_SEC=1 CNTCTR_TEST_IDLE_LOG="$log" daemon_start "$P"
+    daemon_hello
+    sleep 1
+    before=$(wc -l < "$log")
+    sleep 2
+    same "idle watcher makes no tmux calls across two retry intervals" "$(wc -l < "$log")" "$before"
+    daemon_stop
+}
+
 lease_deadlines() {
     local S P id fifo start i out
     S=$(newpane lease_deadline_watcher); P=$(hk_agent claude lease_deadline_target)
@@ -2675,6 +2691,7 @@ lease_deadlines() {
 }
 
 f8_6() {
+    lease_idle_watcher
     lease_early_prompt
     lease_ordinary_prompt
     lease_start_second
