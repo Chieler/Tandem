@@ -107,6 +107,8 @@ Register that path once for each harness:
 
 To upgrade or roll back, point the same entries at another version and restart the agents. Release tags (`v0.1.0`, ...) rebuild any old version.
 
+For the mail lease schema upgrade, stop all agents that can run legacy cntctr hooks and stop their MCP servers before opening the database with the new build. Activate the new MCP and hook binaries together. SQLite's writer lock serializes the migration with active transactions. A legacy process that starts writing after the migration can still bypass the new lease rules.
+
 ### Configure timeouts
 
 Raise each harness's tool timeout above the longest blocking wait you plan to use:

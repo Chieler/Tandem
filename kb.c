@@ -118,13 +118,22 @@ static const struct { const char *table, *name, *def; } MIGRATIONS[] = {
     {"hook_sessions", "generation", "TEXT NOT NULL DEFAULT ''"},
     {"hook_sessions", "event_seq", "INTEGER NOT NULL DEFAULT 0"},
     {"mail", "wake_attempts", "INTEGER NOT NULL DEFAULT 0"},
+    {"mail", "lease_until", "INTEGER NOT NULL DEFAULT 0"},
 };
 
 /* PRAGMA user_version of a database that has this file's SCHEMA and every column of MIGRATIONS: 1 for the 13 columns above, one
- * more for each column added later. A database stamped at or above it is opened as is and is never stamped down. A new table
+ * more for each column added later. A database stamped above it is refused. A new table
  * in SCHEMA has no entry in MIGRATIONS: lower the 12 below by one for it, or databases stamped before it never get the table. */
 /* Version 4 also backfills data, without adding a column. */
 #define KB_SCHEMA_VERSION ((int)(sizeof MIGRATIONS / sizeof *MIGRATIONS) - 11)
+
+static int schema_version(sqlite3 *db, int *version) {
+    sqlite3_stmt *st = prep(db, "PRAGMA user_version");
+    int rc = sqlite3_step(st);
+    if (rc == SQLITE_ROW) *version = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return rc == SQLITE_ROW ? SQLITE_OK : rc;
+}
 
 sqlite3 *kb_open_timeout(const char *path, char **err, int timeout_ms) {
     sqlite3 *db = NULL;
@@ -134,19 +143,23 @@ sqlite3 *kb_open_timeout(const char *path, char **err, int timeout_ms) {
         return NULL;
     }
     sqlite3_busy_timeout(db, timeout_ms);
+    int version = 0, rc = schema_version(db, &version);
+    if (rc != SQLITE_OK || version > KB_SCHEMA_VERSION) goto fail;
+    if (version == KB_SCHEMA_VERSION) return db;
+
     sqlite3_exec(db, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
-    {   /* a database at the current schema needs no schema script, column checks or meta row: every hook event opens it */
-        sqlite3_stmt *v = NULL;
-        int current = sqlite3_prepare_v2(db, "PRAGMA user_version", -1, &v, NULL) == SQLITE_OK && sqlite3_step(v) == SQLITE_ROW
-                      && sqlite3_column_int(v, 0) >= KB_SCHEMA_VERSION;
-        sqlite3_finalize(v);
-        if (current) return db;
-    }
     char host[256] = "host";
     gethostname(host, sizeof host - 1);
     host[strcspn(host, ".")] = '\0';
     char *machine = sqlite3_mprintf("INSERT OR IGNORE INTO meta VALUES ('machine', '%08x-%q');", arc4random(), host);
-    int rc = sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
+    rc = sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
+    if (rc == SQLITE_OK) rc = schema_version(db, &version);
+    if (rc != SQLITE_OK || version >= KB_SCHEMA_VERSION) {
+        sqlite3_free(machine);
+        if (rc != SQLITE_OK || version > KB_SCHEMA_VERSION) goto fail;
+        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+        return db; /* another new writer finished the migration while we waited */
+    }
     if (rc == SQLITE_OK) rc = sqlite3_exec(db, SCHEMA, NULL, NULL, NULL);
     for (size_t i = 0; rc == SQLITE_OK && i < sizeof MIGRATIONS / sizeof *MIGRATIONS; i++)
         rc = ensure_column(db, MIGRATIONS[i].table, MIGRATIONS[i].name, MIGRATIONS[i].def);
@@ -154,6 +167,10 @@ sqlite3 *kb_open_timeout(const char *path, char **err, int timeout_ms) {
     if (rc == SQLITE_OK)
         rc = sqlite3_exec(db, "UPDATE mail SET shown=1, staged_full=0 WHERE shown=0 AND staged_turn IS NOT NULL",
                           NULL, NULL, NULL);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_exec(db, "UPDATE hook_sessions SET generation=lower(hex(randomblob(16)))"
+                             " WHERE generation='' AND session_id!=''", NULL, NULL, NULL);
+    if (rc == SQLITE_OK) rc = kb_mail_reconcile(db, time(NULL), 0);
     if (rc == SQLITE_OK) rc = sqlite3_exec(db, machine, NULL, NULL, NULL);
     if (rc == SQLITE_OK) {
         char stamp[48];
@@ -163,7 +180,8 @@ sqlite3 *kb_open_timeout(const char *path, char **err, int timeout_ms) {
     if (rc == SQLITE_OK) rc = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
     sqlite3_free(machine);
     if (rc == SQLITE_OK) return db;
-    *err = strdup(sqlite3_errmsg(db));
+fail:
+    *err = strdup(version > KB_SCHEMA_VERSION ? "newer schema, upgrade cntctr" : sqlite3_errmsg(db));
     sqlite3_close(db);
     return NULL;
 }
@@ -332,6 +350,108 @@ int kb_post(sqlite3 *db, const char *scope, const char *sender, const char *text
     sqlite3_bind_text(st, 3, text, -1, SQLITE_TRANSIENT);
     int rc = sqlite3_step(st) == SQLITE_DONE ? 0 : -1;
     sqlite3_finalize(st);
+    return rc;
+}
+
+long long kb_mail_insert(sqlite3 *db, const char *scope, const char *pane, const char *name, const char *sender,
+                         const char *task, const char *body, int hooked, const char *from_pane,
+                         const char *from_scope, const char *socket) {
+    if (kb_post(db, scope, sender, body) != 0) return 0;
+    long long post = sqlite3_last_insert_rowid(db);
+    sqlite3_stmt *st = prep(db, "INSERT INTO mail(post,name,pane,task,hooked,from_pane,from_scope,socket)"
+                               " VALUES(?1,?2,?3,?4,?5,?6,?7,?8)");
+    sqlite3_bind_int64(st, 1, post);
+    sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, pane ? pane : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 4, task, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 5, hooked);
+    sqlite3_bind_text(st, 6, from_pane, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 7, from_scope, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 8, socket, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE ? post : 0;
+}
+
+int kb_mail_claim(sqlite3 *db, long long post, const char *socket, const char *pane, long long server_start,
+                  const char *token, int full, int presentations, time_t now, time_t until) {
+    sqlite3_stmt *st = prep(db, "UPDATE mail SET shown=shown+1,state='staged',staged_turn=?2,staged_full=?3,"
+                               " presentations=presentations+?4,lease_until=?9,hooked=max(hooked,?2 IS NOT NULL)"
+                               " WHERE post=?1 AND delivered=0 AND shown<3"
+                               " AND (state='pending' OR (?2 IS NOT NULL AND state='staged' AND lease_until<?8))"
+                               " AND EXISTS (SELECT 1 FROM posts WHERE posts.rowid=mail.post AND "
+                               KB_MAIL_ATTACHED("mail", "?5", "?6", "?7") ") RETURNING shown");
+    sqlite3_bind_int64(st, 1, post);
+    sqlite3_bind_text(st, 2, token, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 3, full);
+    sqlite3_bind_int(st, 4, presentations);
+    sqlite3_bind_text(st, 5, socket, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 6, pane, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 7, server_start);
+    sqlite3_bind_int64(st, 8, now);
+    sqlite3_bind_int64(st, 9, until);
+    int rc = sqlite3_step(st), attempt = 0;
+    if (rc == SQLITE_ROW) {
+        attempt = sqlite3_column_int(st, 0);
+        rc = sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE ? attempt : -1;
+}
+
+int kb_mail_finish(sqlite3 *db, long long post, enum kb_mail_finish outcome, int attempt, const char *token,
+                   time_t now) {
+    const char *read = "UPDATE mail SET delivered=1,state='delivered',lease_until=0 WHERE post=?1 AND delivered=0"
+                       " AND state IN ('pending','staged','stalled')";
+    const char *ack = "UPDATE mail SET delivered=1,state='delivered',lease_until=0 WHERE post=?1 AND delivered=0"
+                      " AND state='staged' AND shown=?2 AND staged_turn IS ?3 AND staged_full=1"
+                      " AND (?4=0 OR lease_until>?4)";
+    sqlite3_stmt *st = prep(db, outcome == KB_MAIL_READ ? read : ack);
+    sqlite3_bind_int64(st, 1, post);
+    if (outcome != KB_MAIL_READ) {
+        sqlite3_bind_int(st, 2, attempt);
+        sqlite3_bind_text(st, 3, token, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 4, outcome == KB_MAIL_STOP ? now : 0);
+    }
+    int rc = sqlite3_step(st) == SQLITE_DONE ? sqlite3_changes(db) : -1;
+    sqlite3_finalize(st);
+    return rc;
+}
+
+int kb_mail_reconcile(sqlite3 *db, time_t now, int wake_sec) {
+    int own = sqlite3_get_autocommit(db);
+    int rc = own ? sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) : SQLITE_OK;
+    if (rc != SQLITE_OK) return rc;
+    sqlite3_stmt *st = prep(db, "UPDATE mail SET state=CASE WHEN shown>=3 THEN 'stalled' ELSE 'pending' END,"
+                               " lease_until=0 WHERE delivered=0 AND ((state='staged' AND lease_until<?1)"
+                               " OR (state='pending' AND shown>=3))"
+                               " RETURNING post,state,name,from_pane,from_scope,socket,"
+                               " (SELECT scope FROM posts WHERE rowid=mail.post),"
+                               " (SELECT sender FROM posts WHERE rowid=mail.post)");
+    sqlite3_bind_int64(st, 1, now);
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+        if (strcmp(col(st, 1), "stalled") || sqlite3_column_type(st, 7) == SQLITE_NULL) continue;
+        long long post = sqlite3_column_int64(st, 0);
+        const char *to = col(st, 7), *pane = col(st, 3), *scope = col(st, 4);
+        char *body = sqlite3_mprintf("for %s (notice):\nundelivered after 3 attempts: %lld to %s;"
+                                    " recipient can call board id=%lld", to, post, col(st, 2), post);
+        long long notice = body ? kb_mail_insert(db, *scope ? scope : col(st, 6), pane, to, "cntctr", "",
+                                                  body, 0, "", "", *pane ? col(st, 5) : "") : 0;
+        sqlite3_free(body);
+        if (!notice) { rc = SQLITE_ERROR; break; }
+    }
+    sqlite3_finalize(st);
+    if (rc == SQLITE_DONE) rc = SQLITE_OK;
+    if (rc == SQLITE_OK && wake_sec > 0) {
+        st = prep(db, "UPDATE hook_sessions SET wake_reserved=0,wake_at=NULL,broken=1"
+                      " WHERE wake_reserved=1 AND wake_at<=?1");
+        sqlite3_bind_int64(st, 1, now - wake_sec);
+        rc = sqlite3_step(st);
+        sqlite3_finalize(st);
+        if (rc == SQLITE_DONE) rc = SQLITE_OK;
+    }
+    if (own && rc == SQLITE_OK) rc = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+    if (own && rc != SQLITE_OK) sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
     return rc;
 }
 

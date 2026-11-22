@@ -2104,7 +2104,7 @@ f6_9() {
     sockpath=$(t display -p '#{socket_path}')
     rm -f "$d" "$d-wal" "$d-shm"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
-    same "F9 a new database carries a schema version" "$(sqx "$d" 'PRAGMA user_version')" 7
+    same "F9 a new database carries a schema version" "$(sqx "$d" 'PRAGMA user_version')" 8
     same "F9 and the machine row" "$(sqx "$d" "SELECT count(*) FROM meta WHERE k='machine'")" 1
     sqx "$d" "DELETE FROM meta WHERE k='machine'"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
@@ -2112,10 +2112,22 @@ f6_9() {
     sqx "$d" "ALTER TABLE mail DROP COLUMN socket; ALTER TABLE task_gate DROP COLUMN answered; PRAGMA user_version=0"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
     same "F9 an older database gets its columns back" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")$(sqx "$d" "SELECT count(*) FROM pragma_table_info('task_gate') WHERE name='answered'")" 11
-    same "F9 and the current version" "$(sqx "$d" 'PRAGMA user_version')" 7
+    same "F9 and the current version" "$(sqx "$d" 'PRAGMA user_version')" 8
     sqx "$d" "ALTER TABLE mail DROP COLUMN wake_attempts; PRAGMA user_version=6"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
-    same "F9 version six migrates the durable wake counter" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='wake_attempts'")$(sqx "$d" 'PRAGMA user_version')" 17
+    same "F9 version six migrates the durable wake counter" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='wake_attempts'")$(sqx "$d" 'PRAGMA user_version')" 18
+    sqx "$d" "ALTER TABLE mail DROP COLUMN lease_until;
+      INSERT INTO posts(rowid,scope,sender,text,at) VALUES(41,'scope','sender','first',1),(42,'scope','sender','last',2);
+      INSERT INTO mail(post,name,pane,socket,state,shown,wake_attempts,staged_turn)
+        VALUES(41,'worker','%1','oldsocket','staged',2,1,'old:1'),(42,'worker','%1','oldsocket','staged',3,2,'old:1');
+      INSERT INTO hook_sessions(socket,pane,harness,session_id,harness_pid,last_event,at)
+        VALUES('oldsocket','%1','claude','legacy',1,'UserPromptSubmit',1);
+      PRAGMA user_version=7;"
+    CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
+    CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
+    same "F9 leases preserve legacy ids, bindings and charges" "$(sqx "$d" "SELECT group_concat(post||':'||pane||':'||socket||':'||state||':'||shown||':'||wake_attempts||':'||lease_until) FROM mail WHERE post IN(41,42)")" '41:%1:oldsocket:pending:2:1:0,42:%1:oldsocket:stalled:3:2:0'
+    same "F9 migration creates one durable sender notice" "$(sqx "$d" "SELECT count(*) FROM posts JOIN mail ON post=posts.rowid WHERE name='sender' AND text LIKE '%board id=42'")" 1
+    same "F9 migration seeds the active hook generation" "$(sqx "$d" "SELECT length(generation) FROM hook_sessions WHERE session_id='legacy'")" 32
 }
 
 # ---- fix round 7 (F7_1 to F7_6) ----
@@ -2162,19 +2174,22 @@ f7_1() {
     same "F7.1 served: the Stop delivers it" "$(mstate "$id2")" "delivered/1/1"
 }
 
-# f7_2: a database stamped at a higher schema version (a newer build wrote it) is opened as it is and never stamped down
+# f7_2: a newer database is left untouched and writer paths refuse it.
 f7_2() {
     local d="$TMPD/f7_2.db" sockpath
     sockpath=$(t display -p '#{socket_path}')
     rm -f "$d" "$d-wal" "$d-shm"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
-    sqx "$d" "ALTER TABLE mail DROP COLUMN socket; PRAGMA user_version=8"
-    CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
-    same "F7.2 a newer database keeps its higher stamp" "$(sqx "$d" 'PRAGMA user_version')" 8
+    sqx "$d" "ALTER TABLE mail DROP COLUMN socket; PRAGMA user_version=999"
+    same "F7.2 hook refuses newer schema" "$(CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0)" no
+    local response
+    response=$(CNTCTR_DB=$d rpc "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"recall","arguments":{}}}' | tail -n 1)
+    check "F7.2 MCP reports newer schema" "$(txt "$response")" 'newer schema'
+    same "F7.2 a newer database keeps its higher stamp" "$(sqx "$d" 'PRAGMA user_version')" 999
     same "F7.2 and is not migrated by this build" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")" 0
     sqx "$d" "PRAGMA user_version=0"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
-    same "F7.2 an older database is migrated and stamped" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")$(sqx "$d" 'PRAGMA user_version')" 17
+    same "F7.2 an older database is migrated and stamped" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")$(sqx "$d" 'PRAGMA user_version')" 18
 }
 
 # f7_3: staged mail is released after a cancelled turn only for a spawned worker; a user's own session is left to its next prompt event

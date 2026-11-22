@@ -2,6 +2,7 @@
 #ifndef KB_H
 #define KB_H
 #include <sqlite3.h>
+#include <time.h>
 
 /* What a new entry holds; kb_put fills in id, machine and times. NULL body, tags
  * and refs are stored as empty text. */
@@ -32,6 +33,21 @@ char *kb_tool_projects(sqlite3 *db);   /* every project with a tool row, one per
     "((" m ".name=" name_arg " AND " name_arg "!='' AND posts.scope=" scope_arg \
     " AND " m ".socket IN (" socket_arg ",'')) OR (" m ".socket || char(10) || " m ".pane=" pane_arg \
     " AND " pane_arg "!='' AND posts.at>" start_arg "))"
+/* Automatic delivery requires a current bound pane. The board also supports name lookup. */
+#define KB_MAIL_ATTACHED(m, socket_arg, pane_arg, start_arg) \
+    "(" m ".socket!='' AND " m ".pane!='' AND " start_arg ">0 AND " \
+    KB_MAIL_FOR(m, "''", "''", "''", "(" socket_arg "||char(10)||" pane_arg ")", start_arg) ")"
+/* Insert, claim and finish can share the caller's short write transaction.
+ * Claim returns the attempt number, zero if ineligible, or -1 on error. */
+long long kb_mail_insert(sqlite3 *db, const char *scope, const char *pane, const char *name, const char *sender,
+                         const char *task, const char *body, int hooked, const char *from_pane,
+                         const char *from_scope, const char *socket);
+int kb_mail_claim(sqlite3 *db, long long post, const char *socket, const char *pane, long long server_start,
+                  const char *token, int full, int presentations, time_t now, time_t until);
+enum kb_mail_finish { KB_MAIL_READ, KB_MAIL_STOP, KB_MAIL_TERMINAL };
+int kb_mail_finish(sqlite3 *db, long long post, enum kb_mail_finish outcome, int attempt, const char *token,
+                   time_t now); /* 1 finished, 0 unmatched, -1 error */
+int kb_mail_reconcile(sqlite3 *db, time_t now, int wake_sec); /* SQLite result code */
 char *kb_board_mail(sqlite3 *db, const char *scope, const char *me, const char *pane, const char *socket, long long server_start, int limit);
 char *kb_board(sqlite3 *db, const char *scope, const char *me, const char *pane, const char *socket, long long server_start, int limit);   /* "<UTC time> <sender>: <text>" lines, oldest first */
 
