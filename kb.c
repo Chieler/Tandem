@@ -117,6 +117,7 @@ static const struct { const char *table, *name, *def; } MIGRATIONS[] = {
     {"mail", "staged_full", "INTEGER NOT NULL DEFAULT 0"},
     {"hook_sessions", "generation", "TEXT NOT NULL DEFAULT ''"},
     {"hook_sessions", "event_seq", "INTEGER NOT NULL DEFAULT 0"},
+    {"mail", "wake_attempts", "INTEGER NOT NULL DEFAULT 0"},
 };
 
 /* PRAGMA user_version of a database that has this file's SCHEMA and every column of MIGRATIONS: 1 for the 13 columns above, one

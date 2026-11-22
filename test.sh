@@ -1530,6 +1530,41 @@ u5p3_run() {
     c_stop "$P" >/dev/null
     same "first Stop acknowledges its own attachment" "$(mstate "$id")" "delivered/1/1"
     daemon_stop
+
+    # A socket-scoped name can recover old mail, but cannot attach mail bound to a closed pane.
+    P=$(hk_agent claude u5_reused_name)
+    id=$(mailput "$P" j4000001 "$(mail_text j4000001 'board recovery on reused name')" 0)
+    t kill-pane -t "$P"
+    P=$(hk_agent claude u5_reused_name)
+    id2=$(mailput "$P" j4000002 "$(mail_text j4000002 'mail for the replacement pane')" 0)
+    daemon_start "$P"
+    daemon_hello
+    expect_screen "replacement pane wakes for mail it can attach" "$P" "$(pointer "$id2")"
+    refute "replacement pane gets no pointer for the closed pane" "$(screen "$P")" "$(pointer "$id")"
+    same "closed-pane row spent no wake presentations" "$(mstate "$id")" "pending/0/0"
+    daemon_stop
+    check "reused name can still recover old mail by ID" "$(txt "$(call "$P" board "{\"id\":$id}")")" "board recovery on reused name"
+
+    # Restart the watcher and clear the idle reservation between unconsumed wakes.
+    # No hook consumes the line, so these only exercise the durable wake budget.
+    P=$(hk_agent claude u5_wake_budget)
+    id=$(mailput "$P" j5000001 "$(mail_text j5000001 'unconsumed wake budget')" 0)
+    local wake
+    for wake in 1 2 3; do
+        daemon_start "$P"
+        daemon_hello
+        wait_mstate "wake-only attempt $wake survives watcher restart" "$id" "pending/$wake/0"
+        daemon_stop
+        sqx "$CNTCTR_DB" "UPDATE hook_sessions SET wake_reserved=0,wake_at=NULL WHERE pane='$P';"
+    done
+    id2=$(mailput "$P" j5000002 "$(mail_text j5000002 'mail behind exhausted wakes')" 0)
+    daemon_start "$P"
+    daemon_hello
+    expect_screen "exhausted wake budget does not block later mail" "$P" "$(pointer "$id2")"
+    same "fourth unconsumed wake did not increment presentations" "$(mstate "$id")" "pending/3/0"
+    daemon_stop
+    ans=$(c_prompt "$P" "$(pointer "$id")")
+    check "exhausted wake can still attach its first body" "$(ctx_c "$ans")" "unconsumed wake budget"
 }
 
 # list_call: the long-lived server (daemon_start) learns its agent's identity, which starts its mail retry thread
@@ -2069,7 +2104,7 @@ f6_9() {
     sockpath=$(t display -p '#{socket_path}')
     rm -f "$d" "$d-wal" "$d-shm"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
-    same "F9 a new database carries a schema version" "$(sqx "$d" 'PRAGMA user_version')" 6
+    same "F9 a new database carries a schema version" "$(sqx "$d" 'PRAGMA user_version')" 7
     same "F9 and the machine row" "$(sqx "$d" "SELECT count(*) FROM meta WHERE k='machine'")" 1
     sqx "$d" "DELETE FROM meta WHERE k='machine'"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
@@ -2077,7 +2112,10 @@ f6_9() {
     sqx "$d" "ALTER TABLE mail DROP COLUMN socket; ALTER TABLE task_gate DROP COLUMN answered; PRAGMA user_version=0"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
     same "F9 an older database gets its columns back" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")$(sqx "$d" "SELECT count(*) FROM pragma_table_info('task_gate') WHERE name='answered'")" 11
-    same "F9 and the current version" "$(sqx "$d" 'PRAGMA user_version')" 6
+    same "F9 and the current version" "$(sqx "$d" 'PRAGMA user_version')" 7
+    sqx "$d" "ALTER TABLE mail DROP COLUMN wake_attempts; PRAGMA user_version=6"
+    CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
+    same "F9 version six migrates the durable wake counter" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='wake_attempts'")$(sqx "$d" 'PRAGMA user_version')" 17
 }
 
 # ---- fix round 7 (F7_1 to F7_6) ----
@@ -2130,13 +2168,13 @@ f7_2() {
     sockpath=$(t display -p '#{socket_path}')
     rm -f "$d" "$d-wal" "$d-shm"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
-    sqx "$d" "ALTER TABLE mail DROP COLUMN socket; PRAGMA user_version=7"
+    sqx "$d" "ALTER TABLE mail DROP COLUMN socket; PRAGMA user_version=8"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
-    same "F7.2 a newer database keeps its higher stamp" "$(sqx "$d" 'PRAGMA user_version')" 7
+    same "F7.2 a newer database keeps its higher stamp" "$(sqx "$d" 'PRAGMA user_version')" 8
     same "F7.2 and is not migrated by this build" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")" 0
     sqx "$d" "PRAGMA user_version=0"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
-    same "F7.2 an older database is migrated and stamped" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")$(sqx "$d" 'PRAGMA user_version')" 16
+    same "F7.2 an older database is migrated and stamped" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")$(sqx "$d" 'PRAGMA user_version')" 17
 }
 
 # f7_3: staged mail is released after a cancelled turn only for a spawned worker; a user's own session is left to its next prompt event
