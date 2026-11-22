@@ -1131,6 +1131,20 @@ u5p2_run() {
     same "1024-byte repeat stays full" "$(ctx_c "$ans")" "$body"
     c_stop "$P" >/dev/null
 
+    P=$(hk_agent claude spill_from_stop)
+    tail=$(head -c 10000 /dev/zero | tr '\0' x)
+    body=$(mail_text e1000006 "$tail")
+    m=$(mailput "$P" e1000006 "$body" 0)
+    ans=$(c_stop "$P")
+    out=$(printf '%s' "$ans" | jq -r '.reason')
+    check "first Stop spill names a cache file" "$out" "$HOME/.cache/cntctr/mail/"
+    check "first Stop spill also names its durable lookup" "$out" "call board id=$m"
+    check "first Stop spill fits the serialized hook budget" "$((${#ans} <= 8192))" 1
+    sqx "$CNTCTR_DB" "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<205)
+        INSERT INTO posts(scope,sender,text,at)
+        SELECT '$U5_SCOPE','sender','newer than spill',strftime('%s','now') FROM n;"
+    same "Stop preview ID retrieves the full mail after 205 newer posts" "$(txt "$(call "$P" board "{\"id\":$m}")")" "$body"
+
     P=$(hk_agent claude spill_unavailable)
     tail=$(head -c 10000 /dev/zero | tr '\0' x)
     body=$(printf '[cntctr from=sender id=e1000005]\n%s\n[cntctr end id=e1000005]' "$tail")

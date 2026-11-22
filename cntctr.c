@@ -4454,12 +4454,13 @@ static char *spill_file(const char *text) {
 }
 
 /* First `head` and last `tail` bytes of `text` (cut on character boundaries) and the file that holds all of it. */
-static char *excerpt(const char *text, const char *path, size_t head, size_t tail) {
+static char *excerpt(const char *text, const char *path, size_t head, size_t tail, long long id) {
     size_t len = strlen(text), h = head < len ? head : len, t = tail < len - h ? tail : len - h;
     h = utf8_prefix(text, h);
     size_t from = len - t;
     while (from < len && (text[from] & 0xC0) == 0x80) from++;
-    return fmt("%.*s\n[... %zu bytes left out; the whole mail is in the file %s ...]\n%s", (int)h, text, from - h, path, text + from);
+    return fmt("%.*s\n[... %zu bytes left out; the whole mail is in the file %s or call board id=%lld ...]\n%s",
+               (int)h, text, from - h, path, id, text + from);
 }
 
 static json_object *hook_trace;
@@ -4524,7 +4525,7 @@ static char *fit_mail(const char *harness, const char *event, enum hook_answer_k
             const char *start, *end;
             mail_body(rows[i].text, &start, &end);
             for (size_t head = path ? 4096 : 400; !cand && head >= 64; head /= 2) {
-                char *p2 = path ? excerpt(rows[i].text, path, head, head / 2)
+                char *p2 = path ? excerpt(rows[i].text, path, head, head / 2, rows[i].id)
                                 : mail_excerpt(&rows[i], start, end, head);
                 full = extra ? fmt("%s\n\n%s", p2, extra) : strdup(p2);
                 if (answer_fits(harness, event, kind, full)) cand = p2;
