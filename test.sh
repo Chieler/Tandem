@@ -1111,7 +1111,17 @@ u5p2_run() {
     expected=$(printf '[cntctr from=sender id=e1000003]\n%s\n[cntctr end id=e1000003]\n[702 more bytes omitted: call board id=%s]' "$prefix" "$m")
     same "large repeat ends on a UTF-8 boundary with exact omitted bytes" "$(ctx_c "$ans")" "$expected"
     check "serialized quoted excerpt fits Claude's 8192-byte limit" "$((${#ans} <= 8192))" 1
+    ans=$(c_stop "$P")
+    emptyans "$ans" && ok_ || bad "clean Stop does not immediately repeat the excerpt" "  got: $ans"
+    same "clean Stop leaves the excerpt unread" "$(mstate "$m")" "pending/1/0"
+    ans=$(c_prompt "$P" "$(pointer "$m")")
+    same "third large presentation has the same exact excerpt" "$(ctx_c "$ans")" "$expected"
     c_stop "$P" >/dev/null
+    same "clean Stop after the third body stalls without delivery" "$(mstate "$m")" "stalled/1/0"
+    same "excerpt stall tells the sender once" "$(notices "$m")" 1
+    out=$(txt "$(call "$P" board "{\"id\":$m}")")
+    same "board lookup returns the entire stalled body" "$out" "$body"
+    same "complete board lookup acknowledges the stalled body" "$(mstate "$m")" "delivered/1/1"
 
     P=$(hk_agent claude repeat_limit)
     body=$(head -c 1024 /dev/zero | tr '\0' x)
@@ -1134,6 +1144,41 @@ u5p2_run() {
     mv "$mail_cache.saved" "$mail_cache"
     expected=$(printf '[cntctr from=sender id=e1000005]\n%s\n[cntctr end id=e1000005]\n[9600 more bytes omitted: call board id=%s]' "${tail:0:400}" "$m")
     same "spill failure still gives both markers and a working lookup" "$(ctx_c "$ans")" "$expected"
+
+    c_stop "$P" >/dev/null
+    same "clean Stop after a spill fallback leaves mail unread" "$(mstate "$m")" "pending/1/0"
+
+    # A wake for the newest of 205 mixed rows still presents the oldest fitting prefix.
+    local socket first last row piece assembled='' sep='' i
+    P=$(hk_agent claude mixed_budget)
+    socket=$(t display -p '#{socket_path}')
+    sqx "$CNTCTR_DB" "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<205)
+        INSERT INTO posts(scope,sender,text,at)
+        SELECT '$U5_SCOPE','mixed_fixture',printf('batch-%03d:',i) ||
+          CASE i%3 WHEN 1 THEN 'small' WHEN 2 THEN printf('%03000d',0) ELSE printf('%06000d',0) END,
+          strftime('%s','now') FROM n;
+        INSERT INTO mail(post,name,pane,socket,hooked,shown)
+        SELECT rowid,'mixed_budget','$P','$socket',1,CASE WHEN length(text)>6000 THEN 1 ELSE 0 END
+        FROM posts WHERE scope='$U5_SCOPE' AND sender='mixed_fixture';"
+    first=$(sq "$CNTCTR_DB" "SELECT min(post) FROM mail WHERE pane='$P'")
+    last=$(sq "$CNTCTR_DB" "SELECT max(post) FROM mail WHERE pane='$P'")
+    for i in 1 2 3 4 5 6 7; do
+        row=$((first + i - 1))
+        piece=$(sq "$CNTCTR_DB" "SELECT text FROM posts WHERE rowid=$row")
+        if [ "$((i % 3))" -eq 0 ]; then
+            piece=$(printf '%s\n[5610 more bytes omitted: call board id=%s]' "${piece:0:400}" "$row")
+        fi
+        assembled="$assembled$sep$piece"
+        sep=$'\n\n'
+    done
+    ans=$(c_prompt "$P" "$(pointer "$last")")
+    same "205 mixed mails yield the exact oldest fitting seven rows" "$(ctx_c "$ans")" "$assembled"
+    check "205 mixed mails stay within the serialized hook budget" "$((${#ans} <= 8192))" 1
+    same "only the seven emitted rows are staged" "$(sq "$CNTCTR_DB" "SELECT count(*) FROM mail WHERE pane='$P' AND state='staged'")" 7
+    same "the newest wake leaves the newest mail pending" "$(mstate "$last")" "pending/0/0"
+    c_stop "$P" true >/dev/null
+    same "one Stop delivers only the five full bodies in a mixed answer" "$(sq "$CNTCTR_DB" "SELECT count(*) FROM mail WHERE pane='$P' AND delivered=1")" 5
+    same "the two excerpted bodies in a mixed answer remain unread" "$(sq "$CNTCTR_DB" "SELECT count(*) FROM mail WHERE pane='$P' AND shown=2 AND state='pending' AND delivered=0")" 2
 
     # An exact mail lookup must work after the mail falls outside the recent board window.
     P=$(hk_agent claude lookup_owner)
@@ -1803,7 +1848,7 @@ f6_9() {
     sockpath=$(t display -p '#{socket_path}')
     rm -f "$d" "$d-wal" "$d-shm"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
-    same "F9 a new database carries a schema version" "$(sqx "$d" 'PRAGMA user_version')" 2
+    same "F9 a new database carries a schema version" "$(sqx "$d" 'PRAGMA user_version')" 3
     same "F9 and the machine row" "$(sqx "$d" "SELECT count(*) FROM meta WHERE k='machine'")" 1
     sqx "$d" "DELETE FROM meta WHERE k='machine'"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
@@ -1811,7 +1856,7 @@ f6_9() {
     sqx "$d" "ALTER TABLE mail DROP COLUMN socket; ALTER TABLE task_gate DROP COLUMN answered; PRAGMA user_version=0"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
     same "F9 an older database gets its columns back" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")$(sqx "$d" "SELECT count(*) FROM pragma_table_info('task_gate') WHERE name='answered'")" 11
-    same "F9 and the current version" "$(sqx "$d" 'PRAGMA user_version')" 2
+    same "F9 and the current version" "$(sqx "$d" 'PRAGMA user_version')" 3
 }
 
 # ---- fix round 7 (F7_1 to F7_6) ----
@@ -1870,7 +1915,7 @@ f7_2() {
     same "F7.2 and is not migrated by this build" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")" 0
     sqx "$d" "PRAGMA user_version=0"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
-    same "F7.2 an older database is migrated and stamped" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")$(sqx "$d" 'PRAGMA user_version')" 12
+    same "F7.2 an older database is migrated and stamped" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")$(sqx "$d" 'PRAGMA user_version')" 13
 }
 
 # f7_3: staged mail is released after a cancelled turn only for a spawned worker; a user's own session is left to its next prompt event
