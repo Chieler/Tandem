@@ -2403,6 +2403,7 @@ f8_5() {
     printf 'Stop %s %s %s async\n' "$TMPD/late_stop_event" "$P" "$TMPD/late_stop_answer" >&20
     read -r ready <&21
     waitfor_hook_pause "$TMPD/hold_stop.ready"
+    same "paused Stop has captured its old claim before acknowledging" "$(mstate "$old")" staged/1/0
     ans=$(c_prompt "$P" "$(pointer "$id")")
     same "newer prompt stages the exact mail body" "$(ctx_c "$ans")" "$(mail_text f8000005 'mail for turn N plus one')"
     new_claim=$(sqx "$CNTCTR_DB" "SELECT shown||'/'||staged_turn FROM mail WHERE post=$id")
@@ -3194,16 +3195,17 @@ check "note cannot write history" "$(txt "$(call "$KA" note '{"layer":"history",
 
 mkdir "$TMPD/repo" "$TMPD/plain"
 git -C "$TMPD/repo" init -q
-git -C "$TMPD/repo" remote add origin git@GitHub.com:X/y.git
+remote_repo="y-$(basename "$TMPD")"
+git -C "$TMPD/repo" remote add origin "git@GitHub.com:X/$remote_repo.git"
 KR=$(t new-window -d -n kr -c "$TMPD/repo" -P -F '#{pane_id}' cat)
 t set -p -t "$KR" @cntctr_name kr
-check "project key from the origin remote" "$(txt "$(call "$KR" project '{}')")" "project github.com/X/y (root "
-git -C "$TMPD/repo" remote set-url origin https://github.com/X/y.git/
-check "https remote normalizes the same" "$(txt "$(call "$KR" project '{}')")" "project github.com/X/y (root "
+check "project key from the origin remote" "$(txt "$(call "$KR" project '{}')")" "project github.com/X/$remote_repo (root "
+git -C "$TMPD/repo" remote set-url origin "https://github.com/X/$remote_repo.git/"
+check "https remote normalizes the same" "$(txt "$(call "$KR" project '{}')")" "project github.com/X/$remote_repo (root "
 same "project override" "$(txt "$(call "$KR" project '{"key":"foo"}')" | cut -d' ' -f1-2)" "project foo"
 same "override persists" "$(txt "$(call "$KR" project '{}')" | cut -d' ' -f1-2)" "project foo"
 call "$KR" project '{"key":""}' >/dev/null
-check "empty key removes the override" "$(txt "$(call "$KR" project '{}')")" "project github.com/X/y"
+check "empty key removes the override" "$(txt "$(call "$KR" project '{}')")" "project github.com/X/$remote_repo"
 KP=$(t new-window -d -n kp -c "$TMPD/plain" -P -F '#{pane_id}' cat)
 t set -p -t "$KP" @cntctr_name kp
 check "outside git the key is the directory" "$(txt "$(call "$KP" project '{}')")" "/plain (root "
@@ -3254,8 +3256,9 @@ call "$KB" reply "{\"id\":\"$hid\",\"text\":\"ok\",\"insights\":[\"$long\"]}" >/
 out=$(txt "$(call "$KA" recall '{}')")
 check "long unicode insight is listed" "$out" "[insight] xéé"
 refute "titles are cut on a character boundary" "$out" "�"
-out=$(CNTCTR_DB=/nonexistent/x.db call "$KA" send '{"to":"kb","text":"still delivered"}')
-check "send works without a knowledge store" "$(txt "$out")" "sent id="
+out=$(CNTCTR_DB=/nonexistent/x.db call "$KA" send '{"to":"kb","text":"mail requires a durable store"}')
+same "send reports an unavailable durable mail store" "$(txt "$out")" "could not store message for kb"
+refute "unavailable store leaves the pane clear of uncharged mail" "$(screen "$KB")" "mail requires a durable store"
 same "note reports a missing store" "$(txt "$(CNTCTR_DB=/nonexistent/x.db call "$KA" note '{"layer":"insight","title":"x","summary":"y"}')" | cut -c1-30)" "knowledge store unavailable: u"
 call "$KA" send '{"to":"kb","text":"why does Enter get lost in copy-mode?"}' >/dev/null
 expect_screen "envelope points at recall" "$KB" "[cntctr knowledge: call recall for more]"
@@ -3499,12 +3502,27 @@ deft envt 'env'
 out=$(export FOO_TOKEN=s OPENAI_API_KEY=s MY_SECRET=s; txt "$(use envt)")
 check "env reaches the tool" "$out" "CNTCTR_FD=3"
 refute "no tokens" "$out" FOO_TOKEN; refute "no keys" "$out" API_KEY; refute "no secrets" "$out" MY_SECRET; refute "no TMUX" "$out" "TMUX="
-python3 -c "import socket,time;s=socket.socket();s.bind(('127.0.0.1',47124));s.listen();time.sleep(8)" & LP=$!
-sleep 0.5
-deft neto 'nc -z -w1 127.0.0.1 47124 && echo open'
+python3 - "$TMPD/net-port" <<'PYTHON' &
+import socket
+import sys
+import time
+
+with socket.socket() as server:
+    server.bind(("127.0.0.1", 0))
+    server.listen()
+    with open(sys.argv[1], "w") as port:
+        print(server.getsockname()[1], file=port)
+    time.sleep(30)
+PYTHON
+LP=$!
+for _ in $(seq 40); do [ -s "$TMPD/net-port" ] && break; sleep 0.05; done
+net_port=$(cat "$TMPD/net-port" 2>/dev/null)
+deft neto "nc -z -w1 127.0.0.1 $net_port && echo open"
 same "network denied by default" "$(iserr "$(use neto)")" true
-deft neta 'nc -z -w1 127.0.0.1 47124 && echo open' '{"net":true}'
-same "declared net works" "$(txt "$(use neta)")" open; kill $LP
+deft neta "nc -z -w1 127.0.0.1 $net_port && echo open" '{"net":true}'
+same "declared net works" "$(txt "$(use neta)")" open
+kill "$LP" 2>/dev/null
+wait "$LP" 2>/dev/null
 deft big 'yes | head -c 400000'
 big_out=$(txt "$(use big)")
 [ "${#big_out}" -lt 16384 ] && ok_ || bad "stdout cap returns a preview under 16 KB"
@@ -3877,7 +3895,8 @@ session "$KA" 3 "$INIT" "$LIST" | while read -r l; do echo "$l" >> "$TMPD/lc2"; 
 waitfor "the second listener registered" '[ "$(grep -c . "$TMPD/lc2")" = 2 ]'
 for n in lcb1 lcb2 lcb3; do publish "$FR" $n 'echo b' >/dev/null; done
 waitfor "the burst is approved" '[ "$(st lcb1)$(st lcb2)$(st lcb3)" = activeactiveactive ]'
-wait $lc2
+if [ "$(st lcb1)$(st lcb2)$(st lcb3)" = activeactiveactive ]; then wait "$lc2"
+else kill "$lc2" 2>/dev/null; wait "$lc2" 2>/dev/null; fi
 check "a burst notifies after the last commit" "$(cat "$TMPD/lc2")" "$LC"
 mkfifo "$TD/999999.fifo"
 call "$KR" tool_revoke '{"name":"lcb1","reason":"t"}' >/dev/null
