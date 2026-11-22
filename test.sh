@@ -874,6 +874,14 @@ mailput() {
     sqx "$CNTCTR_DB" "INSERT INTO posts(scope,sender,text,at) VALUES('$U5_SCOPE','sender',CAST(readfile('$f') AS TEXT),${5:-strftime('%s','now')}); INSERT INTO mail(post,name,pane,task,hooked,presentations,socket) VALUES(last_insert_rowid(),'$name','$1','$2',1,${4:-0},'$(t display -p '#{socket_path}')'); SELECT last_insert_rowid();"
 }
 # Force the persisted deadline across expiry without sleeping for a production lease.
+wait_shown() {
+    local i
+    for i in $(seq 80); do
+        [ "$(sqx "$CNTCTR_DB" "SELECT shown FROM mail WHERE post=$1")" = "$2" ] && return
+        sleep 0.1
+    done
+    bad "mail $1 did not charge body attempt $2"
+}
 expire_mail() { sqx "$CNTCTR_DB" "UPDATE mail SET lease_until=1 WHERE post=$1 AND state='staged'"; }
 mstate() { sqx "$CNTCTR_DB" "SELECT state||'/'||presentations||'/'||delivered FROM mail WHERE post=$1"; }
 pointer() { printf '[cntctr mail id=%s] body attached; if missing, call board id=%s' "$1" "$1"; }
@@ -1513,7 +1521,7 @@ u5p3_run() {
     check "U17 with the text" "$(screen "$N")" "mail for an agent without hooks"
     check "U17 and the header" "$(screen "$N")" "[cntctr from=u5_snd id=$task]"
     refute "U17 no pointer line is typed" "$(screen "$N")" "[cntctr mail id="
-    same "U17 no mail row is kept for it" "$(sqx "$CNTCTR_DB" "SELECT count(*) FROM mail WHERE pane='$N'")" 0
+    same "U17 terminal submission finishes one charged attempt" "$(sqx "$CNTCTR_DB" "SELECT state || '/' || shown || '/' || delivered FROM mail WHERE pane='$N' AND task='$task'")" "delivered/1/1"
 
     # the retry thread wakes an idle agent that has hooks and pending mail: one line
     P=$(hk_agent claude u5_j1)
@@ -1685,6 +1693,10 @@ u5p4_run() {
     expect_screen "quiet repeat keeps the original closing marker" "$P" "[cntctr end id=e4000002]"
     expect_screen "quiet repeat names the exact omitted byte count and lookup" "$P" "[700 more bytes omitted: call board id=$id]"
     refute "quiet repeat does not paste the full payload" "$(screen "$P")" "$payload"
+    for i in 2 3; do
+        wait_shown "$id" "$i"
+        expire_mail "$id"
+    done
     wait_mstate "quiet repeat stops after the third body" "$id" "stalled/0/0"
     same "quiet repeat charges the two fallbacks and the first hook body" "$(sq "$CNTCTR_DB" "SELECT shown FROM mail WHERE post=$id")" 3
     same "quiet repeat tells the sender once" "$(notices "$id")" 1
@@ -1702,6 +1714,10 @@ u5p4_run() {
     daemon_start "$P"
     daemon_hello
     expect_screen "quiet paste reaches the pane before the delivery update fails" "$P" "FULL-ONLY-CHARGE-MARKER"
+    for i in 1 2 3; do
+        wait_shown "$id" "$i"
+        expire_mail "$id"
+    done
     wait_mstate "quiet paste spends three body attempts despite the update failure" "$id" "stalled/0/0"
     same "quiet paste never retries the full oversized body" "$(screen "$P" | grep -c 'FULL-ONLY-CHARGE-MARKER')" 2
     same "failed delivery update still leaves three recorded attempts" "$(sq "$CNTCTR_DB" "SELECT shown FROM mail WHERE post=$id")" 3

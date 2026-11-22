@@ -745,9 +745,8 @@ static char *server_opts(void) {
 
 static int enter_delay_ms = 150;   /* CNTCTR_ENTER_DELAY_MS: pause between paste and Enter */
 
-/* Write `text` to `pane`'s program through a temporary buffer, bracketed or raw. */
-static char *paste(const char *pane, const char *text, int bracketed, int *may_have_written) {
-    char buf[32], *err;
+/* Check input state before submitting multi-line text. */
+static char *paste_ready(const char *pane, int brackets) {
     const char *configured = getenv("CNTCTR_PASTE_WAIT_MS");
     long wait = configured ? strtol(configured, NULL, 10) : 2000;
     if (wait < 0) wait = 0;
@@ -767,7 +766,7 @@ static char *paste(const char *pane, const char *text, int bracketed, int *may_h
         int valid = sscanf(flags, "%d %d %d", &off, &flag, &in_mode) == 3;
         free(flags);
         if (!valid || off) return fmt("paste blocked: pane input is disabled or unknown");
-        if (!bracketed || !strchr(text, '\n')) break;   /* a one-line text needs no brackets */
+        if (!brackets) break;   /* a one-line text needs no brackets */
         if (in_mode) {
             /* In copy-mode tmux reports the mode screen's bracketed-paste flag and `paste-buffer -p` sends no brackets,
              * so each newline of a multi-line text would act as Enter. Leave the mode once, then read the flags again. */
@@ -783,10 +782,16 @@ static char *paste(const char *pane, const char *text, int bracketed, int *may_h
         struct timespec pause = {0, 50000000L};
         nanosleep(&pause, NULL);
     }
+    return NULL;
+}
+
+/* Write text through a temporary tmux buffer, bracketed or raw. */
+static char *paste(const char *pane, const char *text, int bracketed) {
+    char *err = paste_ready(pane, bracketed && strchr(text, '\n'));
+    if (err) return err;
+    char buf[32];
     snprintf(buf, sizeof buf, "cntctr-in-%08x", arc4random());
     if ((err = TMUXE(text, "load-buffer", "-b", buf, "-"))) return err;
-    /* Once tmux receives paste-buffer, failure may leave bytes in the pane. */
-    if (may_have_written) *may_have_written = 1;
     if ((err = bracketed ? TMUXE(NULL, "paste-buffer", "-p", "-d", "-b", buf, "-t", pane)
                          : TMUXE(NULL, "paste-buffer", "-d", "-b", buf, "-t", pane)))
         free(TMUXE(NULL, "delete-buffer", "-b", buf));
@@ -834,7 +839,7 @@ static int lock_mail(const char *socket, long long id, int flags, char **err) {
 
 /* Paste `text` into `pane` as one bracketed paste, then press Enter. A text with `with_end` gets the
  * `[cntctr end id=...]` line. `who` names the pane in errors. Returns NULL or an error (caller frees). */
-static char *inject_with_progress(const char *pane, const char *who, const char *text, int with_end, int *may_have_written) {
+static char *inject_ex(const char *pane, const char *who, const char *text, int with_end) {
     char *err = NULL;
     int lock = lock_pane(pane, &err);
     if (lock < 0) return err;
@@ -857,20 +862,16 @@ static char *inject_with_progress(const char *pane, const char *who, const char 
         body = len >= endlen && !strcmp(text + len - endlen, ending) ? strdup(text) : fmt("%s\n%s", text, ending);
         free(ending);
     } else body = strdup(text);
-    err = paste(pane, body, 1, may_have_written);
+    err = paste(pane, body, 1);
     free(body);
     if (err) goto done;
     struct timespec pause = {enter_delay_ms / 1000, (enter_delay_ms % 1000) * 1000000L};
     nanosleep(&pause, NULL);
     /* Enter as a raw CR paste: send-keys would go to copy-mode if the user is scrolled back. */
-    err = paste(pane, "\r", 0, NULL);
+    err = paste(pane, "\r", 0);
 done:
     close(lock);
     return err;
-}
-
-static char *inject_ex(const char *pane, const char *who, const char *text, int with_end) {
-    return inject_with_progress(pane, who, text, with_end, NULL);
 }
 
 static char *inject(const char *pane, const char *who, const char *text) { return inject_ex(pane, who, text, 1); }
@@ -1007,32 +1008,11 @@ static char *buffer_take(const char *buf) {
 static void notify_all(void);
 
 static long long store_mail(sqlite3 *db, const char *pane, const char *name, const char *scope, const char *task, const char *sender, const char *text, int hooked);
-static int hook_mail(const char *pane, const char *name, const char *scope, const char *task, const char *text, int *on_board);
+static int route_mail(const char *pane, const char *name, const char *scope, const char *task, const char *text, int refuse_permission);
 
-/* A failed terminal delivery is durable mail on the addressee's board. */
-static int deliver_fallback(const char *pane, const char *name, const char *scope, const char *id, const char *text) {
-    char *err = NULL;
-    sqlite3 *db = kb(&err);
-    free(err);
-    if (!db) return -1;
-    long long mail = store_mail(db, pane, name, scope, id, caller_name, text, 0);
-    sqlite3_close(db);
-    if (mail > 0) notify_all();
-    return mail > 0 ? 1 : -1;
-}
-
-/* Addressed text: typed into the pane, or, for an agent that has hooks, stored and announced by a one-line wake.
- * 0 delivered or queued, 1 on the board, -1 failed. */
+/* 0 delivered or queued, 1 on board, -1 failed. */
 static int deliver(const char *pane, const char *name, const char *scope, const char *id, const char *text) {
-    if (pane && *pane) {
-        int on_board = 0, stored = hook_mail(pane, name, scope, id, text, &on_board);
-        if (stored > 0) return on_board;
-        if (stored < 0) return -1;
-    }
-    char *err = pane && *pane ? inject(pane, name, text) : strdup("pane gone");
-    if (!err) return 0;
-    free(err);
-    return deliver_fallback(pane, name, scope, id, text);
+    return route_mail(pane, name, scope, id, text, 0);
 }
 
 /* Serialize claims with active waiters. Delete late buffers only after durable delivery. */
@@ -1620,18 +1600,10 @@ static int start_send(json_object *a, int wait, char id[9], char **pane_out, int
         free(env);
         env = add;
     }
-    int stored = 0, woke_late = 0;
-    if ((stored = hook_mail(pane, label, NULL, id, env, &woke_late)) > 0) {   /* an agent that has hooks: stored first, then woken */
-        err = NULL;
-        if (on_board && woke_late) *on_board = 1;
-    } else if (stored < 0) {
-        err = fmt("could not store the message for %s", label);
-    } else err = inject(pane, label, env);
-    if (err && !stored && strncmp(err, "paste blocked:", 14) == 0 && deliver_fallback(pane, label, NULL, id, env) > 0) {
-        free(err);
-        err = NULL;
-        if (on_board) *on_board = 1;
-    }
+    int sent = route_mail(pane, label, NULL, id, env, 1);
+    err = sent == -2 ? fmt("%s awaiting permission prompt; retry later", label) :
+          sent < 0 ? fmt("could not store message for %s", label) : NULL;
+    if (on_board && sent > 0) *on_board = 1;
     free(env);
     if (err && wait && !pane_alive(pane)) { free(err); err = NULL; }
     if (err) {
@@ -3466,7 +3438,6 @@ static void notify_all(void) {
     if (d) closedir(d);
 }
 
-static int has_hooks(sqlite3 *db, const char *socket, const char *pane);
 static int wake_pending(sqlite3 *db, const char *socket, const char *pane, const char *name, const char *scope);
 static char *tmux_socket(void);
 static void hooks_expire(sqlite3 *db);
@@ -3476,172 +3447,117 @@ static void broken_pointer(sqlite3 *db, const char *socket, const char *pane, co
 struct mrow { long long id; char *text; int shown, complete; };
 static char *fit_mail(const char *harness, const char *event, enum hook_answer_kind kind,
                       struct mrow *rows, int n, const char *extra, int *taken);
+enum { MAIL_LEASE_SEC = 300 };
 
-/* Charge this attempt before terminal I/O. Finalization and refunds match the
- * reserved count, so a later hook or board read owns any newer state. */
-static int update_paste_attempt(sqlite3 *db, const char *sql, long long id, int shown) {
-    sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
-    sqlite3_bind_int64(st, 1, id);
-    sqlite3_bind_int(st, 2, shown);
-    int ok = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
-    sqlite3_finalize(st);
-    return ok;
+static long long pane_epoch(const char *pane) {
+    char *out = NULL;
+    long long epoch = pane && *pane && TMUX(NULL, &out, "display", "-p", "-t", pane, "#{start_time}") == 0 ? atoll(out) : 0;
+    free(out);
+    return epoch;
 }
 
-/* The caller holds the mail lock and an open transaction. */
-static int paste_tracked_mail(sqlite3 *db, const char *socket, const char *pane, const char *name,
-                              const char *harness, long long id, char *body, int shown) {
-    char *message = strchr(body, '\n');
-    struct mrow row = {.id = id, .text = message && !strncmp(body, "for ", 4) ? message + 1 : body,
-                       .shown = shown};
-    const char *event = !strcmp(harness, "agy") ? "PreInvocation" : "UserPromptSubmit";
-    int taken = 0;
-    char *piece = fit_mail(harness, event, HOOK_ATTACH, &row, 1, NULL, &taken);
-    const char *reserve = "UPDATE mail SET shown=shown+1, state='pending' "
-        "WHERE post=?1 AND shown=?2 AND shown<3 AND delivered=0 AND state='pending'";
-    if (!taken || !update_paste_attempt(db, reserve, id, shown) ||
-        sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
-        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
-        free(piece);
-        return 1;
+/* Positive for responsive hooks, zero for terminal submission, negative on a query error. */
+static int mail_hook_mode(sqlite3 *db, const char *socket, const char *pane, long long epoch, char *quiet) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT harness,prompt_seen,broken FROM hook_sessions"
+                              " WHERE socket=?1 AND pane=?2 AND server_start=?3 AND server_start>0",
+                           -1, &st, NULL) != SQLITE_OK) return -1;
+    sqlite3_bind_text(st, 1, socket, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, pane, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 3, epoch);
+    int step = sqlite3_step(st), mode = -1;
+    if (step == SQLITE_DONE) mode = 0;
+    if (step == SQLITE_ROW) {
+        int broken = sqlite3_column_int(st, 2);
+        mode = sqlite3_column_int(st, 1) && !broken;
+        if (quiet && broken) snprintf(quiet, 16, "%s", sqlite3_column_text(st, 0));
     }
+    sqlite3_finalize(st);
+    return mode;
+}
 
-    int may_have_written = 0;
-    char *err = inject_with_progress(pane, name, piece, row.complete, &may_have_written);
-    free(piece);
-    if (err) {
-        free(err);
-        if (!may_have_written) {
-            const char *refund = "UPDATE mail SET shown=shown-1 WHERE post=?1 AND shown=?2 AND state='pending' AND delivered=0";
-            update_paste_attempt(db, refund, id, shown + 1);
-            broken_pointer(db, socket, pane, name, id);
+/* The row lock spans claim, submission (including Enter), and compare-and-finish. */
+static int terminal_mail(sqlite3 *db, const char *socket, const char *pane, const char *name,
+                         long long epoch, long long id, const char *text, int shown, const char *quiet, int unserved) {
+    int lock = lock_mail(socket, id, LOCK_NB, NULL);
+    if (lock < 0) return 0;
+    struct mrow row = {.id = id, .text = (char *)text, .shown = shown, .complete = 1};
+    int taken = 1, finished = 0, pointer = 0;
+    char *piece = NULL;
+    if (*quiet) {
+        const char *event = !strcmp(quiet, "agy") ? "PreInvocation" : "UserPromptSubmit";
+        piece = fit_mail(quiet, event, HOOK_ATTACH, &row, 1, NULL, &taken);
+    }
+    const char *body = piece ? piece : text;
+    if (taken && epoch > 0 && !awaiting_permission(pane)) {
+        char *blocked = *quiet ? paste_ready(pane, row.complete || strchr(body, '\n')) : NULL;
+        if (blocked) {
+            free(blocked);
+            pointer = 1;
+        } else if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK) {
+            time_t now = time(NULL);
+            int attempt = (unserved || mail_hook_mode(db, socket, pane, epoch, NULL) == 0) ?
+                kb_mail_claim(db, id, socket, pane, epoch, NULL, row.complete, 0, now, now + MAIL_LEASE_SEC) : 0;
+            if (attempt == shown + 1 && sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK) {
+                char *err = inject_ex(pane, name, body, row.complete);
+                if (!err) finished = kb_mail_finish(db, id, KB_MAIL_TERMINAL, attempt, NULL, 0) == 1;
+                free(err);
+            } else sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
         }
-        return 1;
     }
-    const char *deliver = "UPDATE mail SET state='delivered', delivered=1 WHERE post=?1 AND shown=?2 AND state='pending' AND delivered=0";
-    return !row.complete || !update_paste_attempt(db, deliver, id, shown + 1);
+    free(piece);
+    close(lock);
+    if (pointer) broken_pointer(db, socket, pane, name, id);
+    return finished;
 }
 
-/* The caller holds the mail lock and write transaction. A prompt can stage mail
- * before has_hooks() sees the first Stop of that generation. */
-static int release_orphaned_stage(sqlite3 *db, long long id) {
-    const char *sql = "SELECT mail.pane, h.harness, h.harness_pid FROM mail LEFT JOIN hook_sessions h"
-        " ON h.socket=mail.socket AND h.pane=mail.pane AND h.generation!=''"
-        " AND mail.staged_turn=h.generation || ':' || h.turn WHERE mail.post=?1 AND mail.state='staged' AND mail.lease_until=0";
-    sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return SQLITE_ERROR;
-    sqlite3_bind_int64(st, 1, id);
-    int step = sqlite3_step(st);
-    int owned = step == SQLITE_ROW && sqlite3_column_type(st, 1) != SQLITE_NULL
-        && hook_process_alive(sqlite3_column_int64(st, 2), (const char *)sqlite3_column_text(st, 1))
-        && pane_served((const char *)sqlite3_column_text(st, 0));
-    sqlite3_finalize(st);
-    if (step == SQLITE_DONE) return SQLITE_OK;
-    if (step != SQLITE_ROW) return SQLITE_ERROR;
-    if (owned) return SQLITE_BUSY;
-
-    if (sqlite3_prepare_v2(db, "UPDATE mail SET state='pending' WHERE post=?1 AND state='staged'", -1, &st, NULL) != SQLITE_OK)
-        return SQLITE_ERROR;
-    sqlite3_bind_int64(st, 1, id);
-    step = sqlite3_step(st);
-    sqlite3_finalize(st);
-    return step == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
-}
-
-/* Only the FIFO watcher retries mail, sleeping indefinitely when its queue is empty. */
 static int redeliver_for(const char *pane, const char *name) {
     char *err = NULL;
     sqlite3 *db = kb(&err);
     free(err);
-    if (!db) return 1;   /* an unavailable queue may still hold mail */
+    if (!db) return 1;
     struct project p;
     resolve_project(db, pane, &p);
-    sqlite3_stmt *st = NULL;
-    int pending = 0;
-    char *socket = tmux_socket();
+    char *socket = tmux_socket(), quiet[16] = "";
+    long long epoch = pane_epoch(pane);
     hooks_expire(db);
     stall_overdue(db, socket, pane);
-    int hooked = *socket && has_hooks(db, socket, pane);
-    if (hooked) {   /* a hook presents this agent's mail, a one-line wake asks for it; the paste path below is for agents without hooks */
-        int waiting = wake_pending(db, socket, pane, name, p.key);
-        free(socket);
-        sqlite3_close(db);
-        return waiting;
-    }
-    if (sqlite3_prepare_v2(db, "SELECT post FROM mail JOIN posts ON posts.rowid=mail.post WHERE " KB_MAIL_FOR("mail", "?1", "?2", "?5", "?3", "?4") " AND posts.scope=?2 AND delivered=0 AND state IN ('pending','staged') AND shown<3", -1, &st, NULL) == SQLITE_OK) {
-        bind_mail_recipient(st, p.key, name, socket, pane);
-        json_object *ids = json_object_new_array();
-        int step;
-        while ((step = sqlite3_step(st)) == SQLITE_ROW)
-            json_object_array_add(ids, json_object_new_int64(sqlite3_column_int64(st, 0)));
-        if (step != SQLITE_DONE) pending = 1;
-        sqlite3_finalize(st);
-        st = NULL;
-        for (size_t i = 0; i < json_object_array_length(ids); i++) {
-            long long id = json_object_get_int64(json_object_array_get_idx(ids, i));
-            int lock = lock_mail(socket, id, 0, &err);
-            free(err);
-            err = NULL;
-            if (lock < 0) { pending = 1; continue; }
-            /* Reserve the DB write before typing, so another writer cannot prevent the delivered mark. */
-            int paste_failed = 0;
-            int rc = sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
-            if (rc == SQLITE_OK) rc = release_orphaned_stage(db, id);
-            if (rc == SQLITE_OK && sqlite3_prepare_v2(db, "SELECT posts.text, mail.hooked, mail.shown, "
-                    "(SELECT harness FROM hook_sessions WHERE socket=mail.socket AND pane=mail.pane) FROM posts JOIN mail ON posts.rowid=mail.post WHERE post=?6 AND delivered=0 AND state='pending' AND shown<3 "
-                    "AND posts.scope=?2 AND " KB_MAIL_FOR("mail", "?1", "?2", "?5", "?3", "?4"), -1, &st, NULL) == SQLITE_OK) {
-                bind_mail_recipient(st, p.key, name, socket, pane);
-                sqlite3_bind_int64(st, 6, id);
-                step = sqlite3_step(st);
-                char *body = step == SQLITE_ROW ? strdup((const char *)sqlite3_column_text(st, 0)) : NULL;
-                int shown = body ? sqlite3_column_int(st, 2) : 0;
-                int tracked = body && (sqlite3_column_int(st, 1) || shown > 0);
-                char harness[16] = "claude";
-                if (tracked && sqlite3_column_type(st, 3) != SQLITE_NULL)
-                    snprintf(harness, sizeof harness, "%s", sqlite3_column_text(st, 3));
-                rc = step == SQLITE_ROW || step == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
-                sqlite3_finalize(st);
-                st = NULL;
-                if (body) {
-                    char *message = strchr(body, '\n');
-                    if (tracked) {
-                        if (has_hooks(db, socket, pane)) {
-                            sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
-                            pending = 1;
-                        } else {
-                            pending |= paste_tracked_mail(db, socket, pane, name, harness, id, body, shown);
-                        }
-                        free(body);
-                        close(lock);
-                        continue;
-                    }
-                    err = inject(pane, name, message ? message + 1 : body);
-                    paste_failed = err != NULL;
-                    rc = err ? SQLITE_ERROR : sqlite3_prepare_v2(db,
-                        "UPDATE mail SET delivered=1, state='delivered' WHERE post=?1", -1, &st, NULL);
-                    if (rc == SQLITE_OK) {
-                        sqlite3_bind_int64(st, 1, id);
-                        rc = sqlite3_step(st) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
-                    }
-                    sqlite3_finalize(st);
-                    st = NULL;
-                    free(body), free(err);
-                    err = NULL;
-                }
-            } else rc = SQLITE_ERROR;
-            if (rc == SQLITE_OK) rc = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
-            if (rc != SQLITE_OK) {
-                sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
-                pending = 1;
+    int pending = 0, mode = mail_hook_mode(db, socket, pane, epoch, quiet);
+    int unserved = mode > 0 && !pane_served(pane);
+    if (unserved) mode = 0;
+    if (mode > 0) pending = wake_pending(db, socket, pane, name, p.key);
+    else if (mode == 0 && epoch > 0) {
+        sqlite3_stmt *st = NULL;
+        json_object *rows = json_object_new_array();
+        const char *sql = "SELECT post,posts.text,mail.shown FROM mail JOIN posts ON posts.rowid=mail.post WHERE "
+            KB_MAIL_ATTACHED("mail", "?1", "?2", "?3")
+            " AND posts.scope=?4 AND mail.state='pending' AND mail.delivered=0 AND mail.shown<3 ORDER BY post";
+        if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, socket, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(st, 2, pane, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(st, 3, epoch);
+            sqlite3_bind_text(st, 4, p.key, -1, SQLITE_TRANSIENT);
+            int rc;
+            while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+                json_object *row = json_object_new_array();
+                json_object_array_add(row, json_object_new_int64(sqlite3_column_int64(st, 0)));
+                json_object_array_add(row, json_object_new_string((const char *)sqlite3_column_text(st, 1)));
+                json_object_array_add(row, json_object_new_int(sqlite3_column_int(st, 2)));
+                json_object_array_add(rows, row);
             }
-            if (paste_failed) broken_pointer(db, socket, pane, name, id);
-            close(lock);
+            pending = rc != SQLITE_DONE;
+        } else pending = 1;
+        sqlite3_finalize(st);
+        for (size_t i = 0; i < json_object_array_length(rows); i++) {
+            json_object *row = json_object_array_get_idx(rows, i);
+            long long id = json_object_get_int64(json_object_array_get_idx(row, 0));
+            const char *body = json_object_get_string(json_object_array_get_idx(row, 1));
+            const char *message = !strncmp(body, "for ", 4) ? strchr(body, '\n') : NULL;
+            pending |= !terminal_mail(db, socket, pane, name, epoch, id, message ? message + 1 : body,
+                                      json_object_get_int(json_object_array_get_idx(row, 2)), quiet, unserved);
         }
-        json_object_put(ids);
-    } else pending = 1;
-    sqlite3_finalize(st);
-    stall_overdue(db, socket, pane);
+        json_object_put(rows);
+    } else pending = mode < 0;
     free(socket);
     sqlite3_close(db);
     return pending;
@@ -4162,7 +4078,6 @@ struct recorded_hook {
     long long server_start;
 };
 
-enum { MAIL_LEASE_SEC = 300 };
 static json_object *hook_trace;
 
 static int stop_normal(const char *harness, const struct hook_event *event);
@@ -4354,12 +4269,7 @@ static int wake_sec(void) {
 /* A wake that no hook event answered within wake_sec(): that agent's hook is broken or gone. It does not have hooks until
  * its next prompt event, so its mail takes the 0.3.0 path (full envelope). */
 static void hooks_expire(sqlite3 *db) {
-    sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(db, "UPDATE hook_sessions SET wake_reserved=0, wake_at=NULL, broken=1 WHERE wake_reserved=1 AND wake_at<=?1", -1, &st, NULL) == SQLITE_OK) {
-        sqlite3_bind_int64(st, 1, (long long)time(NULL) - wake_sec());
-        sqlite3_step(st);
-    }
-    sqlite3_finalize(st);
+    kb_mail_reconcile(db, time(NULL), wake_sec());
 }
 
 /* Mail of `pane` presented three times without delivery is stalled: nothing more is typed or attached for it, it stays on the
@@ -4470,7 +4380,7 @@ static int wake_agent(sqlite3 *db, const char *socket, const char *pane, const c
                       long long mail, char **why) {
     struct hook_row r;
     time_t now = time(NULL);
-    if (!hook_row_get(db, socket, pane, &r) || r.wake_reserved || (!r.broken && !hook_row_has(&r, pane))) return 0;
+    if (!hook_row_get(db, socket, pane, &r) || r.wake_reserved || (!r.broken && !r.prompt_seen)) return 0;
     int needs_screen;
     enum pstate st = hook_event_state(r.harness, r.last_event, r.stop_blocked, r.at, now, &needs_screen);
     const char *max_age = getenv("CNTCTR_HOOK_MAX_AGE_SEC");
@@ -4479,9 +4389,7 @@ static int wake_agent(sqlite3 *db, const char *socket, const char *pane, const c
     enum pstate on_screen = pane_state_screen(tail, NULL);
     free(tail);
     if (on_screen != P_IDLE) return 0;
-    char *start = NULL;
-    long long epoch = TMUX(NULL, &start, "display", "-p", "-t", pane, "#{start_time}") == 0 ? atoll(start) : 0;
-    free(start);
+    long long epoch = pane_epoch(pane);
     if (!epoch || !reserve_hook_wake(db, socket, pane, mail, &r, time(NULL), epoch)) return 0;
     char *line = fmt(WAKE_FMT, mail, mail);
     char *err = inject_ex(pane, name, line, 0);
@@ -4498,30 +4406,29 @@ static int wake_agent(sqlite3 *db, const char *socket, const char *pane, const c
     return rc;
 }
 
-/* Addressed text for `pane`. 0: its agent does not have hooks and nothing was done. 1: stored (then woken if idle);
- * *on_board is set when the wake line could not be typed. -1: the store failed. */
-static int hook_mail(const char *pane, const char *name, const char *scope, const char *task, const char *text, int *on_board) {
+/* Persist addressed mail before either delivery channel can submit it. */
+static int route_mail(const char *pane, const char *name, const char *scope, const char *task, const char *text, int refuse_permission) {
     char *err = NULL;
     sqlite3 *db = kb(&err);
     free(err);
-    if (!db) return 0;
-    char *socket = tmux_socket();
-    int rc = 0;
-    hooks_expire(db);
-    if (*socket && has_hooks(db, socket, pane)) {
-        long long mail = store_mail(db, pane, name, scope, task, caller_name, text, 1);
-        if (mail <= 0) rc = -1;
-        else {
-            rc = 1;
-            char *why = NULL;
-            if (wake_agent(db, socket, pane, name, mail, &why) < 0 && on_board) *on_board = 1;
-            free(why);
+    if (!db) return -1;
+    char *socket = tmux_socket(), quiet[16] = "";
+    long long epoch = pane_epoch(pane);
+    int mode = epoch > 0 ? mail_hook_mode(db, socket, pane, epoch, quiet) : 0, result = -1;
+    int unserved = mode > 0 && !pane_served(pane);
+    if (unserved) mode = 0;
+    if (mode == 0 && epoch > 0 && refuse_permission && awaiting_permission(pane)) result = -2;
+    else {
+        long long mail = store_mail(db, pane, name, scope, task, caller_name, text, mode > 0);
+        if (mail > 0) {
+            if (mode > 0) result = wake_agent(db, socket, pane, name, mail, NULL) < 0;
+            else result = !epoch || mode < 0 || !terminal_mail(db, socket, pane, name, epoch, mail, text, 0, quiet, unserved);
+            if (mode > 0 || result) notify_all();
         }
     }
     free(socket);
     sqlite3_close(db);
-    if (rc > 0) notify_all();   /* the addressee's own server keeps the mail moving if the wake could not be typed */
-    return rc;
+    return result;
 }
 
 /* Claude Code runs no Stop when the user cancels a turn or the API fails, so mail staged in that turn would stay staged. When
@@ -5201,12 +5108,8 @@ static int hook_cmd(int argc, char **argv) {
                 char *err = NULL; sqlite3 *db = kb_timed(&err, 1000); free(err);
                 if (db) {
                     if (hook_trace) json_object_object_add(hook_trace, "before", trace_snapshot(db, socket, pane));
-                    long long started = 0;
-                    if (strcmp(event.kind, "Stop")) { /* A Stop acknowledges from its captured turn without waiting on tmux. */
-                        char *out = NULL;
-                        if (TMUX(NULL, &out, "display", "-p", "#{start_time}") == 0) started = atoll(out);
-                        free(out);
-                    }
+                    /* Stop acknowledges from its captured turn without waiting on tmux. */
+                    long long started = strcmp(event.kind, "Stop") ? pane_epoch(pane) : 0;
                     struct recorded_hook record;
                     if (record_hook(db, socket, pane, argv[2], pid, &event, started, &record)) {
 #ifdef CNTCTR_TEST_HOOKS
