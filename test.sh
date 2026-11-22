@@ -1578,6 +1578,20 @@ u5p4_run() {
     sqx "$CNTCTR_DB" "DROP TRIGGER fail_paste_delivery"
     daemon_stop
 
+    # Hold Enter after the paste so a recovering hook overlaps terminal delivery.
+    P=$(hk_agent claude recovering_paste)
+    envelope=$(mail_text e4000004 'body already pasted before Enter')
+    id=$(mailput "$P" e4000004 "$envelope" 0)
+    sqx "$CNTCTR_DB" "UPDATE hook_sessions SET broken=1 WHERE pane='$P'"
+    CNTCTR_ENTER_DELAY_MS=3500 daemon_start "$P"
+    daemon_hello
+    expect_screen "quiet fallback has already pasted the body" "$P" "body already pasted before Enter"
+    ans=$(c_prompt "$P" "$(pointer "$id")")
+    emptyans "$ans" && ok_ || bad "recovering hook cannot stage an in-flight paste" "  got: $ans"
+    wait_mstate "the in-flight terminal attempt finalizes" "$id" "delivered/0/1"
+    same "terminal attempt and racing hook spend one presentation" "$(sq "$CNTCTR_DB" "SELECT shown FROM mail WHERE post=$id")" 1
+    daemon_stop
+
     # Failed body pastes can yield three pointers without spending any body budget.
     P=$(hk_agent claude u5_l2 sh -c 'exec /bin/cat')   # no bracketed paste: a multi-line paste is refused, one line is not
     daemon_start "$P"

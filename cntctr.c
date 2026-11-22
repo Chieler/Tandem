@@ -3469,7 +3469,12 @@ static int redeliver_for(const char *pane, const char *name) {
                 if (body) {
                     char *message = strchr(body, '\n');
                     if (tracked) {
-                        pending |= paste_tracked_mail(db, socket, pane, name, harness, id, body, shown);
+                        if (has_hooks(db, socket, pane)) {
+                            sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+                            pending = 1;
+                        } else {
+                            pending |= paste_tracked_mail(db, socket, pane, name, harness, id, body, shown);
+                        }
                         free(body);
                         close(lock);
                         continue;
@@ -4555,7 +4560,15 @@ static int pending_rows(sqlite3 *db, const char *socket, const char *pane, long 
     sqlite3_bind_int(st, 3, max);
     sqlite3_bind_text(st, 4, skip_turn, -1, SQLITE_TRANSIENT);
     while (sqlite3_step(st) == SQLITE_ROW) {
-        rows[n].id = sqlite3_column_int64(st, 0);
+        long long id = sqlite3_column_int64(st, 0);
+        char *err = NULL;
+        int lock = lock_mail(socket, id, LOCK_NB, &err);
+        free(err);
+        if (lock < 0) break;
+        /* The write transaction excludes new claims. The lock probe excludes
+         * terminal claims that committed before the transaction began. */
+        close(lock);
+        rows[n].id = id;
         rows[n].text = strdup((const char *)sqlite3_column_text(st, 1));
         rows[n].repeat = sqlite3_column_int(st, 2) > 0;
         n++;
