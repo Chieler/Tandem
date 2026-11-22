@@ -1192,6 +1192,26 @@ u5p2_run() {
     same "board id rejects another agent's mail" "$(iserr "$ans")" true
     same "board id does not disclose another agent's mail" "$(txt "$ans")" "mail not found"
 
+    # A name fallback is scoped to the project and server. A live pane survives a cwd change.
+    local lookup_dir="$TMPD/other_lookup_project" same_name other_sock
+    mkdir "$lookup_dir"
+    git -C "$lookup_dir" init -q
+    same_name=$(newpane lookup_owner)
+    same "board id permits the same name on the same project and socket" "$(txt "$(call "$same_name" board "{\"id\":$m}")")" "$(mail_text e1000010 'old lookup body')"
+    t respawn-pane -k -t "$same_name" -c "$lookup_dir" cat
+    t set -p -t "$same_name" @cntctr_name lookup_owner
+    same "board id denies a same-name caller in a different project" "$(txt "$(call "$same_name" board "{\"id\":$m}")")" "mail not found"
+    t2 new-session -d -s lookup -c "$PWD" cat
+    other_sock=$(t2 display -p '#{socket_path}')
+    same_name=$(t2 display -p '#{pane_id}')
+    t2 set -p -t "$same_name" @cntctr_name lookup_owner
+    ans=$(TMUX="$other_sock,0,0" call_raw "$same_name" board "{\"id\":$m}")
+    same "board id denies a same-name caller on a different socket" "$(txt "$ans")" "mail not found"
+    t2 kill-server
+    t respawn-pane -k -t "$P" -c "$lookup_dir" cat
+    t set -p -t "$P" @cntctr_name lookup_owner
+    same "board id permits the bound pane after its cwd changes" "$(txt "$(call "$P" board "{\"id\":$m}")")" "$(mail_text e1000010 'old lookup body')"
+
     # Exact lookup pages large mail without marking a partial response delivered.
     P=$(hk_agent claude lookup_large)
     body=$(head -c 70000 /dev/zero | tr '\0' x)

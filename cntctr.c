@@ -2284,7 +2284,7 @@ static size_t utf8_prefix(const char *text, size_t end) {
 
 enum { BOARD_PAGE_BYTES = 32768 };
 
-static int board_lookup(sqlite3 *db, json_object *a, json_object *v, char **res) {
+static int board_lookup(sqlite3 *db, const char *scope, json_object *a, json_object *v, char **res) {
     long long id = json_object_get_int64(v), offset = 0;
     if (json_object_get_type(v) != json_type_int || id <= 0)
         return fail(res, fmt("board id must be a positive integer"));
@@ -2297,7 +2297,8 @@ static int board_lookup(sqlite3 *db, json_object *a, json_object *v, char **res)
     int complete = 0, bad_offset = 0;
     const char *sql = "SELECT length(CAST(posts.text AS BLOB)), substr(CAST(posts.text AS BLOB), ?5 + 1, ?6) "
                       "FROM posts JOIN mail ON mail.post=posts.rowid WHERE mail.post=?1 "
-                      "AND ((mail.name=?2 AND ?2!='') OR (mail.socket || char(10) || mail.pane=?3 AND ?3!='' AND posts.at>?4))";
+                      "AND ((mail.name=?2 AND ?2!='' AND posts.scope=?7 AND mail.socket IN (?8,'')) "
+                      "OR (mail.socket || char(10) || mail.pane=?3 AND ?3!='' AND posts.at>?4))";
     int rc = sqlite3_prepare_v2(db, sql, -1, &st, NULL);
     if (rc == SQLITE_OK) {
         sqlite3_bind_int64(st, 1, id);
@@ -2306,6 +2307,8 @@ static int board_lookup(sqlite3 *db, json_object *a, json_object *v, char **res)
         sqlite3_bind_int64(st, 4, server_start);
         sqlite3_bind_int64(st, 5, offset);
         sqlite3_bind_int(st, 6, BOARD_PAGE_BYTES + 1);
+        sqlite3_bind_text(st, 7, scope, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 8, self_socket, -1, SQLITE_TRANSIENT);
         rc = sqlite3_step(st);
         if (rc == SQLITE_ROW) {
             long long len = sqlite3_column_int64(st, 0);
@@ -2345,7 +2348,7 @@ static int tool_board(json_object *a, char **res) {
     sqlite3 *db = kb_for_caller(&p, res);
     if (!db) return 1;
     if (json_object_object_get_ex(a, "id", &v)) {
-        int err = board_lookup(db, a, v, res);
+        int err = board_lookup(db, p.key, a, v, res);
         sqlite3_close(db);
         return err;
     }
