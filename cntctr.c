@@ -2364,6 +2364,94 @@ static int board_lookup(sqlite3 *db, const char *scope, json_object *a, json_obj
     return fail(res, fmt(rc == SQLITE_DONE ? "mail not found" : "cannot read mail"));
 }
 
+/* Keep each index field on one line and leave UTF-8 characters intact. */
+static size_t index_field(char *text, size_t limit) {
+    size_t n = strlen(text);
+    n = n > limit ? utf8_prefix(text, limit) : n;
+    size_t i = 0;
+    for (; i < n; i++) {
+        unsigned char c = (unsigned char)text[i];
+        if (c == '\r' || c == '\n' || c == '\v' || c == '\f' ||
+            !strncmp(text + i, "\xc2\x85", 2) || !strncmp(text + i, "\xe2\x80\xa8", 3) ||
+            !strncmp(text + i, "\xe2\x80\xa9", 3)) break;
+        if (c < 32 || c == 127) text[i] = ' ';
+    }
+    text[i] = '\0';
+    return i;
+}
+
+static int board_index(sqlite3 *db, const char *scope, json_object *args, int limit, char **res) {
+    json_object *v;
+    long long offset = 0;
+    if (json_object_object_get_ex(args, "offset", &v) &&
+        (json_object_get_type(v) != json_type_int || (offset = json_object_get_int64(v)) < 0))
+        return fail(res, fmt("board offset must be a nonnegative integer"));
+
+    #define INDEX_MAIL " FROM mail JOIN posts ON posts.rowid=mail.post WHERE " \
+        KB_MAIL_FOR("mail", "?1", "?2", "?5", "?3", "?4")
+    if (sqlite3_exec(db, "BEGIN", NULL, NULL, NULL) != SQLITE_OK)
+        return fail(res, fmt("cannot read mail index"));
+    sqlite3_stmt *st = NULL;
+    int rc = sqlite3_prepare_v2(db, "SELECT count(*)" INDEX_MAIL, -1, &st, NULL);
+    long long total = 0;
+    if (rc == SQLITE_OK) {
+        bind_mail_recipient(st, scope, caller_name, self_socket, caller_pane);
+        rc = sqlite3_step(st);
+        if (rc == SQLITE_ROW) total = sqlite3_column_int64(st, 0);
+    }
+    sqlite3_finalize(st);
+    st = NULL;
+
+    sqlite3_str *lines = sqlite3_str_new(db);
+    int listed = 0;
+    if (rc == SQLITE_ROW)
+        rc = sqlite3_prepare_v2(db, "SELECT mail.post, substr(posts.sender,1,97), mail.state, mail.shown, "
+                                "mail.presentations, length(CAST(posts.text AS BLOB)), substr(CAST(posts.text AS BLOB),1,512)"
+                                INDEX_MAIL " ORDER BY mail.post DESC LIMIT ?6 OFFSET ?7", -1, &st, NULL);
+    #undef INDEX_MAIL
+    if (rc == SQLITE_OK) {
+        bind_mail_recipient(st, scope, caller_name, self_socket, caller_pane);
+        sqlite3_bind_int(st, 6, limit);
+        sqlite3_bind_int64(st, 7, offset);
+        while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+            char sender[389], preview[513] = "";
+            snprintf(sender, sizeof sender, "%s", sqlite3_column_text(st, 1));
+            int bytes = sqlite3_column_bytes(st, 6);
+            if (bytes) memcpy(preview, sqlite3_column_blob(st, 6), (size_t)bytes);
+            char *body = preview;
+            if (!strncmp(body, "for ", 4)) {
+                char *line = strchr(body, '\n');
+                if (line && line - preview < 256) body = line + 1;
+            }
+            if (!strncmp(body, "[cntctr ", 8)) {
+                char *line = strchr(body, '\n');
+                if (line && line - preview < 256) body = line + 1;
+            }
+            long long size = sqlite3_column_int64(st, 5);
+            size_t prefix = (size_t)(body - preview) + index_field(body, 96);
+            index_field(sender, 96);
+            sqlite3_str_appendf(lines, "id=%lld sender=%s state=%s attempts=%d presentations=%d bytes=%lld | %s%s\n",
+                                (long long)sqlite3_column_int64(st, 0), sender, sqlite3_column_text(st, 2),
+                                sqlite3_column_int(st, 3), sqlite3_column_int(st, 4), size, body,
+                                prefix < (unsigned long long)size ? "..." : "");
+            listed++;
+        }
+    }
+    sqlite3_finalize(st);
+    sqlite3_str_appendf(lines, "%lld total mail", total);
+    if (listed && offset + listed < total)
+        sqlite3_str_appendf(lines, " [more: call board mode=mail offset=%lld limit=%d]", offset + listed, limit);
+    char *out = sqlite3_str_finish(lines);
+    if (rc != SQLITE_DONE || sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK || !out) {
+        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+        sqlite3_free(out);
+        return fail(res, fmt("cannot read mail index"));
+    }
+    char *result = strdup(out);
+    sqlite3_free(out);
+    return ok(res, result);
+}
+
 static int tool_board(json_object *a, char **res) {
     json_object *v;
     int limit = json_object_object_get_ex(a, "limit", &v) ? json_object_get_int(v) : 20;
@@ -2371,6 +2459,18 @@ static int tool_board(json_object *a, char **res) {
     struct project p;
     sqlite3 *db = kb_for_caller(&p, res);
     if (!db) return 1;
+    if (json_object_object_get_ex(a, "mode", &v)) {
+        json_object *id;
+        int err;
+        if (json_object_get_type(v) != json_type_string || strcmp(json_object_get_string(v), "mail"))
+            err = fail(res, fmt("board mode must be mail"));
+        else if (json_object_object_get_ex(a, "id", &id))
+            err = fail(res, fmt("use board id without mode to read a body"));
+        else
+            err = board_index(db, p.key, a, limit, res);
+        sqlite3_close(db);
+        return err;
+    }
     if (json_object_object_get_ex(a, "id", &v)) {
         int err = board_lookup(db, p.key, a, v, res);
         sqlite3_close(db);
@@ -3213,8 +3313,8 @@ static const char TOOLS[] =
     "urgent=true also types it into every agent's pane now.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"},\"urgent\":{\"type\":\"boolean\"},"
     "\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"}},\"required\":[\"text\"]}},"
-    "{\"name\":\"board\",\"description\":\"Read recent posts or mail by id.\","
-    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},\"offset\":{\"type\":\"integer\"},\"limit\":{\"type\":\"integer\",\"description\":\"Default 20, at most 200\"}," KFROM "}}}"
+    "{\"name\":\"board\",\"description\":\"Posts, mail by id, or mode=mail index.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},\"offset\":{\"type\":\"integer\"},\"limit\":{\"type\":\"integer\"},\"mode\":{\"type\":\"string\",\"enum\":[\"mail\"]}," KFROM "}}}"
     ",{\"name\":\"use\",\"description\":\"Run a fleet tool by name with arguments. Needed for drafts and from Codex (pass from). Published tools also appear directly on clients that support list_changed.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"tool\":{\"type\":\"string\"},\"args\":{\"type\":\"object\"}," KFROM "},"
     "\"required\":[\"tool\"]}}"
@@ -4512,7 +4612,7 @@ static char *excerpt(const char *text, const char *path, size_t head, size_t tai
     h = utf8_prefix(text, h);
     size_t from = len - t;
     while (from < len && (text[from] & 0xC0) == 0x80) from++;
-    return fmt("%.*s\n[... %zu bytes left out; the whole mail is in the file %s or call board id=%lld ...]\n%s",
+    return fmt("%.*s\n[... %zu bytes left out; the whole mail is in the file %s or call board id=%lld (index: board mode=mail) ...]\n%s",
                (int)h, text, from - h, path, id, text + from);
 }
 
@@ -4542,12 +4642,12 @@ static void mail_body(const char *text, const char **start, const char **end) {
     }
 }
 
-static char *mail_excerpt(const struct mrow *r, const char *start, const char *end, size_t limit) {
+static char *mail_excerpt(const struct mrow *r, const char *start, const char *end, size_t limit, const char *lookup_hint) {
     size_t len = (size_t)(end - start);
     if (len <= limit) return strdup(r->text);
     size_t head = utf8_prefix(start, limit);
-    return fmt("%.*s%.*s%s\n[%zu more bytes omitted: call board id=%lld]",
-               (int)(start - r->text), r->text, (int)head, start, end, len - head, r->id);
+    return fmt("%.*s%.*s%s\n[%zu more bytes omitted: call board id=%lld%s]",
+               (int)(start - r->text), r->text, (int)head, start, end, len - head, r->id, lookup_hint);
 }
 
 static char *mail_piece(const struct mrow *r, int *complete) {
@@ -4557,7 +4657,7 @@ static char *mail_piece(const struct mrow *r, int *complete) {
     mail_body(r->text, &start, &end);
     if (end - start <= 1024) return strdup(r->text);
     if (complete) *complete = 0;
-    return mail_excerpt(r, start, end, 400);
+    return mail_excerpt(r, start, end, 400, "");
 }
 
 /* The text for a hook answer: as many of the rows (oldest first) as the harness budget takes, then `extra`.
@@ -4579,7 +4679,7 @@ static char *fit_mail(const char *harness, const char *event, enum hook_answer_k
             mail_body(rows[i].text, &start, &end);
             for (size_t head = path ? 4096 : 400; !cand && head >= 64; head /= 2) {
                 char *p2 = path ? excerpt(rows[i].text, path, head, head / 2, rows[i].id)
-                                : mail_excerpt(&rows[i], start, end, head);
+                                : mail_excerpt(&rows[i], start, end, head, " (index: board mode=mail)");
                 full = extra ? fmt("%s\n\n%s", p2, extra) : strdup(p2);
                 if (answer_fits(harness, event, kind, full)) cand = p2;
                 else free(p2);

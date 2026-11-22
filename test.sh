@@ -1148,6 +1148,7 @@ u5p2_run() {
     out=$(printf '%s' "$ans" | jq -r '.reason')
     check "first Stop spill names a cache file" "$out" "$HOME/.cache/cntctr/mail/"
     check "first Stop spill also names its durable lookup" "$out" "call board id=$m"
+    check "first Stop spill advertises the mail index" "$out" "board mode=mail"
     check "first Stop spill fits the serialized hook budget" "$((${#ans} <= 8192))" 1
     sqx "$CNTCTR_DB" "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<205)
         INSERT INTO posts(scope,sender,text,at)
@@ -1165,7 +1166,7 @@ u5p2_run() {
     ans=$(c_prompt "$P" "$(pointer "$m")")
     rm "$mail_cache"
     mv "$mail_cache.saved" "$mail_cache"
-    expected=$(printf '[cntctr from=sender id=e1000005]\n%s\n[cntctr end id=e1000005]\n[9600 more bytes omitted: call board id=%s]' "${tail:0:400}" "$m")
+    expected=$(printf '[cntctr from=sender id=e1000005]\n%s\n[cntctr end id=e1000005]\n[9600 more bytes omitted: call board id=%s (index: board mode=mail)]' "${tail:0:400}" "$m")
     same "spill failure still gives both markers and a working lookup" "$(ctx_c "$ans")" "$expected"
 
     c_stop "$P" >/dev/null
@@ -1202,6 +1203,10 @@ u5p2_run() {
     c_stop "$P" true >/dev/null
     same "one Stop delivers only the five full bodies in a mixed answer" "$(sq "$CNTCTR_DB" "SELECT count(*) FROM mail WHERE pane='$P' AND delivered=1")" 5
     same "the two excerpted bodies in a mixed answer remain unread" "$(sq "$CNTCTR_DB" "SELECT count(*) FROM mail WHERE pane='$P' AND shown=2 AND state='pending' AND delivered=0")" 2
+    out=$(txt "$(call "$P" board '{"mode":"mail","offset":200}')")
+    same "index beyond the 200th item returns five entries and a footer" "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" 6
+    same "index total is independent of the recent board cap" "$(printf '%s\n' "$out" | tail -n 1)" "205 total mail"
+
 
     # An exact mail lookup must work after the mail falls outside the recent board window.
     P=$(hk_agent claude lookup_owner)
@@ -1234,6 +1239,49 @@ u5p2_run() {
     t respawn-pane -k -t "$P" -c "$lookup_dir" cat
     t set -p -t "$P" @cntctr_name lookup_owner
     same "board id permits the bound pane after its cwd changes" "$(txt "$(call "$P" board "{\"id\":$m}")")" "$(mail_text e1000010 'old lookup body')"
+
+    # Discard the first answer. The continuation Stop acknowledges the staged attempt.
+    P=$(hk_agent claude mail_index_owner)
+    body=$(mail_text e1000015 "$(printf 'index recovery preview\nbody available only by ID')")
+    m=$(mailput "$P" e1000015 "$body" 0)
+    c_stop "$P" >/dev/null
+    same "discarded first Stop still records one attempt" "$(sq "$CNTCTR_DB" "SELECT shown FROM mail WHERE post=$m")" 1
+    c_stop "$P" true >/dev/null
+    same "continuation Stop acknowledges the full attempt" "$(mstate "$m")" "delivered/1/1"
+
+    local pending staged stalled page_ids
+    pending=$(mailput "$P" e1000016 "$(mail_text e1000016 'pending index mail')" 0)
+    staged=$(mailput "$P" e1000017 "$(mail_text e1000017 'staged index mail')" 1)
+    stalled=$(mailput "$P" e1000018 "$(mail_text e1000018 'stalled index mail')" 3)
+    sqx "$CNTCTR_DB" "UPDATE mail SET state='staged',shown=1 WHERE post=$staged;
+        UPDATE mail SET state='stalled',shown=3 WHERE post=$stalled;
+        WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<205)
+        INSERT INTO posts(scope,sender,text,at) SELECT '$U5_SCOPE','sender','newer than lost attempt',strftime('%s','now') FROM n;"
+    out=$(txt "$(call "$P" board '{"limit":200}')")
+    refute "recent board no longer lists the lost body" "$out" "index recovery preview"
+    out=$(txt "$(call "$P" board '{"mode":"mail","limit":2}')")
+    page_ids=$(printf '%s\n' "$out" | sed -n 's/^id=\([0-9]*\) .*/\1/p')
+    same "index page one lists newest mail without gaps" "$page_ids" "$(printf '%s\n%s' "$stalled" "$staged")"
+    check "index page one reports total and next offset" "$out" "4 total mail [more: call board mode=mail offset=2 limit=2]"
+    check "index includes the stalled state and both counters" "$out" "id=$stalled sender=sender state=stalled attempts=3 presentations=3 bytes="
+    same "listing staged mail does not acknowledge it" "$(mstate "$staged")" "staged/1/0"
+    out=$(txt "$(call "$P" board '{"mode":"mail","limit":2,"offset":2}')")
+    page_ids=$(printf '%s\n' "$out" | sed -n 's/^id=\([0-9]*\) .*/\1/p')
+    same "index page two continues with no overlap" "$page_ids" "$(printf '%s\n%s' "$pending" "$m")"
+    same "final index footer gives the same total" "$(printf '%s\n' "$out" | tail -n 1)" "4 total mail"
+    check "index entry exposes delivered ID and byte count with one-line excerpt" "$out" "id=$m sender=sender state=delivered attempts=1 presentations=1 bytes=${#body} | index recovery preview..."
+    refute "index omits the remaining body" "$out" "body available only by ID"
+    same "index output has one line per entry and one footer" "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" 3
+    same "exact lookup recovers the entire lost body by listed ID" "$(txt "$(call "$P" board "{\"id\":$m}")")" "$body"
+    same "index leaves pending mail pending" "$(mstate "$pending")" "pending/0/0"
+
+    t2 new-session -d -s mail_index -c "$PWD" cat
+    other_sock=$(t2 display -p '#{socket_path}')
+    same_name=$(t2 display -p '#{pane_id}')
+    t2 set -p -t "$same_name" @cntctr_name mail_index_owner
+    ans=$(TMUX="$other_sock,0,0" call_raw "$same_name" board '{"mode":"mail"}')
+    same "same-name caller on another socket cannot list the mail index" "$(txt "$ans")" "0 total mail"
+    t2 kill-server
 
     # The first page must stop before the two-byte character at its boundary.
     P=$(hk_agent claude lookup_large)
