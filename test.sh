@@ -1529,6 +1529,24 @@ u5p4_run() {
     same "quiet repeat tells the sender once" "$(notices "$id")" 1
     daemon_stop
 
+    # A DB failure after a full paste must preserve the charged attempt.
+    P=$(hk_agent claude quiet_charge)
+    payload=$(head -c 800 /dev/zero | tr '\0' x)
+    envelope=$(printf '[cntctr from=sender id=e4000003]\n%600s\nFULL-ONLY-CHARGE-MARKER\n%s\n[cntctr end id=e4000003]' x "$payload")
+    id=$(mailput "$P" e4000003 "$envelope" 0)
+    sqx "$CNTCTR_DB" "UPDATE hook_sessions SET broken=1 WHERE pane='$P';
+        CREATE TRIGGER fail_paste_delivery BEFORE UPDATE OF delivered ON mail
+        WHEN OLD.post=$id AND NEW.delivered=1
+        BEGIN SELECT RAISE(ABORT, 'injected post-paste commit error'); END;"
+    daemon_start "$P"
+    daemon_hello
+    expect_screen "quiet paste reaches the pane before the delivery update fails" "$P" "FULL-ONLY-CHARGE-MARKER"
+    wait_mstate "quiet paste spends three body attempts despite the update failure" "$id" "stalled/0/0"
+    same "quiet paste never retries the full oversized body" "$(screen "$P" | grep -c 'FULL-ONLY-CHARGE-MARKER')" 2
+    same "failed delivery update still leaves three recorded attempts" "$(sq "$CNTCTR_DB" "SELECT shown FROM mail WHERE post=$id")" 3
+    sqx "$CNTCTR_DB" "DROP TRIGGER fail_paste_delivery"
+    daemon_stop
+
     # Failed body pastes can yield three pointers without spending any body budget.
     P=$(hk_agent claude u5_l2 sh -c 'exec /bin/cat')   # no bracketed paste: a multi-line paste is refused, one line is not
     daemon_start "$P"

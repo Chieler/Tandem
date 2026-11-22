@@ -746,7 +746,7 @@ static char *server_opts(void) {
 static int enter_delay_ms = 150;   /* CNTCTR_ENTER_DELAY_MS: pause between paste and Enter */
 
 /* Write `text` to `pane`'s program through a temporary buffer, bracketed or raw. */
-static char *paste(const char *pane, const char *text, int bracketed) {
+static char *paste(const char *pane, const char *text, int bracketed, int *may_have_written) {
     char buf[32], *err;
     const char *configured = getenv("CNTCTR_PASTE_WAIT_MS");
     long wait = configured ? strtol(configured, NULL, 10) : 2000;
@@ -785,6 +785,8 @@ static char *paste(const char *pane, const char *text, int bracketed) {
     }
     snprintf(buf, sizeof buf, "cntctr-in-%08x", arc4random());
     if ((err = TMUXE(text, "load-buffer", "-b", buf, "-"))) return err;
+    /* Once tmux receives paste-buffer, failure may leave bytes in the pane. */
+    if (may_have_written) *may_have_written = 1;
     if ((err = bracketed ? TMUXE(NULL, "paste-buffer", "-p", "-d", "-b", buf, "-t", pane)
                          : TMUXE(NULL, "paste-buffer", "-d", "-b", buf, "-t", pane)))
         free(TMUXE(NULL, "delete-buffer", "-b", buf));
@@ -792,16 +794,10 @@ static char *paste(const char *pane, const char *text, int bracketed) {
 }
 
 /* Serialize terminal input across cntctr processes targeting the same pane. */
-static int lock_pane(const char *pane, char **err) {
-    char *scope;
-    if (TMUX(NULL, &scope, "display", "-p", "#{socket_path}") != 0) {
-        *err = scope;
-        return -1;
-    }
+static int lock_input(const char *scope, const char *pane, int flags, char **err) {
     uint64_t hash = UINT64_C(14695981039346656037);
     for (const unsigned char *p = (const unsigned char *)scope; *p; p++)
         hash = (hash ^ *p) * UINT64_C(1099511628211);
-    free(scope);
     hash = (hash ^ 0xff) * UINT64_C(1099511628211);
     for (const unsigned char *p = (const unsigned char *)pane; *p; p++)
         hash = (hash ^ *p) * UINT64_C(1099511628211);
@@ -810,7 +806,7 @@ static int lock_pane(const char *pane, char **err) {
              (unsigned long)getuid(), (unsigned long long)hash);
     int fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (fd < 0) { *err = fmt("pane lock: %s", strerror(errno)); return -1; }
-    while (flock(fd, LOCK_EX) < 0) {
+    while (flock(fd, LOCK_EX | flags) < 0) {
         if (errno == EINTR) continue;
         *err = fmt("pane lock: %s", strerror(errno));
         close(fd);
@@ -819,9 +815,26 @@ static int lock_pane(const char *pane, char **err) {
     return fd;
 }
 
+static int lock_pane(const char *pane, char **err) {
+    char *scope;
+    if (TMUX(NULL, &scope, "display", "-p", "#{socket_path}") != 0) {
+        *err = scope;
+        return -1;
+    }
+    int fd = lock_input(scope, pane, 0, err);
+    free(scope);
+    return fd;
+}
+
+static int lock_mail(const char *socket, long long id, int flags, char **err) {
+    char key[64];
+    snprintf(key, sizeof key, "mail-%lld", id);
+    return lock_input(socket, key, flags, err);
+}
+
 /* Paste `text` into `pane` as one bracketed paste, then press Enter. A text with `with_end` gets the
  * `[cntctr end id=...]` line. `who` names the pane in errors. Returns NULL or an error (caller frees). */
-static char *inject_ex(const char *pane, const char *who, const char *text, int with_end) {
+static char *inject_with_progress(const char *pane, const char *who, const char *text, int with_end, int *may_have_written) {
     char *err = NULL;
     int lock = lock_pane(pane, &err);
     if (lock < 0) return err;
@@ -844,16 +857,20 @@ static char *inject_ex(const char *pane, const char *who, const char *text, int 
         body = len >= endlen && !strcmp(text + len - endlen, ending) ? strdup(text) : fmt("%s\n%s", text, ending);
         free(ending);
     } else body = strdup(text);
-    err = paste(pane, body, 1);
+    err = paste(pane, body, 1, may_have_written);
     free(body);
     if (err) goto done;
     struct timespec pause = {enter_delay_ms / 1000, (enter_delay_ms % 1000) * 1000000L};
     nanosleep(&pause, NULL);
     /* Enter as a raw CR paste: send-keys would go to copy-mode if the user is scrolled back. */
-    err = paste(pane, "\r", 0);
+    err = paste(pane, "\r", 0, NULL);
 done:
     close(lock);
     return err;
+}
+
+static char *inject_ex(const char *pane, const char *who, const char *text, int with_end) {
+    return inject_with_progress(pane, who, text, with_end, NULL);
 }
 
 static char *inject(const char *pane, const char *who, const char *text) { return inject_ex(pane, who, text, 1); }
@@ -3343,6 +3360,52 @@ struct mrow { long long id; char *text; int repeat, complete; };
 static char *fit_mail(const char *harness, const char *event, enum hook_answer_kind kind,
                       struct mrow *rows, int n, const char *extra, int *taken);
 
+/* Charge this attempt before terminal I/O. Finalization and refunds match the
+ * reserved count, so a later hook or board read owns any newer state. */
+static int update_paste_attempt(sqlite3 *db, const char *sql, long long id, int shown) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int64(st, 1, id);
+    sqlite3_bind_int(st, 2, shown);
+    int ok = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
+    sqlite3_finalize(st);
+    return ok;
+}
+
+/* The caller holds the mail lock and an open transaction. */
+static int paste_tracked_mail(sqlite3 *db, const char *socket, const char *pane, const char *name,
+                              const char *harness, long long id, char *body, int shown) {
+    char *message = strchr(body, '\n');
+    struct mrow row = {.id = id, .text = message && !strncmp(body, "for ", 4) ? message + 1 : body,
+                       .repeat = shown > 0};
+    const char *event = !strcmp(harness, "agy") ? "PreInvocation" : "UserPromptSubmit";
+    int taken = 0;
+    char *piece = fit_mail(harness, event, HOOK_ATTACH, &row, 1, NULL, &taken);
+    const char *reserve = "UPDATE mail SET shown=shown+1, state='pending' "
+                          "WHERE post=?1 AND shown=?2 AND shown<3 AND delivered=0 AND state IN ('pending','staged')";
+    if (!taken || !update_paste_attempt(db, reserve, id, shown) ||
+        sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
+        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+        free(piece);
+        return 1;
+    }
+
+    int may_have_written = 0;
+    char *err = inject_with_progress(pane, name, piece, row.complete, &may_have_written);
+    free(piece);
+    if (err) {
+        free(err);
+        if (!may_have_written) {
+            const char *refund = "UPDATE mail SET shown=shown-1 WHERE post=?1 AND shown=?2 AND state='pending' AND delivered=0";
+            update_paste_attempt(db, refund, id, shown + 1);
+            broken_pointer(db, socket, pane, name, id);
+        }
+        return 1;
+    }
+    const char *deliver = "UPDATE mail SET state='delivered', delivered=1 WHERE post=?1 AND shown=?2 AND state='pending' AND delivered=0";
+    return !row.complete || !update_paste_attempt(db, deliver, id, shown + 1);
+}
+
 /* Only the FIFO watcher retries mail, sleeping indefinitely when its queue is empty. */
 static int redeliver_for(const char *pane, const char *name) {
     char *err = NULL;
@@ -3377,9 +3440,7 @@ static int redeliver_for(const char *pane, const char *name) {
         st = NULL;
         for (size_t i = 0; i < json_object_array_length(ids); i++) {
             long long id = json_object_get_int64(json_object_array_get_idx(ids, i));
-            char key[64];
-            snprintf(key, sizeof key, "mail-%lld", id);
-            int lock = lock_pane(key, &err);
+            int lock = lock_mail(socket, id, 0, &err);
             free(err);
             err = NULL;
             if (lock < 0) { pending = 1; continue; }
@@ -3401,30 +3462,20 @@ static int redeliver_for(const char *pane, const char *name) {
                 st = NULL;
                 if (body) {
                     char *message = strchr(body, '\n');
-                    int complete = 1;
                     if (tracked) {
-                        struct mrow row = {.id = id, .text = message && !strncmp(body, "for ", 4) ? message + 1 : body,
-                                           .repeat = shown > 0};
-                        const char *event = !strcmp(harness, "agy") ? "PreInvocation" : "UserPromptSubmit";
-                        int taken = 0;
-                        char *piece = fit_mail(harness, event, HOOK_ATTACH, &row, 1, NULL, &taken);
-                        complete = row.complete;
-                        err = taken ? inject_ex(pane, name, piece, complete) : fmt("mail does not fit");
-                        free(piece);
-                    } else {
-                        err = inject(pane, name, message ? message + 1 : body);
+                        pending |= paste_tracked_mail(db, socket, pane, name, harness, id, body, shown);
+                        free(body);
+                        close(lock);
+                        continue;
                     }
+                    err = inject(pane, name, message ? message + 1 : body);
                     paste_failed = err != NULL;
                     rc = err ? SQLITE_ERROR : sqlite3_prepare_v2(db,
-                        "UPDATE mail SET delivered=?2, state=CASE WHEN ?2 THEN 'delivered' ELSE 'pending' END, "
-                        "shown=shown+?3 WHERE post=?1 AND shown<3", -1, &st, NULL);
+                        "UPDATE mail SET delivered=1, state='delivered' WHERE post=?1", -1, &st, NULL);
                     if (rc == SQLITE_OK) {
                         sqlite3_bind_int64(st, 1, id);
-                        sqlite3_bind_int(st, 2, complete);
-                        sqlite3_bind_int(st, 3, tracked);
                         rc = sqlite3_step(st) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
                     }
-                    pending |= tracked && !complete;
                     sqlite3_finalize(st);
                     st = NULL;
                     free(body), free(err);
@@ -4111,8 +4162,16 @@ static void stall_overdue(sqlite3 *db, const char *socket, const char *pane) {
         const char *name = json_object_get_string(json_object_array_get_idx(r, 1)), *sender = json_object_get_string(json_object_array_get_idx(r, 2)),
                    *from_pane = json_object_get_string(json_object_array_get_idx(r, 3)), *from_scope = json_object_get_string(json_object_array_get_idx(r, 4)),
                    *scope = json_object_get_string(json_object_array_get_idx(r, 5));
+        /* A committed third paste may still be in progress. */
+        char *err = NULL;
+        int lock = lock_mail(socket, id, LOCK_NB, &err);
+        free(err);
+        if (lock < 0) continue;
         /* Publish the stall and its notice together, so a failed notice can be retried. */
-        if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) continue;
+        if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
+            close(lock);
+            continue;
+        }
         st = NULL;
         int mine = 0;
         if (sqlite3_prepare_v2(db, "UPDATE mail SET state='stalled' WHERE post=?1 AND state='pending' AND shown>=3 AND delivered=0", -1, &st, NULL) == SQLITE_OK) {
@@ -4130,6 +4189,7 @@ static void stall_overdue(sqlite3 *db, const char *socket, const char *pane) {
         }
         if (notice && sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK) noticed++;
         else sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+        close(lock);
     }
     json_object_put(rows);
     if (noticed) notify_all();
