@@ -422,26 +422,47 @@ int kb_mail_reconcile(sqlite3 *db, time_t now, int wake_sec) {
     int own = sqlite3_get_autocommit(db);
     int rc = own ? sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) : SQLITE_OK;
     if (rc != SQLITE_OK) return rc;
-    sqlite3_stmt *st = prep(db, "UPDATE mail SET state=CASE WHEN shown>=3 THEN 'stalled' ELSE 'pending' END,"
-                               " lease_until=0 WHERE delivered=0 AND ((state='staged' AND lease_until<?1)"
-                               " OR (state='pending' AND shown>=3))"
-                               " RETURNING post,state,name,from_pane,from_scope,socket,"
-                               " (SELECT scope FROM posts WHERE rowid=mail.post),"
-                               " (SELECT sender FROM posts WHERE rowid=mail.post)");
+    sqlite3_stmt *st = prep(db, "UPDATE mail SET state='pending',lease_until=0"
+        " WHERE delivered=0 AND state='staged' AND shown<3 AND lease_until<?1");
     sqlite3_bind_int64(st, 1, now);
-    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
-        if (strcmp(col(st, 1), "stalled") || sqlite3_column_type(st, 7) == SQLITE_NULL) continue;
-        long long post = sqlite3_column_int64(st, 0);
-        const char *to = col(st, 7), *pane = col(st, 3), *scope = col(st, 4);
-        char *body = sqlite3_mprintf("for %s (notice):\nundelivered after 3 attempts: %lld to %s;"
-                                    " recipient can call board id=%lld", to, post, col(st, 2), post);
-        long long notice = body ? kb_mail_insert(db, *scope ? scope : col(st, 6), pane, to, "cntctr", "",
-                                                  body, 0, "", "", *pane ? col(st, 5) : "") : 0;
-        sqlite3_free(body);
-        if (!notice) { rc = SQLITE_ERROR; break; }
-    }
+    rc = sqlite3_step(st);
     sqlite3_finalize(st);
     if (rc == SQLITE_DONE) rc = SQLITE_OK;
+
+    sqlite3_stmt *due = prep(db, "SELECT post,name,from_pane,from_scope,socket,posts.sender,posts.scope"
+        " FROM mail LEFT JOIN posts ON posts.rowid=mail.post WHERE post>?2 AND delivered=0 AND shown>=3"
+        " AND (state='pending' OR (state='staged' AND lease_until<?1)) ORDER BY post LIMIT 1");
+    sqlite3_stmt *stall = prep(db, "UPDATE mail SET state='stalled',lease_until=0 WHERE post=?1");
+    long long post = 0;
+    sqlite3_bind_int64(due, 1, now);
+    while (rc == SQLITE_OK) {
+        sqlite3_bind_int64(due, 2, post);
+        int step = sqlite3_step(due);
+        if (step != SQLITE_ROW) {
+            rc = step == SQLITE_DONE ? SQLITE_OK : step;
+            break;
+        }
+        post = sqlite3_column_int64(due, 0);
+        int save = sqlite3_exec(db, "SAVEPOINT stall_mail", NULL, NULL, NULL);
+        if (save != SQLITE_OK) { rc = save; break; }
+        sqlite3_bind_int64(stall, 1, post);
+        int ok = sqlite3_step(stall) == SQLITE_DONE && sqlite3_changes(db) == 1;
+        sqlite3_reset(stall);
+        if (ok && sqlite3_column_type(due, 5) != SQLITE_NULL) {
+            const char *to = col(due, 5), *pane = col(due, 2), *scope = col(due, 3);
+            char *body = sqlite3_mprintf("for %s: undelivered after 3 attempts: %lld to %s; recipient can call board id=%lld",
+                                        to, post, col(due, 1), post);
+            ok = body && kb_mail_insert(db, *scope ? scope : col(due, 6), pane, to, "cntctr", "",
+                                        body, 0, col(due, 1), col(due, 6), col(due, 4)) > 0;
+            sqlite3_free(body);
+        }
+        sqlite3_reset(due);
+        if (!ok) rc = sqlite3_exec(db, "ROLLBACK TO stall_mail", NULL, NULL, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_exec(db, "RELEASE stall_mail", NULL, NULL, NULL);
+        if (!ok && wake_sec == 0 && rc == SQLITE_OK) rc = SQLITE_ERROR;  /* Migration stays atomic. */
+    }
+    sqlite3_finalize(stall);
+    sqlite3_finalize(due);
     if (rc == SQLITE_OK && wake_sec > 0) {
         st = prep(db, "UPDATE hook_sessions SET wake_reserved=0,wake_at=NULL,broken=1"
                       " WHERE wake_reserved=1 AND wake_at<=?1");

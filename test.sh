@@ -1675,6 +1675,12 @@ u5p4_run() {
     emptyans "$ans" && ok_ || bad "fourth stale replay attaches nothing" "  got: $ans"
     same "failed stall notice rolls back lease expiry" "$(mstate "$id")" "staged/9/0"
     same "failed notice leaves no partial board post" "$(notices "$id")" 0
+    local other other_id
+    other=$(hk_agent claude independent_stall_notice)
+    other_id=$(mailput "$other" e4000010 "$(mail_text e4000010 'unrelated fresh body')" 1)
+    ans=$(c_prompt "$other" "$(pointer "$other_id")")
+    check "failed stall notice leaves unrelated hook delivery working" "$(ctx_c "$ans")" "unrelated fresh body"
+    same "unrelated mail records its own claim" "$(mstate "$other_id")" staged/1/0
     sqx "$CNTCTR_DB" "DROP TRIGGER fail_stall_notice"
     ans=$(c_prompt "$P" "$(pointer "$id")")
     emptyans "$ans" && ok_ || bad "fifth stale replay attaches nothing" "  got: $ans"
