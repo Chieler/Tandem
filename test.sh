@@ -1461,10 +1461,16 @@ u5p4_run() {
         same "stale replay body $i" "$(ctx_c "$ans")" "$envelope"
         same "stale replay charges body $i" "$(sq "$CNTCTR_DB" "SELECT shown FROM mail WHERE post=$id")" "$i"
     done
-    for i in 4 5; do
-        ans=$(c_prompt "$P" "$(pointer "$id")")
-        emptyans "$ans" && ok_ || bad "stale replay $i attaches nothing" "  got: $ans"
-    done
+    sqx "$CNTCTR_DB" "CREATE TRIGGER fail_stall_notice BEFORE INSERT ON posts
+        WHEN NEW.sender='cntctr' AND NEW.text LIKE '%undelivered after 3 attempts: $id to %'
+        BEGIN SELECT RAISE(ABORT, 'injected notice error'); END;"
+    ans=$(c_prompt "$P" "$(pointer "$id")")
+    emptyans "$ans" && ok_ || bad "fourth stale replay attaches nothing" "  got: $ans"
+    same "stall stays pending while the notice fails" "$(mstate "$id")" "pending/9/0"
+    same "failed notice leaves no partial board post" "$(notices "$id")" 0
+    sqx "$CNTCTR_DB" "DROP TRIGGER fail_stall_notice"
+    ans=$(c_prompt "$P" "$(pointer "$id")")
+    emptyans "$ans" && ok_ || bad "fifth stale replay attaches nothing" "  got: $ans"
     same "stale replay stalls with the wake count unchanged" "$(mstate "$id")" "stalled/9/0"
     same "stale replay tells the sender once" "$(notices "$id")" 1
 

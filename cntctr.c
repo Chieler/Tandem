@@ -4017,34 +4017,40 @@ static char *tmux_socket(void) {
 
 /* One mail: a board post in `scope` and its mail row. `from_pane` and `from_scope` say where the sender is, for notices back to it.
  * Returns the mail id (the post's row id) or 0. */
+static long long insert_mail(sqlite3 *db, const char *scope, const char *pane, const char *name, const char *sender,
+                             const char *task, const char *body, int hooked, const char *from_pane,
+                             const char *from_scope, const char *socket) {
+    if (kb_post(db, scope, sender, body) != 0) return 0;
+    long long id = sqlite3_last_insert_rowid(db);
+    sqlite3_stmt *st = NULL;
+    const char *sql = "INSERT INTO mail(post,name,pane,task,hooked,from_pane,from_scope,socket) "
+                      "VALUES(?1,?2,?3,?4,?5,?6,?7,?8)";
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    sqlite3_bind_int64(st, 1, id);
+    sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, pane ? pane : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 4, task, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 5, hooked);
+    sqlite3_bind_text(st, 6, from_pane, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 7, from_scope, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 8, socket, -1, SQLITE_TRANSIENT);
+    int inserted = sqlite3_step(st) == SQLITE_DONE;
+    sqlite3_finalize(st);
+    return inserted ? id : 0;
+}
+
 static long long post_mail(sqlite3 *db, const char *scope, const char *pane, const char *name, const char *sender, const char *task,
                            const char *body, int hooked, const char *from_pane, const char *from_scope) {
+    char *socket = pane && *pane ? tmux_socket() : strdup("");
     long long id = 0;
-    char *socket = pane && *pane ? tmux_socket() : strdup("");   /* the mail belongs to this pane of this tmux server */
-    int rc = sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
-    if (rc == SQLITE_OK && kb_post(db, scope, sender, body) == 0) {
-        id = sqlite3_last_insert_rowid(db);
-        sqlite3_stmt *st = NULL;
-        rc = sqlite3_prepare_v2(db, "INSERT INTO mail(post,name,pane,task,hooked,from_pane,from_scope,socket) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)", -1, &st, NULL);
-        if (rc == SQLITE_OK) {
-            sqlite3_bind_int64(st, 1, id);
-            sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(st, 3, pane ? pane : "", -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(st, 4, task, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int(st, 5, hooked);
-            sqlite3_bind_text(st, 6, from_pane, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(st, 7, from_scope, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(st, 8, socket, -1, SQLITE_TRANSIENT);
-            rc = sqlite3_step(st) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK) {
+        id = insert_mail(db, scope, pane, name, sender, task, body, hooked, from_pane, from_scope, socket);
+        if (!id || sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
+            sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+            id = 0;
         }
-        sqlite3_finalize(st);
-    } else rc = SQLITE_ERROR;
-    free(socket);
-    if (rc == SQLITE_OK) rc = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
-    if (rc != SQLITE_OK) {
-        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
-        id = 0;
     }
+    free(socket);
     return id;
 }
 
@@ -4102,17 +4108,25 @@ static void stall_overdue(sqlite3 *db, const char *socket, const char *pane) {
         const char *name = json_object_get_string(json_object_array_get_idx(r, 1)), *sender = json_object_get_string(json_object_array_get_idx(r, 2)),
                    *from_pane = json_object_get_string(json_object_array_get_idx(r, 3)), *from_scope = json_object_get_string(json_object_array_get_idx(r, 4)),
                    *scope = json_object_get_string(json_object_array_get_idx(r, 5));
+        /* Publish the stall and its notice together, so a failed notice can be retried. */
+        if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) continue;
         st = NULL;
-        int mine = 0;   /* the state change is the claim: only one process tells the sender */
+        int mine = 0;
         if (sqlite3_prepare_v2(db, "UPDATE mail SET state='stalled' WHERE post=?1 AND state='pending' AND shown>=3 AND delivered=0", -1, &st, NULL) == SQLITE_OK) {
             sqlite3_bind_int64(st, 1, id);
             mine = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
         }
         sqlite3_finalize(st);
-        if (!mine) continue;
-        char *text = fmt("undelivered after 3 attempts: %lld to %s; recipient can call board id=%lld", id, name, id), *body = fmt("for %s (notice):\n%s", sender, text);
-        noticed += post_mail(db, *from_scope ? from_scope : scope, from_pane, sender, "cntctr", "", body, 0, "", "") > 0;
-        free(text), free(body);
+        long long notice = 0;
+        if (mine) {
+            char *text = fmt("undelivered after 3 attempts: %lld to %s; recipient can call board id=%lld", id, name, id);
+            char *body = fmt("for %s (notice):\n%s", sender, text);
+            notice = insert_mail(db, *from_scope ? from_scope : scope, from_pane, sender, "cntctr",
+                                 "", body, 0, "", "", *from_pane ? socket : "");
+            free(text), free(body);
+        }
+        if (notice && sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK) noticed++;
+        else sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
     }
     json_object_put(rows);
     if (noticed) notify_all();
