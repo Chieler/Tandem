@@ -873,6 +873,8 @@ mailput() {
     printf '%s' "$3" > "$f"
     sqx "$CNTCTR_DB" "INSERT INTO posts(scope,sender,text,at) VALUES('$U5_SCOPE','sender',CAST(readfile('$f') AS TEXT),${5:-strftime('%s','now')}); INSERT INTO mail(post,name,pane,task,hooked,presentations,socket) VALUES(last_insert_rowid(),'$name','$1','$2',1,${4:-0},'$(t display -p '#{socket_path}')'); SELECT last_insert_rowid();"
 }
+# Force the persisted deadline across expiry without sleeping for a production lease.
+expire_mail() { sqx "$CNTCTR_DB" "UPDATE mail SET lease_until=1 WHERE post=$1 AND state='staged'"; }
 mstate() { sqx "$CNTCTR_DB" "SELECT state||'/'||presentations||'/'||delivered FROM mail WHERE post=$1"; }
 pointer() { printf '[cntctr mail id=%s] body attached; if missing, call board id=%s' "$1" "$1"; }
 ctx_c() { printf '%s' "$1" | jq -r '.hookSpecificOutput.additionalContext // empty'; }
@@ -1056,17 +1058,21 @@ u5p2_run() {
     a_pre "$Q" 0 "$(pointer "$m2")" >/dev/null
     a_stop "$Q" USER_CANCELED >/dev/null
     undelivered "$m2" && ok_ || bad "U7 a Stop with terminationReason USER_CANCELED does not deliver" "  got: $(mstate "$m2")"
+    expire_mail "$m2"
     a_pre "$Q" 0 "$(pointer "$m2")" >/dev/null
     a_stop "$Q" NO_TOOL_CALL >/dev/null
     same "U7 an agy Stop that ends normally delivers" "$(mstate "$m2")" "delivered/1/1"
 
-    # U8: a new prompt with no Stop releases staged mail for another presentation.
+    # U8: an abandoned attempt stays staged until its lease expires.
     P=$(hk_agent claude u5_d3)
     m=$(mailput "$P" d3000001 "$(mail_text d3000001 'maybe seen mail')" 1)
     c_prompt "$P" "$(pointer "$m")" >/dev/null
     same "U8 mail is staged in the first turn" "$(mstate "$m")" "staged/1/0"
     c_prompt "$P" "an unrelated question" >/dev/null
-    same "U8 a new turn with no delivery makes staged mail pending again" "$(mstate "$m")" "pending/1/0"
+    same "U8 a new prompt cannot release a live lease" "$(mstate "$m")" "staged/1/0"
+    expire_mail "$m"
+    c_prompt "$P" "an unrelated question after expiry" >/dev/null
+    same "U8 an expired lease makes staged mail pending again" "$(mstate "$m")" "pending/1/0"
     sqx "$CNTCTR_DB" "UPDATE mail SET presentations=2 WHERE post=$m" # a second line was typed for it
     ans=$(c_prompt "$P" "$(pointer "$m")")
     same "U8 small repeat has the full envelope" "$(ctx_c "$ans")" "$(mail_text d3000001 'maybe seen mail')"
@@ -1078,7 +1084,10 @@ u5p2_run() {
     m=$(mailput "$Q" d4000001 "$(mail_text d4000001 'agy maybe seen')" 1)
     a_pre "$Q" 0 "$(pointer "$m")" >/dev/null
     a_pre "$Q" 0 "an unrelated question" >/dev/null
-    same "U8 agy: a new turn with no delivery makes staged mail pending again" "$(mstate "$m")" "pending/1/0"
+    same "U8 agy: a new turn leaves the live lease staged" "$(mstate "$m")" "staged/1/0"
+    expire_mail "$m"
+    a_pre "$Q" 0 "question after expiry" >/dev/null
+    same "U8 agy: a prompt can recover an expired lease" "$(mstate "$m")" "pending/1/0"
 
     # A pointer may have been typed for a different prompt: its count alone is not a full presentation.
     P=$(hk_agent claude repeat_pointer)
@@ -1097,12 +1106,13 @@ u5p2_run() {
     same "board id still returns the exact delivered body" "$out" "$wake_body"
     same "looking up delivered mail preserves its status" "$(mstate "$m")" "delivered/2/1"
 
-    # A blocked Stop and its continuation retain the turn token. An error Stop re-pends it.
+    # A blocked Stop and its continuation retain the turn token. An error leaves the lease unresolved.
     Q=$(hk_agent agy repeat_block)
     m=$(mailput "$Q" e1000002 "$(mail_text e1000002 'blocked-stop body')" 0)
     ans=$(a_stop "$Q" NO_TOOL_CALL)
     check "blocked Stop first shows the body" "$(printf '%s' "$ans" | jq -r '.reason')" "blocked-stop body"
     a_stop "$Q" ERROR >/dev/null
+    expire_mail "$m"
     ans=$(a_pre "$Q" 0 "$(pointer "$m")")
     same "second hook presentation repeats the full small envelope" "$(ctx_a "$ans")" "$(mail_text e1000002 'blocked-stop body')"
     same "second hook body increments shown" "$(sq "$CNTCTR_DB" "SELECT shown FROM mail WHERE post=$m")" 2
@@ -1116,17 +1126,22 @@ u5p2_run() {
     m=$(mailput "$P" e1000003 "$body" 1)
     ans=$(c_prompt "$P" "$(pointer "$m")")
     same "first large presentation includes the entire envelope" "$(ctx_c "$ans")" "$body"
+    expire_mail "$m"
     ans=$(c_prompt "$P" "$(pointer "$m")")
     expected=$(printf '[cntctr from=sender id=e1000003]\n%s\n[cntctr end id=e1000003]\n[702 more bytes omitted: call board id=%s]' "$prefix" "$m")
     same "large repeat ends on a UTF-8 boundary with exact omitted bytes" "$(ctx_c "$ans")" "$expected"
     check "serialized quoted excerpt fits Claude's 8192-byte limit" "$((${#ans} <= 8192))" 1
     ans=$(c_stop "$P")
     emptyans "$ans" && ok_ || bad "clean Stop does not immediately repeat the excerpt" "  got: $ans"
-    same "clean Stop leaves the excerpt unread" "$(mstate "$m")" "pending/1/0"
+    same "clean Stop leaves the excerpt unread" "$(mstate "$m")" "staged/1/0"
+    expire_mail "$m"
     ans=$(c_prompt "$P" "$(pointer "$m")")
     same "third large presentation has the same exact excerpt" "$(ctx_c "$ans")" "$expected"
     c_stop "$P" >/dev/null
-    same "clean Stop after the third body stalls without delivery" "$(mstate "$m")" "stalled/1/0"
+    same "clean Stop cannot acknowledge the third excerpt" "$(mstate "$m")" "staged/1/0"
+    expire_mail "$m"
+    c_prompt "$P" "recover the expired excerpt" >/dev/null
+    same "third expired body stalls without delivery" "$(mstate "$m")" "stalled/1/0"
     same "excerpt stall tells the sender once" "$(notices "$m")" 1
     out=$(txt "$(call "$P" board "{\"id\":$m}")")
     same "board lookup returns the entire stalled body" "$out" "$body"
@@ -1136,6 +1151,7 @@ u5p2_run() {
     body=$(head -c 1024 /dev/zero | tr '\0' x)
     m=$(mailput "$P" e1000004 "$body" 1)
     c_prompt "$P" "$(pointer "$m")" >/dev/null
+    expire_mail "$m"
     ans=$(c_prompt "$P" "$(pointer "$m")")
     same "1024-byte repeat stays full" "$(ctx_c "$ans")" "$body"
     c_stop "$P" >/dev/null
@@ -1170,7 +1186,7 @@ u5p2_run() {
     same "spill failure still gives both markers and a working lookup" "$(ctx_c "$ans")" "$expected"
 
     c_stop "$P" >/dev/null
-    same "clean Stop after a spill fallback leaves mail unread" "$(mstate "$m")" "pending/1/0"
+    same "clean Stop after a spill fallback leaves mail unread" "$(mstate "$m")" "staged/1/0"
 
     # A wake for the newest of 205 mixed rows still presents the oldest fitting prefix.
     local socket first last row piece assembled='' sep='' i
@@ -1202,7 +1218,7 @@ u5p2_run() {
     same "the newest wake leaves the newest mail pending" "$(mstate "$last")" "pending/0/0"
     c_stop "$P" true >/dev/null
     same "one Stop delivers only the five full bodies in a mixed answer" "$(sq "$CNTCTR_DB" "SELECT count(*) FROM mail WHERE pane='$P' AND delivered=1")" 5
-    same "the two excerpted bodies in a mixed answer remain unread" "$(sq "$CNTCTR_DB" "SELECT count(*) FROM mail WHERE pane='$P' AND shown=2 AND state='pending' AND delivered=0")" 2
+    same "the two excerpted bodies in a mixed answer remain unread" "$(sq "$CNTCTR_DB" "SELECT count(*) FROM mail WHERE pane='$P' AND shown=2 AND state='staged' AND delivered=0")" 2
     out=$(txt "$(call "$P" board '{"mode":"mail","offset":200}')")
     same "index beyond the 200th item returns five entries and a footer" "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" 6
     same "index total is independent of the recent board cap" "$(printf '%s\n' "$out" | tail -n 1)" "205 total mail"
@@ -1323,6 +1339,9 @@ u5p2_run() {
     refute "U10 the hold does not repeat the staged mail" "$(printf '%s' "$ans" | jq -r '.reason')" "first in the turn"
     same "U10 the staged mail is delivered by that Stop" "$(mstate "$m")" "delivered/1/1"
     same "U10 the held mail is staged and counted once" "$(mstate "$m2")" "staged/1/0"
+    ans=$(c_stop "$P")
+    emptyans "$ans" && ok_ || bad "U10 another non-continuation Stop cannot hold or ack" "  got: $ans"
+    same "U10 the held mail still awaits continuation" "$(mstate "$m2")" "staged/1/0"
     ans=$(c_stop "$P" true)
     emptyans "$ans" && ok_ || bad "U10 the second Stop of the turn is never held" "  got: $ans"
     same "U10 the second Stop delivers the held mail" "$(mstate "$m2")" "delivered/1/1"
@@ -2083,7 +2102,7 @@ f6_5() {
     unset CNTCTR_WAKE_SEC
 }
 
-# f6_8: an agy end of turn with a terminationReason this code does not know gave no reminder: the mail goes back to pending, the parent is told nothing
+# f6_8: an unrecognized agy terminationReason leaves its claim unresolved and sends no reminder.
 f6_8() {
     local PAR AW out T id ans
     PAR=$(newpane f6_par8)
@@ -2094,7 +2113,7 @@ f6_8() {
     check "F8 the mail is attached" "$(ctx_a "$ans")" "a job that ends in a strange way"
     ans=$(a_stop "$AW" MAX_STEPS)
     emptyans "$ans" && ok_ || bad "F8 a Stop with an unknown terminationReason passes" "  got: $ans"
-    same "F8 its mail is back to pending" "$(mstate "$id")" "pending/1/0"
+    same "F8 an unrecognized Stop leaves its lease unacknowledged" "$(mstate "$id")" "staged/1/0"
     same "F8 the parent is not told 'no reply after one reminder'" "$(stopped "$T")" 0
 }
 
@@ -2192,7 +2211,7 @@ f7_2() {
     same "F7.2 an older database is migrated and stamped" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")$(sqx "$d" 'PRAGMA user_version')" 18
 }
 
-# f7_3: staged mail is released after a cancelled turn only for a spawned worker; a user's own session is left to its next prompt event
+# f7_3: an abandoned user's claim is protected until its lease expires.
 f7_3() {
     local S P out task id ans
     S=$(newpane f7_snd3)
@@ -2213,7 +2232,10 @@ f7_3() {
     same "F7.3 with no Stop it stays staged for a session with no parent" "$(mstate "$id")" "staged/1/0"
     same "F7.3 and nothing more was typed" "$(screen "$P" | grep -c '\[cntctr mail id=')" 2   # cat shows each typed line twice
     ans=$(c_prompt "$P" "my next question")
-    same "F7.3 the user's next prompt event makes it pending again" "$(mstate "$id")" "pending/1/0"
+    same "F7.3 the user's next prompt leaves the live lease staged" "$(mstate "$id")" "staged/1/0"
+    expire_mail "$id"
+    c_prompt "$P" "my question after expiry" >/dev/null
+    same "F7.3 the expired lease becomes pending again" "$(mstate "$id")" "pending/1/0"
     daemon_stop
     unset CNTCTR_WAKE_SEC
 }
@@ -2326,9 +2348,10 @@ f8_4() {
 
 # W1-3: hold a recorded Stop while the same harness records the next turn.
 f8_5() {
-    local P id ans ready
+    local P old id ans ready
     P=$(hk_agent claude late_stop)
-    c_prompt "$P" 'turn N' >/dev/null
+    old=$(mailput "$P" f8000004 "$(mail_text f8000004 'mail for turn N')" 1)
+    c_prompt "$P" "$(pointer "$old")" >/dev/null
     id=$(mailput "$P" f8000005 "$(mail_text f8000005 'mail for turn N plus one')" 1)
     printf '%s' '{"session_id":"S1","hook_event_name":"Stop","stop_hook_active":false}' > "$TMPD/late_stop_event"
     touch "$TMPD/hold_stop"
@@ -2341,6 +2364,7 @@ f8_5() {
     waitfor_hook_pause "$TMPD/late_stop_answer"
     ans=$(cat "$TMPD/late_stop_answer")
     emptyans "$ans" && ok_ || bad "displaced Stop returns a neutral answer" "  got: $ans"
+    same "old Stop acknowledges exactly mail staged in its turn" "$(mstate "$old")" "delivered/1/1"
     same "old Stop cannot acknowledge mail staged in the newer turn" "$(mstate "$id")" "staged/1/0"
     c_stop "$P" >/dev/null
     same "Stop of the newer turn acknowledges its own mail" "$(mstate "$id")" "delivered/1/1"
@@ -2352,6 +2376,8 @@ f8_5() {
     c_prompt "$P" "$(pointer "$id")" >/dev/null
     old_token=$(sqx "$CNTCTR_DB" "SELECT staged_turn FROM mail WHERE post=$id")
     c_start "$P" >/dev/null
+    same "session restart preserves the active lease" "$(mstate "$id")" "staged/1/0"
+    expire_mail "$id"
     ans=$(c_prompt "$P" "$(pointer "$id")")
     same "new generation can restage mail left by the old generation" "$(ctx_c "$ans")" "$(mail_text f8000006 'mail across session restart')"
     new_token=$(sqx "$CNTCTR_DB" "SELECT staged_turn FROM mail WHERE post=$id")
