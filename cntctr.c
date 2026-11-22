@@ -3335,7 +3335,10 @@ static char *tmux_socket(void);
 static void hooks_expire(sqlite3 *db);
 static void stall_overdue(sqlite3 *db, const char *socket, const char *pane);
 static int wake_sec(void);
-static int broken_pointer(sqlite3 *db, const char *socket, const char *pane, const char *name, const char *scope);
+static void broken_pointer(sqlite3 *db, const char *socket, const char *pane, const char *name, long long mail);
+struct mrow { long long id; char *text; int repeat, complete; };
+static char *fit_mail(const char *harness, const char *event, enum hook_answer_kind kind,
+                      struct mrow *rows, int n, const char *extra, int *taken);
 
 /* Only the FIFO watcher retries mail, sleeping indefinitely when its queue is empty. */
 static int redeliver_for(const char *pane, const char *name) {
@@ -3357,7 +3360,7 @@ static int redeliver_for(const char *pane, const char *name) {
         sqlite3_close(db);
         return waiting;
     }
-    if (sqlite3_prepare_v2(db, "SELECT post FROM mail JOIN posts ON posts.rowid=mail.post WHERE (name=?1 OR (socket || char(10) || pane=?3 AND posts.at>?4 AND ?3 != '')) AND scope=?2 AND delivered=0 AND state IN ('pending','staged')", -1, &st, NULL) == SQLITE_OK) {
+    if (sqlite3_prepare_v2(db, "SELECT post FROM mail JOIN posts ON posts.rowid=mail.post WHERE (name=?1 OR (socket || char(10) || pane=?3 AND posts.at>?4 AND ?3 != '')) AND scope=?2 AND delivered=0 AND state IN ('pending','staged') AND shown<3", -1, &st, NULL) == SQLITE_OK) {
         sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 2, p.key, -1, SQLITE_TRANSIENT);
         { char *pk = pane_key(socket, pane); sqlite3_bind_text(st, 3, pk, -1, SQLITE_TRANSIENT); free(pk); }
@@ -3378,22 +3381,47 @@ static int redeliver_for(const char *pane, const char *name) {
             err = NULL;
             if (lock < 0) { pending = 1; continue; }
             /* Reserve the DB write before typing, so another writer cannot prevent the delivered mark. */
+            int paste_failed = 0;
             int rc = sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
-            if (rc == SQLITE_OK && sqlite3_prepare_v2(db, "SELECT text FROM posts JOIN mail ON posts.rowid=mail.post WHERE post=?1 AND delivered=0 AND state IN ('pending','staged')", -1, &st, NULL) == SQLITE_OK) {
+            if (rc == SQLITE_OK && sqlite3_prepare_v2(db, "SELECT posts.text, mail.hooked, mail.shown, "
+                    "(SELECT harness FROM hook_sessions WHERE socket=mail.socket AND pane=mail.pane) FROM posts JOIN mail ON posts.rowid=mail.post WHERE post=?1 AND delivered=0 AND state IN ('pending','staged') AND shown<3", -1, &st, NULL) == SQLITE_OK) {
                 sqlite3_bind_int64(st, 1, id);
                 step = sqlite3_step(st);
                 char *body = step == SQLITE_ROW ? strdup((const char *)sqlite3_column_text(st, 0)) : NULL;
+                int shown = body ? sqlite3_column_int(st, 2) : 0;
+                int tracked = body && (sqlite3_column_int(st, 1) || shown > 0);
+                char harness[16] = "claude";
+                if (tracked && sqlite3_column_type(st, 3) != SQLITE_NULL)
+                    snprintf(harness, sizeof harness, "%s", sqlite3_column_text(st, 3));
                 rc = step == SQLITE_ROW || step == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
                 sqlite3_finalize(st);
                 st = NULL;
                 if (body) {
                     char *message = strchr(body, '\n');
-                    err = inject(pane, name, message ? message + 1 : body);
-                    rc = err ? SQLITE_ERROR : sqlite3_prepare_v2(db, "UPDATE mail SET delivered=1, state='delivered' WHERE post=?1", -1, &st, NULL);
+                    int complete = 1;
+                    if (tracked) {
+                        struct mrow row = {.id = id, .text = message && !strncmp(body, "for ", 4) ? message + 1 : body,
+                                           .repeat = shown > 0};
+                        const char *event = !strcmp(harness, "agy") ? "PreInvocation" : "UserPromptSubmit";
+                        int taken = 0;
+                        char *piece = fit_mail(harness, event, HOOK_ATTACH, &row, 1, NULL, &taken);
+                        complete = row.complete;
+                        err = taken ? inject_ex(pane, name, piece, complete) : fmt("mail does not fit");
+                        free(piece);
+                    } else {
+                        err = inject(pane, name, message ? message + 1 : body);
+                    }
+                    paste_failed = err != NULL;
+                    rc = err ? SQLITE_ERROR : sqlite3_prepare_v2(db,
+                        "UPDATE mail SET delivered=?2, state=CASE WHEN ?2 THEN 'delivered' ELSE 'pending' END, "
+                        "shown=shown+?3 WHERE post=?1 AND shown<3", -1, &st, NULL);
                     if (rc == SQLITE_OK) {
                         sqlite3_bind_int64(st, 1, id);
+                        sqlite3_bind_int(st, 2, complete);
+                        sqlite3_bind_int(st, 3, tracked);
                         rc = sqlite3_step(st) == SQLITE_DONE ? SQLITE_OK : SQLITE_ERROR;
                     }
+                    pending |= tracked && !complete;
                     sqlite3_finalize(st);
                     st = NULL;
                     free(body), free(err);
@@ -3405,12 +3433,13 @@ static int redeliver_for(const char *pane, const char *name) {
                 sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
                 pending = 1;
             }
+            if (paste_failed) broken_pointer(db, socket, pane, name, id);
             close(lock);
         }
         json_object_put(ids);
     } else pending = 1;
     sqlite3_finalize(st);
-    pending |= broken_pointer(db, socket, pane, name, p.key);
+    stall_overdue(db, socket, pane);
     free(socket);
     sqlite3_close(db);
     return pending;
@@ -4055,8 +4084,7 @@ static void hooks_expire(sqlite3 *db) {
 static void stall_overdue(sqlite3 *db, const char *socket, const char *pane) {
     sqlite3_stmt *st = NULL;
     if (sqlite3_prepare_v2(db, "SELECT mail.post, mail.name, posts.sender, mail.from_pane, mail.from_scope, posts.scope FROM mail JOIN posts ON posts.rowid=mail.post "
-                               "WHERE mail.pane=?1 AND mail.socket=?2 AND mail.socket!='' AND mail.state='pending' AND mail.delivered=0 AND mail.presentations>=3 "
-                               "AND NOT EXISTS (SELECT 1 FROM hook_sessions h WHERE h.pane=mail.pane AND h.socket=mail.socket AND h.wake_reserved=1)", -1, &st, NULL) != SQLITE_OK) return;   /* a reserved wake is a line still waiting for its answer */
+                               "WHERE mail.pane=?1 AND mail.socket=?2 AND mail.socket!='' AND mail.state='pending' AND mail.delivered=0 AND mail.shown>=3", -1, &st, NULL) != SQLITE_OK) return;
     sqlite3_bind_text(st, 1, pane, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st, 2, socket, -1, SQLITE_TRANSIENT);
     json_object *rows = json_object_new_array();
@@ -4076,13 +4104,13 @@ static void stall_overdue(sqlite3 *db, const char *socket, const char *pane) {
                    *scope = json_object_get_string(json_object_array_get_idx(r, 5));
         st = NULL;
         int mine = 0;   /* the state change is the claim: only one process tells the sender */
-        if (sqlite3_prepare_v2(db, "UPDATE mail SET state='stalled' WHERE post=?1 AND state='pending'", -1, &st, NULL) == SQLITE_OK) {
+        if (sqlite3_prepare_v2(db, "UPDATE mail SET state='stalled' WHERE post=?1 AND state='pending' AND shown>=3 AND delivered=0", -1, &st, NULL) == SQLITE_OK) {
             sqlite3_bind_int64(st, 1, id);
             mine = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
         }
         sqlite3_finalize(st);
         if (!mine) continue;
-        char *text = fmt("undelivered after 3 attempts: %lld to %s", id, name), *body = fmt("for %s (notice):\n%s", sender, text);
+        char *text = fmt("undelivered after 3 attempts: %lld to %s; recipient can call board id=%lld", id, name, id), *body = fmt("for %s (notice):\n%s", sender, text);
         noticed += post_mail(db, *from_scope ? from_scope : scope, from_pane, sender, "cntctr", "", body, 0, "", "") > 0;
         free(text), free(body);
     }
@@ -4236,7 +4264,7 @@ static void release_unended(sqlite3 *db, const char *socket, const char *pane, c
 static int wake_pending(sqlite3 *db, const char *socket, const char *pane, const char *name, const char *scope) {
     const char *own = "(name=?1 OR (socket || char(10) || pane=?3 AND posts.at>?4 AND ?3 != '')) AND scope=?2 AND delivered=0";
     release_unended(db, socket, pane, name, scope, own);
-    char *sql = fmt("SELECT post FROM mail JOIN posts ON posts.rowid=mail.post WHERE %s AND state='pending' ORDER BY post LIMIT 1", own);
+    char *sql = fmt("SELECT post FROM mail JOIN posts ON posts.rowid=mail.post WHERE %s AND state='pending' AND shown<3 ORDER BY post LIMIT 1", own);
     sqlite3_stmt *st = NULL;
     long long mail = 0;
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
@@ -4264,47 +4292,34 @@ static int wake_pending(sqlite3 *db, const char *socket, const char *pane, const
     return waiting;
 }
 
-/* An agent whose hook went quiet gets its mail as a full envelope (above). When that paste fails too, the one-line pointer is
- * the last way to reach it: it tells the agent to call board. It is typed for the oldest waiting mail, three presentations at most.
- * Returns 1 while a mail waits. */
-static int broken_pointer(sqlite3 *db, const char *socket, const char *pane, const char *name, const char *scope) {
+/* A quiet hook could not receive a body by paste. Offer a bounded number of
+ * lookup pointers while leaving the mail available and its body budget intact. */
+static void broken_pointer(sqlite3 *db, const char *socket, const char *pane, const char *name, long long mail) {
     struct hook_row r;
-    if (!*socket || !hook_row_get(db, socket, pane, &r) || !r.broken) return 0;
+    if (!*socket || !hook_row_get(db, socket, pane, &r) || !r.broken) return;
     sqlite3_stmt *st = NULL;
-    long long mail = 0;
-    int presented = 0;
-    if (sqlite3_prepare_v2(db, "SELECT post, presentations FROM mail JOIN posts ON posts.rowid=mail.post WHERE (name=?1 OR (socket || char(10) || pane=?3 AND posts.at>?4 AND ?3 != '')) "
-                               "AND scope=?2 AND delivered=0 AND state IN ('pending','staged') ORDER BY post LIMIT 1", -1, &st, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 2, scope, -1, SQLITE_TRANSIENT);
-        { char *pk = pane_key(socket, pane); sqlite3_bind_text(st, 3, pk, -1, SQLITE_TRANSIENT); free(pk); }
-        sqlite3_bind_int64(st, 4, server_start);
-        if (sqlite3_step(st) == SQLITE_ROW) {
-            mail = sqlite3_column_int64(st, 0);
-            presented = sqlite3_column_int(st, 1);
-        }
+    const char *eligible = "post=?1 AND delivered=0 AND state IN ('pending','staged') AND shown<3 AND presentations<3";
+    char *sql = fmt("SELECT 1 FROM mail WHERE %s", eligible);
+    int waiting = 0;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, mail);
+        waiting = sqlite3_step(st) == SQLITE_ROW;
     }
     sqlite3_finalize(st);
-    if (!mail) return 0;
-    if (presented >= 3) {   /* the third presentation went unanswered: a staged mail of a quiet hook is as good as pending */
-        char *sql = fmt("UPDATE mail SET state='pending' WHERE post=%lld AND state='staged'", mail);
-        sqlite3_exec(db, sql, NULL, NULL, NULL);
-        free(sql);
-        stall_overdue(db, socket, pane);
-        return 0;
-    }
+    free(sql);
+    if (!waiting) return;
     char *line = fmt(WAKE_FMT, mail, mail), *err = inject_ex(pane, name, line, 0);
     free(line);
     if (!err) {
-        st = NULL;
-        if (sqlite3_prepare_v2(db, "UPDATE mail SET presentations=presentations+1 WHERE post=?1", -1, &st, NULL) == SQLITE_OK) {
+        sql = fmt("UPDATE mail SET presentations=presentations+1 WHERE %s", eligible);
+        if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
             sqlite3_bind_int64(st, 1, mail);
             sqlite3_step(st);
         }
         sqlite3_finalize(st);
+        free(sql);
     }
     free(err);
-    return 1;
 }
 
 /* ---- mail by reference (H3): the pointer line, what a hook attaches, and where a body that is too big goes ---- */
@@ -4370,7 +4385,6 @@ static char *excerpt(const char *text, const char *path, size_t head, size_t tai
     return fmt("%.*s\n[... %zu bytes left out; the whole mail is in the file %s ...]\n%s", (int)h, text, from - h, path, text + from);
 }
 
-struct mrow { long long id; char *text; int repeat; };
 static json_object *hook_trace;
 
 static int answer_fits(const char *harness, const char *event, enum hook_answer_kind kind, const char *text) {
@@ -4384,8 +4398,13 @@ static int answer_fits(const char *harness, const char *event, enum hook_answer_
 static void mail_body(const char *text, const char **start, const char **end) {
     *start = text;
     *end = text + strlen(text);
-    const char *first = strchr(text, '\n'), *last = strrchr(text, '\n');
-    if (first && last > first && !strncmp(text, "[cntctr from=", 13) &&
+    const char *prefix = text;
+    if (!strncmp(text, "for ", 4)) {
+        const char *line = strchr(text, '\n');
+        if (line) prefix = line + 1;
+    }
+    const char *first = strchr(prefix, '\n'), *last = strrchr(text, '\n');
+    if (first && last > first && !strncmp(prefix, "[cntctr ", 8) &&
         !strncmp(last + 1, "[cntctr end id=", 15) && (*end)[-1] == ']') {
         *start = first + 1;
         *end = last;
@@ -4400,22 +4419,24 @@ static char *mail_excerpt(const struct mrow *r, const char *start, const char *e
                (int)(start - r->text), r->text, (int)head, start, end, len - head, r->id);
 }
 
-static char *mail_piece(const struct mrow *r) {
+static char *mail_piece(const struct mrow *r, int *complete) {
+    if (complete) *complete = 1;
     if (!r->repeat) return strdup(r->text);
     const char *start, *end;
     mail_body(r->text, &start, &end);
     if (end - start <= 1024) return strdup(r->text);
+    if (complete) *complete = 0;
     return mail_excerpt(r, start, end, 400);
 }
 
 /* The text for a hook answer: as many of the rows (oldest first) as the harness budget takes, then `extra`.
  * A first mail that cannot fit alone goes to a file and is cut; later mail that does not fit stays pending.
  * *taken is how many rows went in. NULL when nothing fits. */
-static char *fit_mail(const char *harness, const char *event, enum hook_answer_kind kind, const struct mrow *rows, int n, const char *extra, int *taken) {
+static char *fit_mail(const char *harness, const char *event, enum hook_answer_kind kind, struct mrow *rows, int n, const char *extra, int *taken) {
     char *out = strdup("");
     *taken = 0;
     for (int i = 0; i < n; i++) {
-        char *piece = mail_piece(&rows[i]);
+        char *piece = mail_piece(&rows[i], &rows[i].complete);
         char *cand = fmt("%s%s%s", out, *out ? "\n\n" : "", piece), *full = extra ? fmt("%s\n\n%s", cand, extra) : strdup(cand);
         int fits = answer_fits(harness, event, kind, full);
         free(full), free(piece);
@@ -4435,6 +4456,7 @@ static char *fit_mail(const char *harness, const char *event, enum hook_answer_k
             }
             free(path);
             fits = cand != NULL;
+            rows[i].complete = 0;
         }
         if (!fits) { free(cand); break; }
         free(out);
@@ -4449,17 +4471,16 @@ static char *fit_mail(const char *harness, const char *event, enum hook_answer_k
 
 /* The pending mail of `pane` that a hook may present now, oldest first (rows[].text is allocated; caller frees).
  * `own` is the mail whose pointer line this event carries: its presentation was counted when the line was typed. */
-static int pending_rows(sqlite3 *db, const char *socket, const char *pane, long long server_start, long long own, struct mrow *rows, int max) {
+static int pending_rows(sqlite3 *db, const char *socket, const char *pane, long long server_start, struct mrow *rows, int max) {
     sqlite3_stmt *st = NULL;
     int n = 0;
     if (sqlite3_prepare_v2(db, "SELECT mail.post, posts.text, mail.shown FROM mail JOIN posts ON posts.rowid=mail.post "
-                               "WHERE mail.pane=?1 AND mail.socket=?5 AND mail.socket!='' AND mail.state='pending' AND mail.delivered=0 AND (mail.presentations<3 OR mail.post=?4) "
+                               "WHERE mail.pane=?1 AND mail.socket=?5 AND mail.socket!='' AND mail.state='pending' AND mail.delivered=0 AND mail.shown<3 "
                                "AND ?2>0 AND posts.at>?2 ORDER BY mail.post LIMIT ?3", -1, &st, NULL) != SQLITE_OK) return 0;   /* only mail of this pane on this tmux server, stored after the server started */
     sqlite3_bind_text(st, 1, pane, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st, 5, socket, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 2, server_start);
     sqlite3_bind_int(st, 3, max);
-    sqlite3_bind_int64(st, 4, own);   /* the third line typed for a mail is answered by this event */
     while (sqlite3_step(st) == SQLITE_ROW) {
         rows[n].id = sqlite3_column_int64(st, 0);
         rows[n].text = strdup((const char *)sqlite3_column_text(st, 1));
@@ -4471,16 +4492,23 @@ static int pending_rows(sqlite3 *db, const char *socket, const char *pane, long 
 }
 
 /* Mark rows[0..taken) staged in this turn. A mail with no pointer line of its own is counted now. */
-static void stage_rows(sqlite3 *db, const struct mrow *rows, int taken, long long own, const char *token) {
-    for (int i = 0; i < taken; i++) {
-        sqlite3_stmt *st = NULL;
-        if (sqlite3_prepare_v2(db, "UPDATE mail SET state='staged', hooked=1, staged_turn=?2, presentations=presentations+?3, shown=shown+1 WHERE post=?1 AND state='pending'", -1, &st, NULL) != SQLITE_OK) continue;
+static int stage_rows(sqlite3 *db, const struct mrow *rows, int taken, long long own, const char *token) {
+    if (!taken) return 1;
+    sqlite3_stmt *st = NULL;
+    const char *sql = "UPDATE mail SET state='staged', hooked=1, staged_turn=?2, "
+                      "presentations=presentations+?3, shown=shown+1 "
+                      "WHERE post=?1 AND state='pending' AND delivered=0 AND shown<3";
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return 0;
+    int ok = 1;
+    for (int i = 0; ok && i < taken; i++) {
         sqlite3_bind_int64(st, 1, rows[i].id);
         sqlite3_bind_text(st, 2, token, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(st, 3, rows[i].id != own);
-        sqlite3_step(st);
-        sqlite3_finalize(st);
+        ok = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
+        sqlite3_reset(st);
     }
+    sqlite3_finalize(st);
+    return ok;
 }
 
 #define MAIL_ROWS 50
@@ -4490,10 +4518,10 @@ static json_object *hook_attach(sqlite3 *db, const char *harness, const char *ev
     struct mrow rows[MAIL_ROWS];
     json_object *answer = NULL;
     if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) return NULL;
-    int n = pending_rows(db, socket, pane, server_start, own, rows, MAIL_ROWS), taken = 0;
+    int n = pending_rows(db, socket, pane, server_start, rows, MAIL_ROWS), taken = 0;
     char *text = n ? fit_mail(harness, event, HOOK_ATTACH, rows, n, NULL, &taken) : NULL;
-    if (taken) stage_rows(db, rows, taken, own, token);
-    if (hook_commit(db, taken > 0)) {
+    if (!stage_rows(db, rows, taken, own, token)) sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    else if (hook_commit(db, taken > 0)) {
         if (taken) {
             answer = hook_answer(harness, event, HOOK_ATTACH, text);
             if (hook_trace) json_object_object_add(hook_trace, "attached", json_object_new_int(taken));
@@ -4690,11 +4718,11 @@ static json_object *hook_stop(sqlite3 *db, const char *socket, const char *pane,
     if (normal && !event->loop && sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK) {
         begun = 1;
         struct mrow rows[MAIL_ROWS];
-        int n = pending_rows(db, socket, pane, server_start, 0, rows, MAIL_ROWS), taken = 0, named = 0;
+        int n = pending_rows(db, socket, pane, server_start, rows, MAIL_ROWS), taken = 0, named = 0;
         char *extra = worker ? task_reminder(db, &g, socket, pane, server_start, &named) : NULL;
         char *text = n || extra ? fit_mail(harness, event->kind, HOOK_BLOCK, rows, n, extra, &taken) : NULL;
-        if (taken || named) {
-            stage_rows(db, rows, taken, 0, token);
+        int staged = stage_rows(db, rows, taken, 0, token);
+        if (staged && (taken || named)) {
             for (int i = 0; named && i < g.ntasks; i++) task_gate_set(db, g.task[i].id, "reminded");
             st = NULL;
             if (sqlite3_prepare_v2(db, "UPDATE hook_sessions SET stop_blocked=1 WHERE socket=?1 AND pane=?2", -1, &st, NULL) == SQLITE_OK) {
@@ -4704,7 +4732,8 @@ static json_object *hook_stop(sqlite3 *db, const char *socket, const char *pane,
             }
             sqlite3_finalize(st);
         }
-        if (hook_commit(db, taken || named)) {
+        if (!staged) sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+        else if (hook_commit(db, taken || named)) {
             if (taken || named) {
                 answer = hook_answer(harness, event->kind, HOOK_BLOCK, text);
                 if (hook_trace) json_object_object_add(hook_trace, "re_presented", json_object_new_int(taken));

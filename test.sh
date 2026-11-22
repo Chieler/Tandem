@@ -1369,7 +1369,7 @@ daemon_hello() { daemon_send '{"jsonrpc":"2.0","id":2,"method":"tools/call","par
 notices() { sqx "$CNTCTR_DB" "SELECT count(*) FROM posts WHERE text LIKE '%undelivered after 3 attempts: $1 to %'"; }
 
 u5p4_run() {
-    local S Q P id task out i before ans lines
+    local S Q P id task out i before ans lines payload envelope
     export CNTCTR_PASTE_WAIT_MS=100
     S=$(newpane u5_snd4)
 
@@ -1394,7 +1394,7 @@ u5p4_run() {
     sleep 3
     same "U11 the retry thread types nothing for a stalled mail" "$(screen "$Q")" "$before"
     same "U11 the sender has one undelivered mail" "$(notices "$id")" 1
-    check "U11 it names the mail and the addressee" "$(txt "$(call "$S" board '{}')")" "undelivered after 3 attempts: $id to u5_k1"
+    check "U11 it names the mail and the addressee" "$(txt "$(call "$S" board '{}')")" "undelivered after 3 attempts: $id to u5_k1; recipient can call board id=$id"
     # a server restart does not reset the count and does not tell the sender again
     daemon_stop
     daemon_start "$Q"
@@ -1406,6 +1406,22 @@ u5p4_run() {
     check "U11 the addressee's board lists the stalled mail" "$(txt "$(call "$Q" board '{}')")" "mail that is never delivered"
     check "U11 and its unread notice counted it before the read" "$(sqx "$CNTCTR_DB" "SELECT count(*) FROM mail WHERE pane='$Q'")" 1
     daemon_stop
+
+    # Replaying an old line without a Stop still spends the body budget.
+    P=$(hk_agent claude stale_replay)
+    envelope=$(mail_text e4000001 'stale pointer replay body')
+    id=$(mailput "$P" e4000001 "$envelope" 9)
+    for i in 1 2 3; do
+        ans=$(c_prompt "$P" "$(pointer "$id")")
+        same "stale replay body $i" "$(ctx_c "$ans")" "$envelope"
+        same "stale replay charges body $i" "$(sq "$CNTCTR_DB" "SELECT shown FROM mail WHERE post=$id")" "$i"
+    done
+    for i in 4 5; do
+        ans=$(c_prompt "$P" "$(pointer "$id")")
+        emptyans "$ans" && ok_ || bad "stale replay $i attaches nothing" "  got: $ans"
+    done
+    same "stale replay stalls with the wake count unchanged" "$(mstate "$id")" "stalled/9/0"
+    same "stale replay tells the sender once" "$(notices "$id")" 1
 
     # U11b: the hook command stops running: after the wake window (1 s here, 30 s by default) the mail is pasted as a full envelope
     export CNTCTR_WAKE_SEC=1
@@ -1426,17 +1442,34 @@ u5p4_run() {
     same "U11b the next prompt event gives the hooks back" "$(sqx "$CNTCTR_DB" "SELECT broken FROM hook_sessions WHERE pane='$P'")" 0
     daemon_stop
 
-    # U11b: with the full paste failing as well, the pointer is typed three times at most, then the mail is stalled
+    # A quiet hook gets the same excerpt and body cap as a responding hook.
+    P=$(hk_agent claude quiet_repeat)
+    payload=$(head -c 1100 /dev/zero | tr '\0' x)
+    envelope=$(printf '[cntctr from=sender id=e4000002]\n%s\n[cntctr end id=e4000002]' "$payload")
+    id=$(mailput "$P" e4000002 "$envelope" 0)
+    sqx "$CNTCTR_DB" "UPDATE mail SET shown=1, hooked=1 WHERE post=$id; UPDATE hook_sessions SET broken=1 WHERE pane='$P'"
+    daemon_start "$P"
+    daemon_hello
+    expect_screen "quiet repeat keeps the original closing marker" "$P" "[cntctr end id=e4000002]"
+    expect_screen "quiet repeat names the exact omitted byte count and lookup" "$P" "[700 more bytes omitted: call board id=$id]"
+    refute "quiet repeat does not paste the full payload" "$(screen "$P")" "$payload"
+    wait_mstate "quiet repeat stops after the third body" "$id" "stalled/0/0"
+    same "quiet repeat charges the two fallbacks and the first hook body" "$(sq "$CNTCTR_DB" "SELECT shown FROM mail WHERE post=$id")" 3
+    same "quiet repeat tells the sender once" "$(notices "$id")" 1
+    daemon_stop
+
+    # Failed body pastes can yield three pointers without spending any body budget.
     P=$(hk_agent claude u5_l2 sh -c 'exec /bin/cat')   # no bracketed paste: a multi-line paste is refused, one line is not
     daemon_start "$P"
     daemon_hello
     out=$(txt "$(call "$S" send '{"to":"u5_l2","text":"mail that cannot be pasted"}')")
     task=${out#sent id=}; id=$(mailid "$task")
-    wait_mstate "U11b the mail is stalled after three pointers" "$id" "stalled/3/0"
+    wait_mstate "U11b three pointers leave mail pending" "$id" "pending/3/0"
     lines=$(screen "$P" | grep -c '\[cntctr mail id=')   # cat shows each typed line twice
     same "U11b the pointer was typed three times" "$lines" 6
     refute "U11b the text itself was never typed" "$(screen "$P")" "mail that cannot be pasted"
-    same "U11b the sender has the undelivered mail, once" "$(notices "$id")" 1
+    same "U11b pointers leave the body budget untouched" "$(sq "$CNTCTR_DB" "SELECT shown FROM mail WHERE post=$id")" 0
+    same "U11b pointer-only fallback sends no stall notice" "$(notices "$id")" 0
     daemon_stop
     unset CNTCTR_WAKE_SEC CNTCTR_PASTE_WAIT_MS
 }
