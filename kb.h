@@ -93,5 +93,5 @@ int kb_tool_resolve_human(sqlite3 *db, const char *project, const char *name, in
 /* Copy the project's active version *from to global as a new active *version, revoking the previous one. 0, or -1 (no active version). */
 int kb_tool_promote(sqlite3 *db, const char *project, const char *name, int *from, int *version);
 char *kb_unread(sqlite3 *db, const char *scope, const char *me, const char *pane, const char *socket, long long server_start, long long after, long long *newest, int *count);
-int kb_omitted(sqlite3 *db, const char *scope, const char *me, const char *pane, const char *socket, long long server_start, long long after, int limit);
+int kb_omitted(sqlite3 *db, const char *scope, const char *me, const char *pane, const char *socket, long long server_start, long long after, int limit, int *mail_omitted);
 #endif

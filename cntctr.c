@@ -1669,7 +1669,7 @@ static void remember_reply(const char *id, const char *to, const char *sender, c
 }
 
 /* The agent in `pane` answered task `task`: its staged or pending mail for that task is delivered. */
-static void mail_answered(const char *task, const char *pane) {
+static void mail_answered(const char *task) {
     char *err = NULL;
     sqlite3 *db = kb(&err);
     free(err);
@@ -1679,15 +1679,6 @@ static void mail_answered(const char *task, const char *pane) {
      * (waiting sender, buffer, board), @cntctr_to_<task> may stay set until the sender's wait ends. */
     if (sqlite3_prepare_v2(db, "INSERT INTO task_gate(task, answered) VALUES(?1, 1) ON CONFLICT(task) DO UPDATE SET answered=1", -1, &st, NULL) == SQLITE_OK) {
         sqlite3_bind_text(st, 1, task, -1, SQLITE_TRANSIENT);
-        sqlite3_step(st);
-    }
-    sqlite3_finalize(st);
-    st = NULL;
-    if (!pane || !*pane) { sqlite3_close(db); return; }
-    if (sqlite3_prepare_v2(db, "UPDATE mail SET delivered=1, state='delivered' WHERE task=?1 AND pane=?2 AND socket=?3 AND socket!='' AND (hooked=1 OR presentations>0) AND delivered=0", -1, &st, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, task, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 2, pane, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 3, self_socket, -1, SQLITE_TRANSIENT);
         sqlite3_step(st);
     }
     sqlite3_finalize(st);
@@ -1715,7 +1706,7 @@ static int tool_reply(json_object *a, char **res) {
     }
     snprintf(opt, sizeof opt, "@cntctr_wait_%s", id);
     if ((waiting = sopt_get(opt))) {   /* sender is blocked in wait_one: wake it */
-        mail_answered(id, to);   /* the reply is handed on (buffer loaded); a failed reply leaves the task open */
+        mail_answered(id);   /* the reply is handed on (buffer loaded); a failed reply leaves the task open */
         free(waiting);
         free(sender);
         free(to);
@@ -1723,7 +1714,7 @@ static int tool_reply(json_object *a, char **res) {
     }
     char *me = pane_name(to);
     int rc = deliver_buffer(buf, id, me && *me ? me : caller_name);
-    if (rc >= 0) mail_answered(id, to);   /* only a reply that reached the sender (or the board) closes the task */
+    if (rc >= 0) mail_answered(id);   /* only a reply that reached the sender (or the board) closes the task */
     free(me), free(sender), free(to);
     if (rc < 0) return fail(res, fmt("delivery failed; reply retained for retry"));
     return ok(res, fmt(rc ? "reply is on the board" : "ok"));
@@ -2323,14 +2314,7 @@ static int board_lookup(sqlite3 *db, const char *scope, json_object *a, json_obj
     }
     sqlite3_finalize(st);
     free(key);
-    if (complete) {   /* match regular board's delivery rule only when this answer contains the entire post */
-        st = NULL;
-        if (sqlite3_prepare_v2(db, "UPDATE mail SET delivered=1, state='delivered' WHERE post=?1 AND delivered=0 AND (hooked=1 OR presentations>0)", -1, &st, NULL) == SQLITE_OK) {
-            sqlite3_bind_int64(st, 1, id);
-            sqlite3_step(st);
-        }
-        sqlite3_finalize(st);
-    }
+    if (complete && out) kb_mail_finish(db, id, KB_MAIL_READ, 0, NULL, 0);
     if (out) return ok(res, out);
     if (bad_offset) return fail(res, fmt("board offset is outside the mail or splits UTF-8"));
     return fail(res, fmt(rc == SQLITE_DONE ? "mail not found" : "cannot read mail"));
@@ -2467,7 +2451,8 @@ static int tool_board(json_object *a, char **res) {
     long long after = seen_of(caller_name), newest = 0;
     int unseen = 0;
     free(kb_unread(db, p.key, caller_name, key, self_socket, server_start, after, &newest, &unseen));
-    int omitted = kb_omitted(db, p.key, caller_name, key, self_socket, server_start, after, limit);
+    int omitted_mail = 0;
+    int omitted = kb_omitted(db, p.key, caller_name, key, self_socket, server_start, after, limit, &omitted_mail);
     char *shown = kb_board_mail(db, p.key, caller_name, key, self_socket, server_start, limit);
     free(key);
     if (sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
@@ -2476,13 +2461,19 @@ static int tool_board(json_object *a, char **res) {
         sqlite3_close(db);
         return fail(res, fmt("cannot read board snapshot"));
     }
-    if (*shown) {   /* a mail whose body this board result returned is delivered */
-        char *sql = fmt("UPDATE mail SET delivered=1, state='delivered' WHERE delivered=0 AND (hooked=1 OR presentations>0) AND post IN (%s)", shown);
-        sqlite3_exec(db, sql, NULL, NULL, NULL);
-        free(sql);
+    for (const char *id = shown; *id;) {
+        char *end;
+        kb_mail_finish(db, strtoll(id, &end, 10), KB_MAIL_READ, 0, NULL, 0);
+        if (*end != ',') break;
+        id = end + 1;
     }
     free(shown);
     if (*caller_name) set_seen(caller_name, newest);
+    if (omitted_mail > 0) {
+        char *more = fmt("%s\nOlder mail is available with board mode=mail.", out);
+        free(out);
+        out = more;
+    }
     if (omitted > 0) {
         char *more = fmt("%s\n%d older unread posts were not shown", out, omitted);
         free(out);
@@ -3438,10 +3429,8 @@ static void notify_all(void) {
     if (d) closedir(d);
 }
 
-static int wake_pending(sqlite3 *db, const char *socket, const char *pane, const char *name, const char *scope);
+static void wake_pending(sqlite3 *db, const char *socket, const char *pane, const char *name, const char *scope);
 static char *tmux_socket(void);
-static void hooks_expire(sqlite3 *db);
-static void stall_overdue(sqlite3 *db, const char *socket, const char *pane);
 static int wake_sec(void);
 static void broken_pointer(sqlite3 *db, const char *socket, const char *pane, const char *name, long long mail);
 struct mrow { long long id; char *text; int shown, complete; };
@@ -3490,10 +3479,10 @@ static int terminal_mail(sqlite3 *db, const char *socket, const char *pane, cons
     }
     const char *body = piece ? piece : text;
     if (taken && epoch > 0 && !awaiting_permission(pane)) {
-        char *blocked = *quiet ? paste_ready(pane, row.complete || strchr(body, '\n')) : NULL;
+        char *blocked = paste_ready(pane, row.complete || strchr(body, '\n'));
         if (blocked) {
             free(blocked);
-            pointer = 1;
+            pointer = *quiet != 0;
         } else if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK) {
             time_t now = time(NULL);
             int attempt = (unserved || mail_hook_mode(db, socket, pane, epoch, NULL) == 0) ?
@@ -3511,21 +3500,15 @@ static int terminal_mail(sqlite3 *db, const char *socket, const char *pane, cons
     return finished;
 }
 
-static int redeliver_for(const char *pane, const char *name) {
-    char *err = NULL;
-    sqlite3 *db = kb(&err);
-    free(err);
-    if (!db) return 1;
+static void redeliver_for(sqlite3 *db, const char *pane, const char *name) {
     struct project p;
     resolve_project(db, pane, &p);
     char *socket = tmux_socket(), quiet[16] = "";
     long long epoch = pane_epoch(pane);
-    hooks_expire(db);
-    stall_overdue(db, socket, pane);
-    int pending = 0, mode = mail_hook_mode(db, socket, pane, epoch, quiet);
+    int mode = mail_hook_mode(db, socket, pane, epoch, quiet);
     int unserved = mode > 0 && !pane_served(pane);
     if (unserved) mode = 0;
-    if (mode > 0) pending = wake_pending(db, socket, pane, name, p.key);
+    if (mode > 0) wake_pending(db, socket, pane, name, p.key);
     else if (mode == 0 && epoch > 0) {
         sqlite3_stmt *st = NULL;
         json_object *rows = json_object_new_array();
@@ -3537,40 +3520,56 @@ static int redeliver_for(const char *pane, const char *name) {
             sqlite3_bind_text(st, 2, pane, -1, SQLITE_TRANSIENT);
             sqlite3_bind_int64(st, 3, epoch);
             sqlite3_bind_text(st, 4, p.key, -1, SQLITE_TRANSIENT);
-            int rc;
-            while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+            while (sqlite3_step(st) == SQLITE_ROW) {
                 json_object *row = json_object_new_array();
                 json_object_array_add(row, json_object_new_int64(sqlite3_column_int64(st, 0)));
                 json_object_array_add(row, json_object_new_string((const char *)sqlite3_column_text(st, 1)));
                 json_object_array_add(row, json_object_new_int(sqlite3_column_int(st, 2)));
                 json_object_array_add(rows, row);
             }
-            pending = rc != SQLITE_DONE;
-        } else pending = 1;
+        }
         sqlite3_finalize(st);
         for (size_t i = 0; i < json_object_array_length(rows); i++) {
             json_object *row = json_object_array_get_idx(rows, i);
             long long id = json_object_get_int64(json_object_array_get_idx(row, 0));
             const char *body = json_object_get_string(json_object_array_get_idx(row, 1));
             const char *message = !strncmp(body, "for ", 4) ? strchr(body, '\n') : NULL;
-            pending |= !terminal_mail(db, socket, pane, name, epoch, id, message ? message + 1 : body,
+            terminal_mail(db, socket, pane, name, epoch, id, message ? message + 1 : body,
                                       json_object_get_int(json_object_array_get_idx(row, 2)), quiet, unserved);
         }
         json_object_put(rows);
-    } else pending = mode < 0;
+    }
     free(socket);
-    sqlite3_close(db);
-    return pending;
 }
 
+/* Scan deadlines even when this process has no deliverable row or registered pane. */
 static int redeliver_mail(void) {
-    pthread_mutex_lock(&mail_mu);
-    struct mail_identity *identities = mail_identities;
-    pthread_mutex_unlock(&mail_mu);
-    int pending = 0;
-    for (struct mail_identity *it = identities; it; it = it->next)
-        pending |= redeliver_for(it->pane, it->name);
-    return pending;
+    int interval = wake_sec(), seconds = interval;
+    char *err = NULL;
+    sqlite3 *db = kb(&err);
+    free(err);
+    if (db) {
+        int reconciled = kb_mail_reconcile(db, time(NULL), interval) == SQLITE_OK;
+        pthread_mutex_lock(&mail_mu);
+        struct mail_identity *identities = mail_identities;
+        pthread_mutex_unlock(&mail_mu);
+        for (struct mail_identity *it = identities; it; it = it->next) redeliver_for(db, it->pane, it->name);
+
+        sqlite3_stmt *st = NULL;
+        if (reconciled && sqlite3_prepare_v2(db, "SELECT min(deadline) FROM ("
+            " SELECT min(lease_until)+1 AS deadline FROM mail WHERE state='staged' AND delivered=0"
+            " UNION ALL SELECT min(wake_at)+?1 FROM hook_sessions WHERE wake_reserved=1)",
+            -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_int(st, 1, interval);
+            if (sqlite3_step(st) == SQLITE_ROW && sqlite3_column_type(st, 0) != SQLITE_NULL) {
+                sqlite3_int64 left = sqlite3_column_int64(st, 0) - time(NULL);
+                if (left < seconds) seconds = left > 0 ? (int)left : 0;
+            }
+        }
+        sqlite3_finalize(st);
+        sqlite3_close(db);
+    }
+    return seconds > INT_MAX / 1000 ? INT_MAX : seconds * 1000;
 }
 
 static void learn_mail_identity(const char *pane, const char *name) {
@@ -3597,14 +3596,14 @@ static void learn_mail_identity(const char *pane, const char *name) {
 static void *fifo_watch(void *arg) {
     struct pollfd pf = {(int)(intptr_t)arg, POLLIN, 0};
     char buf[256];
-    int pending = redeliver_mail();
+    int timeout = redeliver_mail();
     for (;;) {
-        int ready = poll(&pf, 1, pending ? wake_sec() * 1000 : -1);
+        int ready = poll(&pf, 1, timeout);
         if (ready < 0) {
             if (errno == EINTR) continue;
             return NULL;
         }
-        if (!ready) { pending = redeliver_mail(); continue; }
+        if (!ready) { timeout = redeliver_mail(); continue; }
         int tools_changed = 0;
         ssize_t n;
         while ((n = read(pf.fd, buf, sizeof buf)) > 0)
@@ -3615,7 +3614,7 @@ static void *fifo_watch(void *arg) {
         json_object_object_add(m, "method", json_object_new_string("notifications/tools/list_changed"));
         emit(m);
         }
-        pending = redeliver_mail();
+        timeout = redeliver_mail();
     }
 }
 
@@ -4132,7 +4131,9 @@ static int record_hook(sqlite3 *db, const char *socket, const char *pane, const 
     #undef FRESH
     sqlite3_stmt *st = NULL;
     if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) return 0;
-    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
+    time_t now = time(NULL);
+    if (kb_mail_reconcile(db, now, wake_sec()) != SQLITE_OK ||
+        sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
         sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
         return 0;
     }
@@ -4142,7 +4143,7 @@ static int record_hook(sqlite3 *db, const char *socket, const char *pane, const 
     sqlite3_bind_text(st, 4, event->session, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 5, pid);
     sqlite3_bind_text(st, 6, event->kind, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(st, 7, !strcmp(event->kind, "UserPromptSubmit") || !strcmp(event->kind, "PreInvocation"));
+    sqlite3_bind_int(st, 7, turn_start(harness, event));
     sqlite3_bind_int(st, 8, !strcmp(event->kind, "Stop"));
     sqlite3_bind_int(st, 9, !strcmp(event->kind, "SessionStart"));
     sqlite3_bind_int(st, 10, 0);
@@ -4167,9 +4168,7 @@ static int record_hook(sqlite3 *db, const char *socket, const char *pane, const 
         }
     } else ok = 0;
     sqlite3_finalize(st);
-    time_t now = time(NULL);
     int acked = 0;
-    if (ok) ok = kb_mail_reconcile(db, now, wake_sec()) == SQLITE_OK;
     if (ok && !strcmp(event->kind, "Stop") && stop_normal(harness, event)) {
         acked = ack_hook(db, socket, pane, record, event->loop, now);
         ok = acked >= 0;
@@ -4268,67 +4267,6 @@ static int wake_sec(void) {
 
 /* A wake that no hook event answered within wake_sec(): that agent's hook is broken or gone. It does not have hooks until
  * its next prompt event, so its mail takes the 0.3.0 path (full envelope). */
-static void hooks_expire(sqlite3 *db) {
-    kb_mail_reconcile(db, time(NULL), wake_sec());
-}
-
-/* Mail of `pane` presented three times without delivery is stalled: nothing more is typed or attached for it, it stays on the
- * addressee's board, and its sender gets one mail. A mail staged in the current turn is not stalled until the turn is over. */
-static void stall_overdue(sqlite3 *db, const char *socket, const char *pane) {
-    sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(db, "SELECT mail.post, mail.name, posts.sender, mail.from_pane, mail.from_scope, posts.scope FROM mail JOIN posts ON posts.rowid=mail.post "
-                               "WHERE mail.pane=?1 AND mail.socket=?2 AND mail.socket!='' AND mail.state='pending' AND mail.delivered=0 AND mail.shown>=3", -1, &st, NULL) != SQLITE_OK) return;
-    sqlite3_bind_text(st, 1, pane, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 2, socket, -1, SQLITE_TRANSIENT);
-    json_object *rows = json_object_new_array();
-    while (sqlite3_step(st) == SQLITE_ROW) {
-        json_object *r = json_object_new_array();
-        json_object_array_add(r, json_object_new_int64(sqlite3_column_int64(st, 0)));
-        for (int i = 1; i <= 5; i++) json_object_array_add(r, json_object_new_string((const char *)sqlite3_column_text(st, i)));
-        json_object_array_add(rows, r);
-    }
-    sqlite3_finalize(st);
-    int noticed = 0;
-    for (size_t i = 0; i < json_object_array_length(rows); i++) {
-        json_object *r = json_object_array_get_idx(rows, i);
-        long long id = json_object_get_int64(json_object_array_get_idx(r, 0));
-        const char *name = json_object_get_string(json_object_array_get_idx(r, 1)), *sender = json_object_get_string(json_object_array_get_idx(r, 2)),
-                   *from_pane = json_object_get_string(json_object_array_get_idx(r, 3)), *from_scope = json_object_get_string(json_object_array_get_idx(r, 4)),
-                   *scope = json_object_get_string(json_object_array_get_idx(r, 5));
-        /* A committed third paste may still be in progress. */
-        char *err = NULL;
-        int lock = lock_mail(socket, id, LOCK_NB, &err);
-        free(err);
-        if (lock < 0) continue;
-        /* Publish the stall and its notice together, so a failed notice can be retried. */
-        if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
-            close(lock);
-            continue;
-        }
-        st = NULL;
-        int mine = 0;
-        if (sqlite3_prepare_v2(db, "UPDATE mail SET state='stalled' WHERE post=?1 AND state='pending' AND shown>=3 AND delivered=0", -1, &st, NULL) == SQLITE_OK) {
-            sqlite3_bind_int64(st, 1, id);
-            mine = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
-        }
-        sqlite3_finalize(st);
-        long long notice = 0;
-        if (mine) {
-            char *text = fmt("undelivered after 3 attempts: %lld to %s; recipient can call board id=%lld", id, name, id);
-            char *body = fmt("for %s (notice):\n%s", sender, text);
-            notice = kb_mail_insert(db, *from_scope ? from_scope : scope, from_pane, sender, "cntctr",
-                                 "", body, 0, "", "", *from_pane ? socket : "");
-            free(text), free(body);
-        }
-        if (notice && sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK) noticed++;
-        else sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
-        close(lock);
-    }
-    json_object_put(rows);
-    if (noticed) notify_all();
-}
-
-/* The watcher and hook must agree on which pane can attach the row. */
 #define WAKE_MAIL \
     " FROM mail JOIN posts ON posts.rowid=mail.post JOIN hook_sessions h ON h.socket=?1 AND h.pane=?2 WHERE " \
     KB_MAIL_ATTACHED("mail", "?1", "?2", "h.server_start") " AND mail.delivered=0"
@@ -4431,76 +4369,17 @@ static int route_mail(const char *pane, const char *name, const char *scope, con
     return result;
 }
 
-/* Claude Code runs no Stop when the user cancels a turn or the API fails, so mail staged in that turn would stay staged. When
- * mail of this agent is staged, no hook event came for wake_sec() and the screen reads idle, the turn is over: the mail goes back
- * to pending and the session reads idle (as after a Stop). It counts as a presentation that ended without delivery: its count
- * stands, and the third one stalls the mail and tells its sender, as after an error Stop. */
-static void release_unended(sqlite3 *db, const char *socket, const char *pane, const char *scope) {
-    struct hook_row r;
-    time_t now = time(NULL);
-    if (!*socket || !hook_row_get(db, socket, pane, &r) || r.broken || r.at > now - wake_sec()) return;
-    const char *sql = "SELECT 1" SCOPED_WAKE_MAIL " AND mail.state='staged' AND mail.lease_until=0 LIMIT 1";
+/* A reservation can charge only the oldest eligible row for this pane. */
+static void wake_pending(sqlite3 *db, const char *socket, const char *pane, const char *name, const char *scope) {
     sqlite3_stmt *st = NULL;
-    int staged = 0;
-    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
+    long long mail = 0;
+    if (sqlite3_prepare_v2(db, "SELECT mail.post" SCOPED_WAKE_MAIL " AND " WAKE_ELIGIBLE
+                               " ORDER BY mail.post LIMIT 1", -1, &st, NULL) == SQLITE_OK) {
         bind_wake_owner(st, socket, pane, scope);
-        staged = sqlite3_step(st) == SQLITE_ROW;
+        if (sqlite3_step(st) == SQLITE_ROW) mail = sqlite3_column_int64(st, 0);
     }
-    sqlite3_finalize(st);
-    if (!staged) return;   /* caller: wake_pending, reached only for a pane has_hooks accepted, so a live 0.4.0 server serves it */
-    {   /* only an agent cntctr spawned: a user's own or leader session is never typed into after a cancelled turn (its next prompt event re-pends the mail) */
-        char *parent = NULL;
-        int worker = TMUX(NULL, &parent, "show", "-pqv", "-t", pane, "@cntctr_parent") == 0 && *parent;
-        free(parent);
-        if (!worker) return;
-    }
-    char *tail = pane_tail(pane);
-    enum pstate on_screen = pane_state_screen(tail, NULL);
-    free(tail);
-    if (on_screen != P_IDLE) return;
-    /* the session row is the claim: an event that came meanwhile changed `at`, and then nothing is released; claim and release are one transaction */
-    if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) return;
-    st = NULL;
-    int mine = 0;
-    if (sqlite3_prepare_v2(db, "UPDATE hook_sessions SET last_event='Stop', stop_blocked=0, at=?3, event_seq=event_seq+1 WHERE socket=?1 AND pane=?2 AND at=?4 AND event_seq=?5 AND generation=?6", -1, &st, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, socket, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, 2, pane, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(st, 3, now);
-        sqlite3_bind_int64(st, 4, r.at);
-        sqlite3_bind_int64(st, 5, r.seq);
-        sqlite3_bind_text(st, 6, r.generation, -1, SQLITE_TRANSIENT);
-        mine = sqlite3_step(st) == SQLITE_DONE && sqlite3_changes(db) == 1;
-    }
-    sqlite3_finalize(st);
-    if (!mine) { sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL); return; }
-    sql = "UPDATE mail SET state='pending' WHERE post IN (SELECT mail.post" SCOPED_WAKE_MAIL " AND mail.state='staged' AND mail.lease_until=0)";
-    st = NULL;
-    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) == SQLITE_OK) {
-        bind_wake_owner(st, socket, pane, scope);
-        sqlite3_step(st);
-    }
-    sqlite3_finalize(st);
-    if (sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {   /* not released: end the transaction here, the next pass tries again */
-        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
-        return;
-    }
-    stall_overdue(db, socket, pane);
-}
-
-/* Wake the oldest eligible row. Staged rows still need idle-turn recovery. */
-static int wake_pending(sqlite3 *db, const char *socket, const char *pane, const char *name, const char *scope) {
-    release_unended(db, socket, pane, scope);
-    const char *sql = "SELECT CASE WHEN mail.state='pending' THEN mail.post ELSE 0 END"
-        SCOPED_WAKE_MAIL " AND ((" WAKE_ELIGIBLE ") OR mail.state='staged')"
-        " ORDER BY (mail.state='pending') DESC, mail.post LIMIT 1";
-    sqlite3_stmt *st = NULL;
-    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) return 1;
-    bind_wake_owner(st, socket, pane, scope);
-    int step = sqlite3_step(st);
-    long long mail = step == SQLITE_ROW ? sqlite3_column_int64(st, 0) : 0;
     sqlite3_finalize(st);
     if (mail) wake_agent(db, socket, pane, name, mail, NULL);
-    return step != SQLITE_DONE;
 }
 
 /* A quiet hook could not receive a body by paste. Offer a bounded number of
@@ -4957,9 +4836,11 @@ static json_object *hook_stop(sqlite3 *db, const char *socket, const char *pane,
     if (!answer) {   /* mail still waits (after an error, or past the first Stop): the agent's own server wakes it */
         st = NULL;
         int waiting = 0;
-        if (sqlite3_prepare_v2(db, "SELECT 1 FROM mail WHERE pane=?1 AND socket=?2 AND state='pending' AND delivered=0 LIMIT 1", -1, &st, NULL) == SQLITE_OK) {
+        if (sqlite3_prepare_v2(db, "SELECT 1 FROM mail JOIN posts ON posts.rowid=mail.post WHERE " KB_MAIL_ATTACHED("mail", "?2", "?1", "?3")
+                                   " AND state='pending' AND delivered=0 LIMIT 1", -1, &st, NULL) == SQLITE_OK) {
             sqlite3_bind_text(st, 1, pane, -1, SQLITE_TRANSIENT);
             sqlite3_bind_text(st, 2, socket, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(st, 3, record->server_start);
             waiting = sqlite3_step(st) == SQLITE_ROW;
         }
         sqlite3_finalize(st);
@@ -5010,8 +4891,9 @@ static json_object *trace_snapshot(sqlite3 *db, const char *socket, const char *
         }
     }
     sqlite3_finalize(st); st = NULL;
-    if (sqlite3_prepare_v2(db, "SELECT post,state,staged_turn,presentations,socket FROM mail WHERE pane=?1 AND delivered=0 ORDER BY post", -1, &st, NULL) == SQLITE_OK) {
+    if (sqlite3_prepare_v2(db, "SELECT post,state,staged_turn,presentations,socket FROM mail WHERE pane=?1 AND socket=?2 AND delivered=0 ORDER BY post", -1, &st, NULL) == SQLITE_OK) {
         sqlite3_bind_text(st, 1, pane, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, socket, -1, SQLITE_TRANSIENT);
         while (sqlite3_step(st) == SQLITE_ROW) {
             json_object *row = json_object_new_object();
             json_object_object_add(row, "post", json_object_new_int64(sqlite3_column_int64(st, 0)));

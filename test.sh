@@ -1032,13 +1032,16 @@ u5p2_run() {
     ans=$(c_stop "$P")
     emptyans "$ans" && ok_ || bad "U7 a normal Stop with nothing else pending passes" "  got: $ans"
     same "U7 a normal Stop of the staging turn delivers" "$(mstate "$m")" "delivered/1/1"
-    # U7: reply to the mail's task id delivers
+    # U7: reply closes the task gate and Stop acknowledges its full body.
     t set -s @cntctr_from_d1000002 "$S"; t set -s @cntctr_to_d1000002 "$P"; t set -s @cntctr_sender_d1000002 u5_d1_sender
     m=$(mailput "$P" d1000002 "$(mail_text d1000002 'reply me')" 1)
     c_prompt "$P" "$(pointer "$m")" >/dev/null
     same "U7 mail to be answered is staged" "$(mstate "$m")" "staged/1/0"
     call "$P" reply '{"id":"d1000002","text":"my answer"}' >/dev/null
-    same "U7 reply to the mail's id delivers" "$(mstate "$m")" "delivered/1/1"
+    same "U7 reply leaves the lease staged until Stop" "$(mstate "$m")" "staged/1/0"
+    same "U7 reply closes the task gate" "$(sqx "$CNTCTR_DB" "SELECT answered FROM task_gate WHERE task='d1000002'")" 1
+    c_stop "$P" >/dev/null
+    same "U7 Stop after reply finishes the lease" "$(mstate "$m")" "delivered/1/1"
     # U7: board returning the body delivers
     m=$(mailput "$P" d1000003 "$(mail_text d1000003 'board me')" 1)
     c_prompt "$P" "$(pointer "$m")" >/dev/null
@@ -1277,12 +1280,13 @@ u5p2_run() {
     pending=$(mailput "$P" e1000016 "$(mail_text e1000016 'pending index mail')" 0)
     staged=$(mailput "$P" e1000017 "$(mail_text e1000017 'staged index mail')" 1)
     stalled=$(mailput "$P" e1000018 "$(mail_text e1000018 'stalled index mail')" 3)
-    sqx "$CNTCTR_DB" "UPDATE mail SET state='staged',shown=1 WHERE post=$staged;
+    sqx "$CNTCTR_DB" "UPDATE mail SET state='staged',shown=1,lease_until=strftime('%s','now')+300 WHERE post=$staged;
         UPDATE mail SET state='stalled',shown=3 WHERE post=$stalled;
         WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<205)
         INSERT INTO posts(scope,sender,text,at) SELECT '$U5_SCOPE','sender','newer than lost attempt',strftime('%s','now') FROM n;"
     out=$(txt "$(call "$P" board '{"limit":200}')")
     refute "recent board no longer lists the lost body" "$out" "index recovery preview"
+    check "recent board points to omitted mail" "$out" "board mode=mail"
     out=$(txt "$(call "$P" board '{"mode":"mail","limit":2}')")
     page_ids=$(printf '%s\n' "$out" | sed -n 's/^id=\([0-9]*\) .*/\1/p')
     same "index page one lists newest mail without gaps" "$page_ids" "$(printf '%s\n%s' "$stalled" "$staged")"
@@ -2105,15 +2109,21 @@ f6_5() {
     ans=$(c_prompt "$P" "$(pointer "$id")")
     check "F5 the prompt attaches the mail" "$(ctx_c "$ans")" "mail whose turn is cancelled"
     same "F5 the mail is staged" "$(mstate "$id")" "staged/1/0"
-    # the user cancels: no Stop comes. The screen reads idle; after the wake window the mail is pending and the line is typed again
+    # Simulate the lease expiring without a Stop, after the last event becomes stale.
+    expire_mail "$id"
+    sqx "$CNTCTR_DB" "UPDATE hook_sessions SET at=1 WHERE pane='$P'"
     wait_mstate "F5 with no Stop and an idle screen the mail is pending again and the line is typed a second time" "$id" "pending/2/0"
     lines=$(screen "$P" | grep -c '\[cntctr mail id=')   # cat shows each typed line twice
     same "F5 the pointer is on the screen twice, typed twice" "$lines" 4
     ans=$(c_prompt "$P" "$(pointer "$id")")
     same "F5 retry has the full small envelope" "$(ctx_c "$ans")" "$(sq "$CNTCTR_DB" "SELECT text FROM posts WHERE rowid=$id")"
+    expire_mail "$id"
+    sqx "$CNTCTR_DB" "UPDATE hook_sessions SET at=1 WHERE pane='$P'"
     wait_mstate "F5 again no Stop: pending, typed a third time" "$id" "pending/3/0"
     ans=$(c_prompt "$P" "$(pointer "$id")")
     same "F5 third presentation has the full small envelope" "$(ctx_c "$ans")" "$(sq "$CNTCTR_DB" "SELECT text FROM posts WHERE rowid=$id")"
+    expire_mail "$id"
+    sqx "$CNTCTR_DB" "UPDATE hook_sessions SET at=1 WHERE pane='$P'"
     wait_mstate "F5 the third presentation ended without delivery: stalled" "$id" "stalled/3/0"
     same "F5 the sender is told once" "$(notices "$id")" 1
     sleep 3

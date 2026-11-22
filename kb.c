@@ -472,10 +472,10 @@ char *kb_board(sqlite3 *db, const char *scope, const char *me, const char *pane,
     return lines(st);
 }
 
-/* Post ids ("3,7"), among the posts kb_board lists, of `me`'s undelivered mail that a hook presented: "" if none. */
+/* Ids of undelivered mail whose full text is included in the board result. */
 char *kb_board_mail(sqlite3 *db, const char *scope, const char *me, const char *pane, const char *socket, long long server_start, int limit) {
     sqlite3_stmt *st = prep(db,
-        "SELECT group_concat(post) FROM mail JOIN posts ON posts.rowid = mail.post WHERE (mail.hooked = 1 OR mail.presentations > 0) AND mail.delivered = 0"
+        "SELECT group_concat(post) FROM mail JOIN posts ON posts.rowid = mail.post WHERE mail.delivered = 0"
         " AND " KB_MAIL_FOR("mail", "?3", "?1", "?6", "?4", "?5") ""
         " AND mail.post IN (SELECT rowid FROM (SELECT rowid FROM posts WHERE scope = ?1 AND NOT EXISTS (SELECT 1 FROM mail m2 WHERE m2.post = posts.rowid"
         " AND NOT " KB_MAIL_FOR("m2", "?3", "?1", "?6", "?4", "?5") ") ORDER BY rowid DESC LIMIT ?2))");
@@ -949,12 +949,13 @@ char *kb_unread(sqlite3 *db, const char *scope, const char *me, const char *pane
     return out;
 }
 
-int kb_omitted(sqlite3 *db, const char *scope, const char *me, const char *pane, const char *socket, long long server_start, long long after, int limit) {
+int kb_omitted(sqlite3 *db, const char *scope, const char *me, const char *pane, const char *socket, long long server_start, long long after, int limit, int *mail_omitted) {
     sqlite3_stmt *st = prep(db,
-        "SELECT count(*) FROM posts WHERE scope=?1 AND rowid>?2 AND sender!=?3 "
-        "AND (EXISTS (SELECT 1 FROM mail WHERE mail.post=posts.rowid AND " KB_MAIL_FOR("mail", "?3", "?1", "?7", "?4", "?6") " AND delivered=0) "
-        "OR (at >= strftime('%s','now') - 86400 AND NOT EXISTS (SELECT 1 FROM mail WHERE mail.post=posts.rowid))) "
-        "AND rowid NOT IN (SELECT rowid FROM posts WHERE scope=?1 AND NOT EXISTS "
+        "SELECT sum(posts.rowid>?2 AND posts.sender!=?3), sum(mail.post IS NOT NULL)"
+        " FROM posts LEFT JOIN mail ON mail.post=posts.rowid WHERE posts.scope=?1 AND ("
+        " (mail.post IS NOT NULL AND mail.delivered=0 AND " KB_MAIL_FOR("mail", "?3", "?1", "?7", "?4", "?6") ")"
+        " OR (mail.post IS NULL AND posts.at >= strftime('%s','now') - 86400)) "
+        "AND posts.rowid NOT IN (SELECT rowid FROM posts WHERE scope=?1 AND NOT EXISTS "
         "(SELECT 1 FROM mail WHERE mail.post=posts.rowid AND NOT " KB_MAIL_FOR("mail", "?3", "?1", "?7", "?4", "?6") ") ORDER BY rowid DESC LIMIT ?5)");
     sqlite3_bind_text(st, 1, scope, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 2, after);
@@ -963,7 +964,9 @@ int kb_omitted(sqlite3 *db, const char *scope, const char *me, const char *pane,
     sqlite3_bind_int(st, 5, limit);
     sqlite3_bind_int64(st, 6, server_start);
     sqlite3_bind_text(st, 7, socket, -1, SQLITE_TRANSIENT);
-    int count = sqlite3_step(st) == SQLITE_ROW ? sqlite3_column_int(st, 0) : 0;
+    int row = sqlite3_step(st) == SQLITE_ROW;
+    int count = row ? sqlite3_column_int(st, 0) : 0;
+    *mail_omitted = row ? sqlite3_column_int(st, 1) : 0;
     sqlite3_finalize(st);
     return count;
 }
