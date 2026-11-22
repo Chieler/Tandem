@@ -1262,7 +1262,7 @@ u5p2_run() {
     out=$(txt "$(call "$P" board '{"mode":"mail","limit":2}')")
     page_ids=$(printf '%s\n' "$out" | sed -n 's/^id=\([0-9]*\) .*/\1/p')
     same "index page one lists newest mail without gaps" "$page_ids" "$(printf '%s\n%s' "$stalled" "$staged")"
-    check "index page one reports total and next offset" "$out" "4 total mail [more: call board mode=mail offset=2 limit=2]"
+    check "index page one reports total and next cursor" "$out" "4 total mail [more: call board mode=mail before=$staged limit=2]"
     check "index includes the stalled state and both counters" "$out" "id=$stalled sender=sender state=stalled attempts=3 presentations=3 bytes="
     same "listing staged mail does not acknowledge it" "$(mstate "$staged")" "staged/1/0"
     out=$(txt "$(call "$P" board '{"mode":"mail","limit":2,"offset":2}')")
@@ -1272,6 +1272,12 @@ u5p2_run() {
     check "index entry exposes delivered ID and byte count with one-line excerpt" "$out" "id=$m sender=sender state=delivered attempts=1 presentations=1 bytes=${#body} | index recovery preview..."
     refute "index omits the remaining body" "$out" "body available only by ID"
     same "index output has one line per entry and one footer" "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" 3
+    mailput "$P" e1000019 "$(mail_text e1000019 'arrived between index pages')" 0 >/dev/null
+    ans=$(call "$P" board "$(printf '{"mode":"mail","limit":2,"before":%s}' "$staged")")
+    out=$(txt "$ans")
+    page_ids=$(printf '%s\n' "$out" | sed -n 's/^id=\([0-9]*\) .*/\1/p')
+    same "cursor page neither repeats nor skips after insertion" "$page_ids" "$(printf '%s\n%s' "$pending" "$m")"
+    same "cursor footer counts new mail without advertising an empty page" "$(printf '%s\n' "$out" | tail -n 1)" "5 total mail"
     same "exact lookup recovers the entire lost body by listed ID" "$(txt "$(call "$P" board "{\"id\":$m}")")" "$body"
     same "index leaves pending mail pending" "$(mstate "$pending")" "pending/0/0"
 

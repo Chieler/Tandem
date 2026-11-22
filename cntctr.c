@@ -2383,9 +2383,16 @@ static size_t index_field(char *text, size_t limit) {
 static int board_index(sqlite3 *db, const char *scope, json_object *args, int limit, char **res) {
     json_object *v;
     long long offset = 0;
-    if (json_object_object_get_ex(args, "offset", &v) &&
+    long long before = 0;
+    int has_offset = json_object_object_get_ex(args, "offset", &v);
+    if (has_offset &&
         (json_object_get_type(v) != json_type_int || (offset = json_object_get_int64(v)) < 0))
         return fail(res, fmt("board offset must be a nonnegative integer"));
+    if (json_object_object_get_ex(args, "before", &v)) {
+        if (json_object_get_type(v) != json_type_int || (before = json_object_get_int64(v)) <= 0)
+            return fail(res, fmt("board before must be a positive mail ID"));
+        if (has_offset) return fail(res, fmt("board before and offset are mutually exclusive"));
+    }
 
     #define INDEX_MAIL " FROM mail JOIN posts ON posts.rowid=mail.post WHERE " \
         KB_MAIL_FOR("mail", "?1", "?2", "?5", "?3", "?4")
@@ -2403,17 +2410,20 @@ static int board_index(sqlite3 *db, const char *scope, json_object *args, int li
     st = NULL;
 
     sqlite3_str *lines = sqlite3_str_new(db);
-    int listed = 0;
+    int listed = 0, more = 0;
+    long long last = 0;
     if (rc == SQLITE_ROW)
         rc = sqlite3_prepare_v2(db, "SELECT mail.post, substr(posts.sender,1,97), mail.state, mail.shown, "
                                 "mail.presentations, length(CAST(posts.text AS BLOB)), substr(CAST(posts.text AS BLOB),1,512)"
-                                INDEX_MAIL " ORDER BY mail.post DESC LIMIT ?6 OFFSET ?7", -1, &st, NULL);
+                                INDEX_MAIL " AND (?7 IS NULL OR mail.post<?7) ORDER BY mail.post DESC LIMIT ?6 OFFSET ?8", -1, &st, NULL);
     #undef INDEX_MAIL
     if (rc == SQLITE_OK) {
         bind_mail_recipient(st, scope, caller_name, self_socket, caller_pane);
-        sqlite3_bind_int(st, 6, limit);
-        sqlite3_bind_int64(st, 7, offset);
+        sqlite3_bind_int(st, 6, limit + 1);
+        if (before) sqlite3_bind_int64(st, 7, before);
+        sqlite3_bind_int64(st, 8, offset);
         while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+            if (listed == limit) { more = 1; break; }
             char sender[389], preview[513] = "";
             snprintf(sender, sizeof sender, "%s", sqlite3_column_text(st, 1));
             int bytes = sqlite3_column_bytes(st, 6);
@@ -2430,8 +2440,9 @@ static int board_index(sqlite3 *db, const char *scope, json_object *args, int li
             long long size = sqlite3_column_int64(st, 5);
             size_t prefix = (size_t)(body - preview) + index_field(body, 96);
             index_field(sender, 96);
+            last = sqlite3_column_int64(st, 0);
             sqlite3_str_appendf(lines, "id=%lld sender=%s state=%s attempts=%d presentations=%d bytes=%lld | %s%s\n",
-                                (long long)sqlite3_column_int64(st, 0), sender, sqlite3_column_text(st, 2),
+                last, sender, sqlite3_column_text(st, 2),
                                 sqlite3_column_int(st, 3), sqlite3_column_int(st, 4), size, body,
                                 prefix < (unsigned long long)size ? "..." : "");
             listed++;
@@ -2439,10 +2450,9 @@ static int board_index(sqlite3 *db, const char *scope, json_object *args, int li
     }
     sqlite3_finalize(st);
     sqlite3_str_appendf(lines, "%lld total mail", total);
-    if (listed && offset + listed < total)
-        sqlite3_str_appendf(lines, " [more: call board mode=mail offset=%lld limit=%d]", offset + listed, limit);
+    if (more) sqlite3_str_appendf(lines, " [more: call board mode=mail before=%lld limit=%d]", last, limit);
     char *out = sqlite3_str_finish(lines);
-    if (rc != SQLITE_DONE || sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK || !out) {
+    if ((rc != SQLITE_DONE && !more) || sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK || !out) {
         sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
         sqlite3_free(out);
         return fail(res, fmt("cannot read mail index"));
@@ -3313,8 +3323,8 @@ static const char TOOLS[] =
     "urgent=true also types it into every agent's pane now.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"},\"urgent\":{\"type\":\"boolean\"},"
     "\"from\":{\"type\":\"string\",\"description\":\"Who you are, if this fails with a pane error (Codex): your agent name, or $TMUX_PANE\"}},\"required\":[\"text\"]}},"
-    "{\"name\":\"board\",\"description\":\"Posts, mail by id, or mode=mail index.\","
-    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},\"offset\":{\"type\":\"integer\"},\"limit\":{\"type\":\"integer\"},\"mode\":{\"type\":\"string\",\"enum\":[\"mail\"]}," KFROM "}}}"
+    "{\"name\":\"board\",\"description\":\"Posts, mail by id, or mode=mail.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"},\"offset\":{\"type\":\"integer\"},\"limit\":{\"type\":\"integer\"},\"before\":{\"type\":\"integer\"},\"mode\":{\"type\":\"string\",\"enum\":[\"mail\"]}," KFROM "}}}"
     ",{\"name\":\"use\",\"description\":\"Run a fleet tool by name with arguments. Needed for drafts and from Codex (pass from). Published tools also appear directly on clients that support list_changed.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"tool\":{\"type\":\"string\"},\"args\":{\"type\":\"object\"}," KFROM "},"
     "\"required\":[\"tool\"]}}"
