@@ -4364,7 +4364,7 @@ static char *spill_file(const char *text) {
 /* First `head` and last `tail` bytes of `text` (cut on character boundaries) and the file that holds all of it. */
 static char *excerpt(const char *text, const char *path, size_t head, size_t tail) {
     size_t len = strlen(text), h = head < len ? head : len, t = tail < len - h ? tail : len - h;
-    while (h > 0 && (text[h] & 0xC0) == 0x80) h--;
+    h = utf8_prefix(text, h);
     size_t from = len - t;
     while (from < len && (text[from] & 0xC0) == 0x80) from++;
     return fmt("%.*s\n[... %zu bytes left out; the whole mail is in the file %s ...]\n%s", (int)h, text, from - h, path, text + from);
@@ -4380,8 +4380,32 @@ static int answer_fits(const char *harness, const char *event, enum hook_answer_
     return fits;
 }
 
-static char *mail_piece(const struct mrow *r, const char *body) {
-    return r->repeat ? fmt("[cntctr mail id=%lld] (may be a repeat); call board id=%lld for the full mail", r->id, r->id) : strdup(body);
+/* Separate envelope markers from the bytes between them. Plain board mail has no markers. */
+static void mail_body(const char *text, const char **start, const char **end) {
+    *start = text;
+    *end = text + strlen(text);
+    const char *first = strchr(text, '\n'), *last = strrchr(text, '\n');
+    if (first && last > first && !strncmp(text, "[cntctr from=", 13) &&
+        !strncmp(last + 1, "[cntctr end id=", 15) && (*end)[-1] == ']') {
+        *start = first + 1;
+        *end = last;
+    }
+}
+
+static char *mail_excerpt(const struct mrow *r, const char *start, const char *end, size_t limit) {
+    size_t len = (size_t)(end - start);
+    if (len <= limit) return strdup(r->text);
+    size_t head = utf8_prefix(start, limit);
+    return fmt("%.*s%.*s%s\n[%zu more bytes omitted: call board id=%lld]",
+               (int)(start - r->text), r->text, (int)head, start, end, len - head, r->id);
+}
+
+static char *mail_piece(const struct mrow *r) {
+    if (!r->repeat) return strdup(r->text);
+    const char *start, *end;
+    mail_body(r->text, &start, &end);
+    if (end - start <= 1024) return strdup(r->text);
+    return mail_excerpt(r, start, end, 400);
 }
 
 /* The text for a hook answer: as many of the rows (oldest first) as the harness budget takes, then `extra`.
@@ -4391,20 +4415,23 @@ static char *fit_mail(const char *harness, const char *event, enum hook_answer_k
     char *out = strdup("");
     *taken = 0;
     for (int i = 0; i < n; i++) {
-        char *piece = mail_piece(&rows[i], rows[i].text);
+        char *piece = mail_piece(&rows[i]);
         char *cand = fmt("%s%s%s", out, *out ? "\n\n" : "", piece), *full = extra ? fmt("%s\n\n%s", cand, extra) : strdup(cand);
         int fits = answer_fits(harness, event, kind, full);
         free(full), free(piece);
-        if (!fits && i == 0) {   /* alone it is too big: the store keeps the body, a file holds it, the context holds its ends */
+        if (!fits && i == 0 && !rows[i].repeat) {   /* alone it is too big: the store keeps the body, a file holds it, the context holds its ends */
             free(cand);
             cand = NULL;
             char *path = spill_file(rows[i].text);
-            for (size_t head = 4096, tail = 2048; path && !cand && head >= 64; head /= 2, tail /= 2) {
-                char *cut = excerpt(rows[i].text, path, head, tail), *p2 = mail_piece(&rows[i], cut);
+            const char *start, *end;
+            mail_body(rows[i].text, &start, &end);
+            for (size_t head = path ? 4096 : 400; !cand && head >= 64; head /= 2) {
+                char *p2 = path ? excerpt(rows[i].text, path, head, head / 2)
+                                : mail_excerpt(&rows[i], start, end, head);
                 full = extra ? fmt("%s\n\n%s", p2, extra) : strdup(p2);
                 if (answer_fits(harness, event, kind, full)) cand = p2;
                 else free(p2);
-                free(full), free(cut);
+                free(full);
             }
             free(path);
             fits = cand != NULL;
@@ -4447,11 +4474,10 @@ static int pending_rows(sqlite3 *db, const char *socket, const char *pane, long 
 static void stage_rows(sqlite3 *db, const struct mrow *rows, int taken, long long own, const char *token) {
     for (int i = 0; i < taken; i++) {
         sqlite3_stmt *st = NULL;
-        if (sqlite3_prepare_v2(db, "UPDATE mail SET state='staged', hooked=1, staged_turn=?2, presentations=presentations+?3, shown=shown+?4 WHERE post=?1 AND state='pending'", -1, &st, NULL) != SQLITE_OK) continue;
+        if (sqlite3_prepare_v2(db, "UPDATE mail SET state='staged', hooked=1, staged_turn=?2, presentations=presentations+?3, shown=shown+1 WHERE post=?1 AND state='pending'", -1, &st, NULL) != SQLITE_OK) continue;
         sqlite3_bind_int64(st, 1, rows[i].id);
         sqlite3_bind_text(st, 2, token, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(st, 3, rows[i].id != own);
-        sqlite3_bind_int(st, 4, !rows[i].repeat);   /* repeat currently emits a pointer without body text */
         sqlite3_step(st);
         sqlite3_finalize(st);
     }

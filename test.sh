@@ -1058,7 +1058,7 @@ u5p2_run() {
     a_stop "$Q" NO_TOOL_CALL >/dev/null
     same "U7 an agy Stop that ends normally delivers" "$(mstate "$m2")" "delivered/1/1"
 
-    # U8: staged mail and a new prompt with no Stop in between: pending again; shown again with a repeat note
+    # U8: a new prompt with no Stop releases staged mail for another presentation.
     P=$(hk_agent claude u5_d3)
     m=$(mailput "$P" d3000001 "$(mail_text d3000001 'maybe seen mail')" 1)
     c_prompt "$P" "$(pointer "$m")" >/dev/null
@@ -1067,9 +1067,7 @@ u5p2_run() {
     same "U8 a new turn with no delivery makes staged mail pending again" "$(mstate "$m")" "pending/1/0"
     sqx "$CNTCTR_DB" "UPDATE mail SET presentations=2 WHERE post=$m" # a second line was typed for it
     ans=$(c_prompt "$P" "$(pointer "$m")")
-    refute "U8 repeat omits the full body" "$(ctx_c "$ans")" "maybe seen mail"
-    check "U8 repeat points to board" "$(ctx_c "$ans")" "board"
-    check "U8 and says it may be a repeat" "$(ctx_c "$ans")" "(may be a repeat)"
+    same "U8 small repeat has the full envelope" "$(ctx_c "$ans")" "$(mail_text d3000001 'maybe seen mail')"
     same "U8 the repeat is staged, still counted twice" "$(mstate "$m")" "staged/2/0"
     c_stop "$P" >/dev/null
     same "U8 the repeat is delivered by the Stop" "$(mstate "$m")" "delivered/2/1"
@@ -1097,9 +1095,45 @@ u5p2_run() {
     check "blocked Stop first shows the body" "$(printf '%s' "$ans" | jq -r '.reason')" "blocked-stop body"
     a_stop "$Q" ERROR >/dev/null
     ans=$(a_pre "$Q" 0 "$(pointer "$m")")
-    refute "blocked Stop does not show the body twice" "$(ctx_a "$ans")" "blocked-stop body"
-    same "second hook presentation is a repeat" "$(ctx_a "$ans")" "[cntctr mail id=$m] (may be a repeat); call board id=$m for the full mail"
-    same "compact repeat has no second body" "$(sq "$CNTCTR_DB" "SELECT shown FROM mail WHERE post=$m")" 1
+    same "second hook presentation repeats the full small envelope" "$(ctx_a "$ans")" "$(mail_text e1000002 'blocked-stop body')"
+    same "second hook body increments shown" "$(sq "$CNTCTR_DB" "SELECT shown FROM mail WHERE post=$m")" 2
+
+    # Repeat size is measured inside the markers before JSON escaping.
+    local prefix tail body expected
+    P=$(hk_agent claude repeat_large)
+    prefix=$(head -c 399 /dev/zero | tr '\0' '"')
+    tail=$(head -c 700 /dev/zero | tr '\0' x)
+    body=$(printf '[cntctr from=sender id=e1000003]\n%sé%s\n[cntctr end id=e1000003]' "$prefix" "$tail")
+    m=$(mailput "$P" e1000003 "$body" 1)
+    ans=$(c_prompt "$P" "$(pointer "$m")")
+    same "first large presentation includes the entire envelope" "$(ctx_c "$ans")" "$body"
+    ans=$(c_prompt "$P" "$(pointer "$m")")
+    expected=$(printf '[cntctr from=sender id=e1000003]\n%s\n[cntctr end id=e1000003]\n[702 more bytes omitted: call board id=%s]' "$prefix" "$m")
+    same "large repeat ends on a UTF-8 boundary with exact omitted bytes" "$(ctx_c "$ans")" "$expected"
+    check "serialized quoted excerpt fits Claude's 8192-byte limit" "$((${#ans} <= 8192))" 1
+    c_stop "$P" >/dev/null
+
+    P=$(hk_agent claude repeat_limit)
+    body=$(head -c 1024 /dev/zero | tr '\0' x)
+    m=$(mailput "$P" e1000004 "$body" 1)
+    c_prompt "$P" "$(pointer "$m")" >/dev/null
+    ans=$(c_prompt "$P" "$(pointer "$m")")
+    same "1024-byte repeat stays full" "$(ctx_c "$ans")" "$body"
+    c_stop "$P" >/dev/null
+
+    P=$(hk_agent claude spill_unavailable)
+    tail=$(head -c 10000 /dev/zero | tr '\0' x)
+    body=$(printf '[cntctr from=sender id=e1000005]\n%s\n[cntctr end id=e1000005]' "$tail")
+    m=$(mailput "$P" e1000005 "$body" 1)
+    local mail_cache="$HOME/.cache/cntctr/mail"
+    mkdir -p "$mail_cache"
+    mv "$mail_cache" "$mail_cache.saved"
+    touch "$mail_cache"
+    ans=$(c_prompt "$P" "$(pointer "$m")")
+    rm "$mail_cache"
+    mv "$mail_cache.saved" "$mail_cache"
+    expected=$(printf '[cntctr from=sender id=e1000005]\n%s\n[cntctr end id=e1000005]\n[9600 more bytes omitted: call board id=%s]' "${tail:0:400}" "$m")
+    same "spill failure still gives both markers and a working lookup" "$(ctx_c "$ans")" "$expected"
 
     # An exact mail lookup must work after the mail falls outside the recent board window.
     P=$(hk_agent claude lookup_owner)
@@ -1348,12 +1382,7 @@ u5p4_run() {
     wait_mstate "U11 the first line is typed and counted" "$id" "pending/1/0"
     for i in 1 2 3; do
         ans=$(a_pre "$Q" 0 "$(pointer "$id")")
-        if [ "$i" -eq 1 ]; then
-            check "U11 first presentation attaches the mail" "$(ctx_a "$ans")" "mail that is never delivered"
-        else
-            refute "U11 repeat $i omits the body" "$(ctx_a "$ans")" "mail that is never delivered"
-            check "U11 repeat $i points to board" "$(ctx_a "$ans")" "[cntctr mail id=$id] (may be a repeat); call board"
-        fi
+        same "U11 presentation $i has the full small envelope" "$(ctx_a "$ans")" "$(sq "$CNTCTR_DB" "SELECT text FROM posts WHERE rowid=$id")"
         same "U11 presentation $i is staged" "$(mstate "$id")" "staged/$i/0"
         a_stop "$Q" ERROR >/dev/null
         if [ "$i" -lt 3 ]; then wait_mstate "U11 after an error Stop the retry thread types the line again" "$id" "pending/$((i + 1))/0"; fi
@@ -1708,12 +1737,10 @@ f6_5() {
     lines=$(screen "$P" | grep -c '\[cntctr mail id=')   # cat shows each typed line twice
     same "F5 the pointer is on the screen twice, typed twice" "$lines" 4
     ans=$(c_prompt "$P" "$(pointer "$id")")
-    refute "F5 release does not repeat the full body" "$(ctx_c "$ans")" "mail whose turn is cancelled"
-    check "F5 release points to the stored mail" "$(ctx_c "$ans")" "board"
+    same "F5 retry has the full small envelope" "$(ctx_c "$ans")" "$(sq "$CNTCTR_DB" "SELECT text FROM posts WHERE rowid=$id")"
     wait_mstate "F5 again no Stop: pending, typed a third time" "$id" "pending/3/0"
     ans=$(c_prompt "$P" "$(pointer "$id")")
-    refute "F5 third presentation omits the full body" "$(ctx_c "$ans")" "mail whose turn is cancelled"
-    check "F5 third presentation points to the stored mail" "$(ctx_c "$ans")" "board"
+    same "F5 third presentation has the full small envelope" "$(ctx_c "$ans")" "$(sq "$CNTCTR_DB" "SELECT text FROM posts WHERE rowid=$id")"
     wait_mstate "F5 the third presentation ended without delivery: stalled" "$id" "stalled/3/0"
     same "F5 the sender is told once" "$(notices "$id")" 1
     sleep 3
