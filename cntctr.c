@@ -4571,6 +4571,9 @@ static int pending_rows(sqlite3 *db, const char *socket, const char *pane, long 
 }
 
 /* Mark rows[0..taken) staged in this turn. A mail with no pointer line of its own is counted now. */
+/* The staging commit records an attempt. A dropped hook result still spends
+ * one of three attempts because no adapter reports receipt. Stop acknowledges
+ * a full payload staged in its turn. The stall notice gives the board lookup ID. */
 static int stage_rows(sqlite3 *db, const struct mrow *rows, int taken, long long own, const char *token) {
     if (!taken) return 1;
     sqlite3_stmt *st = NULL;
