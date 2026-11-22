@@ -25,6 +25,20 @@ if [ -n "\$U24_CAPTURE_LOG" ]; then
         fi
     done
 fi
+if [ -n "\${CNTCTR_TEST_MAIL_ENTER:-}" ]; then
+    case " \$* " in
+        *" paste-buffer -d "*)
+            if [ "\$CNTCTR_TEST_MAIL_WHEN" = after ]; then "$REAL_TMUX" "\$@" || exit \$?; fi
+            printf 'ready\n' > "\$CNTCTR_TEST_MAIL_ENTER.ready"
+            n=0
+            while [ -e "\$CNTCTR_TEST_MAIL_ENTER" ] && [ "\$n" -lt 500 ]; do
+                sleep 0.01
+                n=\$((n+1))
+            done
+            if [ "\$CNTCTR_TEST_MAIL_WHEN" = after ]; then exit 0; fi
+            ;;
+    esac
+fi
 exec "$REAL_TMUX" "\$@"
 EOF
 chmod +x "$TMPD/bin/tmux"
@@ -2378,10 +2392,11 @@ f8_4() {
 
 # W1-3: hold a recorded Stop while the same harness records the next turn.
 f8_5() {
-    local P old id ans ready
+    local P old id ans ready old_claim new_claim
     P=$(hk_agent claude late_stop)
     old=$(mailput "$P" f8000004 "$(mail_text f8000004 'mail for turn N')" 1)
     c_prompt "$P" "$(pointer "$old")" >/dev/null
+    old_claim=$(sqx "$CNTCTR_DB" "SELECT shown||'/'||staged_turn FROM mail WHERE post=$old")
     id=$(mailput "$P" f8000005 "$(mail_text f8000005 'mail for turn N plus one')" 1)
     printf '%s' '{"session_id":"S1","hook_event_name":"Stop","stop_hook_active":false}' > "$TMPD/late_stop_event"
     touch "$TMPD/hold_stop"
@@ -2390,12 +2405,17 @@ f8_5() {
     waitfor_hook_pause "$TMPD/hold_stop.ready"
     ans=$(c_prompt "$P" "$(pointer "$id")")
     same "newer prompt stages the exact mail body" "$(ctx_c "$ans")" "$(mail_text f8000005 'mail for turn N plus one')"
+    new_claim=$(sqx "$CNTCTR_DB" "SELECT shown||'/'||staged_turn FROM mail WHERE post=$id")
     rm -f "$TMPD/hold_stop"
     waitfor_hook_pause "$TMPD/late_stop_answer"
     ans=$(cat "$TMPD/late_stop_answer")
     emptyans "$ans" && ok_ || bad "displaced Stop returns a neutral answer" "  got: $ans"
     same "old Stop acknowledges exactly mail staged in its turn" "$(mstate "$old")" "delivered/1/1"
     same "old Stop cannot acknowledge mail staged in the newer turn" "$(mstate "$id")" "staged/1/0"
+    same "old Stop finishes its exact attempt and token" \
+        "$(sqx "$CNTCTR_DB" "SELECT shown||'/'||staged_turn FROM mail WHERE post=$old")" "$old_claim"
+    same "superseded Stop preserves the newer attempt and token" \
+        "$(sqx "$CNTCTR_DB" "SELECT shown||'/'||staged_turn FROM mail WHERE post=$id")" "$new_claim"
     c_stop "$P" >/dev/null
     same "Stop of the newer turn acknowledges its own mail" "$(mstate "$id")" "delivered/1/1"
 
@@ -2424,12 +2444,170 @@ waitfor_hook_pause() {
     bad "hook synchronization timed out for $1"
 }
 
+wait_for_mail_enter() {
+    local i
+    for i in $(seq 160); do
+        [ -s "$1" ] && return
+        sleep 0.05
+    done
+    bad "tmux Enter did not reach the lease barrier $1"
+}
+
+# Attach a pointer while its injector is still returning from tmux, in both modes.
+lease_early_prompt() {
+    local S P first id kind bar job out ctx
+    S=$(newpane lease_waker)
+    for kind in healthy quiet; do
+        if [ "$kind" = quiet ]; then
+            P=$(hk_agent claude lease_quiet /bin/cat)
+            sqx "$CNTCTR_DB" "UPDATE hook_sessions SET broken=1 WHERE pane='$P'"
+        else
+            P=$(hk_agent claude lease_healthy)
+        fi
+        first=$(mailput "$P" l0000001 "$(mail_text l0000001 "$kind first row")" 0)
+        bar="$TMPD/$kind-enter"
+        : > "$bar"
+        CNTCTR_TEST_MAIL_ENTER="$bar" CNTCTR_TEST_MAIL_WHEN=after \
+            call "$S" send "{\"to\":\"lease_$kind\",\"text\":\"$kind pointer body\"}" > "$bar.out" &
+        job=$!
+        wait_for_mail_enter "$bar.ready"
+        id=$(sqx "$CNTCTR_DB" "SELECT max(post) FROM mail WHERE pane='$P'")
+        same "$kind wake charges before returning from tmux" \
+            "$(sqx "$CNTCTR_DB" "SELECT wake_attempts||'/'||shown FROM mail WHERE post=$id")" 1/0
+        same "$kind wake reserves the pane once" "$(sqx "$CNTCTR_DB" "SELECT wake_reserved FROM hook_sessions WHERE pane='$P'")" 1
+        out=$(c_prompt "$P" "$(pointer "$id")")
+        ctx=$(ctx_c "$out")
+        check "$kind prompt claims the wake row" "$ctx" "$kind pointer body"
+        check "$kind prompt also claims the older row" "$ctx" "$kind first row"
+        same "$kind prompt consumes reservation at claim" "$(sqx "$CNTCTR_DB" "SELECT wake_reserved FROM hook_sessions WHERE pane='$P'")" 0
+        same "$kind older row spends no wake charge" "$(sqx "$CNTCTR_DB" "SELECT wake_attempts FROM mail WHERE post=$first")" 0
+        rm -f "$bar"
+        wait "$job" || bad "$kind wake sender failed"
+        c_stop "$P" >/dev/null
+        same "$kind Stop acknowledges both charged rows" \
+            "$(sqx "$CNTCTR_DB" "SELECT count(*) FROM mail WHERE post IN ($first,$id) AND shown=1 AND state='delivered'")" 2
+    done
+}
+
+lease_late_terminal() {
+    local S P bar job id out
+    S=$(newpane lease_terminal_sender); P=$(newpane lease_late)
+    bar="$TMPD/terminal-enter"
+    : > "$bar"
+    CNTCTR_TEST_MAIL_ENTER="$bar" CNTCTR_TEST_MAIL_WHEN=before \
+        call "$S" send '{"to":"lease_late","text":"late submission lease body"}' > "$bar.out" &
+    job=$!
+    wait_for_mail_enter "$bar.ready"
+    id=$(sqx "$CNTCTR_DB" "SELECT max(post) FROM mail WHERE pane='$P'")
+    same "terminal attempt is durable before Enter" \
+        "$(sqx "$CNTCTR_DB" "SELECT state||'/'||shown||'/'||(lease_until>strftime('%s','now')) FROM mail WHERE post=$id")" staged/1/1
+    expire_mail "$id"
+    c_start "$P" >/dev/null
+    out=$(c_prompt "$P" "$(pointer "$id")")
+    emptyans "$out" && ok_ || bad "terminal row lock protects the paused emitter" "  got: $out"
+    rm -f "$bar"
+    wait "$job" || bad "paused terminal sender failed"
+    check "late Enter finishes submitting the body" "$(screen "$P")" "late submission lease body"
+    check "sender sees the expired submission left on board" "$(txt "$(cat "$bar.out")")" "on board"
+    same "late terminal submission cannot finish an expired claim" \
+        "$(sqx "$CNTCTR_DB" "SELECT state||'/'||shown FROM mail WHERE post=$id")" pending/1
+    out=$(c_prompt "$P" "$(pointer "$id")")
+    check "next hook can claim the re-pended terminal body" "$(ctx_c "$out")" "late submission lease body"
+    c_stop "$P" >/dev/null
+    same "the new attempt alone finishes the row" \
+        "$(sqx "$CNTCTR_DB" "SELECT state||'/'||shown FROM mail WHERE post=$id")" delivered/2
+}
+
+lease_failed_stop() {
+    local P first id event row out q
+    P=$(hk_agent claude lease_failed_stop)
+    first=$(mailput "$P" l0000012 "$(mail_text l0000012 'first Stop claim')" 0)
+    id=$(mailput "$P" l0000002 "$(mail_text l0000002 'rollback owned Stop claim')" 1)
+    c_prompt "$P" "$(pointer "$id")" >/dev/null
+    q="SELECT generation||'/'||turn||'/'||event_seq||'/'||last_event||'/'||at FROM hook_sessions WHERE pane='$P'"
+    event=$(sqx "$CNTCTR_DB" "$q")
+    row=$(sqx "$CNTCTR_DB" "SELECT state||'/'||shown||'/'||staged_turn||'/'||lease_until FROM mail WHERE post=$id")
+    sqx "$CNTCTR_DB" "CREATE TRIGGER fail_stop_ack BEFORE UPDATE OF delivered ON mail
+        WHEN NEW.post=$id AND NEW.delivered=1 BEGIN SELECT RAISE(ABORT,'failed Stop acknowledgement'); END"
+    out=$(c_stop "$P")
+    emptyans "$out" && ok_ || bad "failed Stop sends no decision" "  got: $out"
+    same "failed Stop rolls back its event and turn" "$(sqx "$CNTCTR_DB" "$q")" "$event"
+    same "failed Stop also rolls back the earlier acknowledgement" "$(mstate "$first")" staged/1/0
+    same "failed Stop rolls back its claim decision" \
+        "$(sqx "$CNTCTR_DB" "SELECT state||'/'||shown||'/'||staged_turn||'/'||lease_until FROM mail WHERE post=$id")" "$row"
+    sqx "$CNTCTR_DB" "DROP TRIGGER fail_stop_ack"
+    c_stop "$P" >/dev/null
+    same "retry acknowledges both original claims" "$(mstate "$first")/$(mstate "$id")" delivered/1/1/delivered/1/1
+}
+
+lease_legacy_stage() {
+    local P id db
+    P=$(hk_agent claude lease_legacy)
+    id=$(mailput "$P" l0000003 "$(mail_text l0000003 'active legacy claim')" 1)
+    c_prompt "$P" "$(pointer "$id")" >/dev/null
+    db="$TMPD/legacy-active.db"
+    sqx "$CNTCTR_DB" ".backup '$db'"
+    sqx "$db" "ALTER TABLE mail DROP COLUMN lease_until;
+        UPDATE hook_sessions SET generation='' WHERE pane='$P'; PRAGMA user_version=7"
+    same "migration keeps the active session responsive" "$(CNTCTR_DB="$db" "$BIN" hook status "$P")" yes
+    same "migration seeds the active session generation" \
+        "$(sqx "$db" "SELECT length(generation) FROM hook_sessions WHERE pane='$P'")" 32
+    same "legacy staged claim is reclaimable with its attempt intact" \
+        "$(sqx "$db" "SELECT state||'/'||shown||'/'||lease_until FROM mail WHERE post=$id")" pending/1/0
+}
+
+lease_deadlines() {
+    local S P id fifo start i out
+    S=$(newpane lease_deadline_watcher); P=$(hk_agent claude lease_deadline_target)
+    id=$(mailput "$P" l0000004 "$(mail_text l0000004 'dropped hook response near the cap')" 1)
+    sqx "$CNTCTR_DB" "UPDATE mail SET shown=2,wake_attempts=3 WHERE post=$id"
+    c_prompt "$P" "$(pointer "$id")" >/dev/null
+    same "dropping host response keeps the third attempt charged" \
+        "$(sqx "$CNTCTR_DB" "SELECT state||'/'||shown||'/'||wake_attempts FROM mail WHERE post=$id")" staged/3/3
+    start=$(date +%s)
+    sqx "$CNTCTR_DB" "UPDATE hook_sessions SET wake_reserved=1,wake_at=$((start-5)) WHERE pane='$P';
+        UPDATE mail SET pane='%99999',lease_until=$((start+3)) WHERE post=$id"
+    CNTCTR_WAKE_SEC=8 daemon_start "$S"
+    daemon_hello
+    fifo="$(realpath "${TMPDIR:-/tmp}")/cntctr-$(id -u)/tools/$DPID.fifo"
+    for i in $(seq 50); do [ -p "$fifo" ] && break; sleep 0.02; done
+    if [ -p "$fifo" ]; then
+        printf m > "$fifo"
+    else
+        bad "deadline watcher registered its FIFO"
+    fi
+    for i in $(seq 120); do
+        [ "$(sqx "$CNTCTR_DB" "SELECT state FROM mail WHERE post=$id")" = stalled ] && break
+        [ "$(date +%s)" -lt "$((start+7))" ] || break
+        sleep 0.05
+    done
+    same "early FIFO scan preserves the original wake deadline" \
+        "$(sqx "$CNTCTR_DB" "SELECT wake_reserved||'/'||broken FROM hook_sessions WHERE pane='$P'")" 0/1
+    same "watcher stalls an expired cap even with no eligible recipient" "$(mstate "$id")" stalled/1/0
+    same "lease expiry and one sender notice commit together" "$(notices "$id")" 1
+    daemon_stop
+    daemon_start "$S"
+    daemon_hello
+    same "restart cannot give the capped row another body charge" \
+        "$(sqx "$CNTCTR_DB" "SELECT state||'/'||shown FROM mail WHERE post=$id")" stalled/3
+    same "restart cannot duplicate sender notice" "$(notices "$id")" 1
+    daemon_stop
+}
+
+f8_6() {
+    lease_early_prompt
+    lease_late_terminal
+    lease_failed_stop
+    lease_legacy_stage
+    lease_deadlines
+}
+
 u5p6_run() {
     export CNTCTR_PASTE_WAIT_MS=100
     local f
     for f in ${F6:-1 2 3 4 5 6 7 8 9}; do declare -F "f6_$f" >/dev/null && "f6_$f"; done
     for f in ${F7:-1 2 3 4 5 6}; do declare -F "f7_$f" >/dev/null && "f7_$f"; done
-    for f in ${F8:-1 2 3 4 5}; do declare -F "f8_$f" >/dev/null && "f8_$f"; done
+    for f in ${F8:-1 2 3 4 5 6}; do declare -F "f8_$f" >/dev/null && "f8_$f"; done
     unset CNTCTR_PASTE_WAIT_MS
 }
 
@@ -2439,6 +2617,14 @@ u5_run() {   # U5PARTS="p3 p4" runs just those parts, in that order
     for part in ${U5PARTS:-p1 p2 p3 p4 p5 p6}; do "u5${part}_run"; done
     hk_stop
 }
+if [ "${ONLY:-}" = mail-lease ]; then
+    hk_boot
+    F6=none F7=none F8='5 6' u5p6_run
+    hk_stop
+    echo "$pass passed, $fail failed"
+    [ "$fail" -eq 0 ]; exit $?
+fi
+
 if [ "${ONLY:-}" = u5 ] || [ "${ONLY:-}" = u5p1 ] || [ "${ONLY:-}" = u5p2 ] || [ "${ONLY:-}" = u5p3 ] || [ "${ONLY:-}" = u5p4 ] || [ "${ONLY:-}" = u5p5 ] || [ "${ONLY:-}" = u5p6 ]; then
     case $ONLY in
         u5) u5_run ;;
