@@ -25,6 +25,23 @@ if [ -n "\$U24_CAPTURE_LOG" ]; then
         fi
     done
 fi
+if [ -n "\${CNTCTR_TEST_MAIL_ENTER:-}" ]; then
+    case " \$* " in
+        *" paste-buffer -d "*)
+            if [ "\$CNTCTR_TEST_MAIL_WHEN" = after ]; then "$REAL_TMUX" "\$@" || exit \$?; fi
+            printf 'ready\n' > "\$CNTCTR_TEST_MAIL_ENTER.ready"
+            n=0
+            while [ -e "\$CNTCTR_TEST_MAIL_ENTER" ] && [ "\$n" -lt 500 ]; do
+                sleep 0.01
+                n=\$((n+1))
+            done
+            if [ "\$CNTCTR_TEST_MAIL_WHEN" = after ]; then exit 0; fi
+            ;;
+    esac
+fi
+if [ -n "\${CNTCTR_TEST_IDLE_LOG:-}" ]; then
+    printf '%s\n' "\$*" >> "\$CNTCTR_TEST_IDLE_LOG"
+fi
 exec "$REAL_TMUX" "\$@"
 EOF
 chmod +x "$TMPD/bin/tmux"
@@ -554,7 +571,8 @@ int main(int argc, char **argv) {
     puts("READY");
     while (fgets(line, sizeof line, stdin)) {
         char event[128] = "", path[2048] = "", pane[64] = "", answer[2048] = "";
-        int n = sscanf(line, "%127s %2047s %63s %2047s", event, path, pane, answer);
+        char mode[16] = "";
+        int n = sscanf(line, "%127s %2047s %63s %2047s %15s", event, path, pane, answer, mode);
         if (n < 2) continue;
         pid_t child = fork();
         if (!child) {
@@ -565,7 +583,8 @@ int main(int argc, char **argv) {
             _exit(127);
         }
         int st;
-        waitpid(child, &st, 0);
+        if (strcmp(mode, "async")) waitpid(child, &st, 0);
+        while (waitpid(-1, &st, WNOHANG) > 0) {}
         puts("DONE");
     }
     return 0;
@@ -817,7 +836,7 @@ hk_boot() {
     for h in claude agy; do
         rm -f "$TMPD/hk_${h}_in" "$TMPD/hk_${h}_out"
         mkfifo "$TMPD/hk_${h}_in" "$TMPD/hk_${h}_out"
-        "$TMPD/hook_harness/$h" "$BIN" "$h" < "$TMPD/hk_${h}_in" > "$TMPD/hk_${h}_out" &
+        CNTCTR_TEST_STOP_PAUSE="$TMPD/hold_stop" "$TMPD/hook_harness/$h" "$BIN" "$h" < "$TMPD/hk_${h}_in" > "$TMPD/hk_${h}_out" &
         eval "HK_PID_$h=$!"
     done
     exec 20> "$TMPD/hk_claude_in" 21< "$TMPD/hk_claude_out" 22> "$TMPD/hk_agy_in" 23< "$TMPD/hk_agy_out"
@@ -871,8 +890,18 @@ mailput() {
     printf '%s' "$3" > "$f"
     sqx "$CNTCTR_DB" "INSERT INTO posts(scope,sender,text,at) VALUES('$U5_SCOPE','sender',CAST(readfile('$f') AS TEXT),${5:-strftime('%s','now')}); INSERT INTO mail(post,name,pane,task,hooked,presentations,socket) VALUES(last_insert_rowid(),'$name','$1','$2',1,${4:-0},'$(t display -p '#{socket_path}')'); SELECT last_insert_rowid();"
 }
+# Force the persisted deadline across expiry without sleeping for a production lease.
+wait_shown() {
+    local i
+    for i in $(seq 80); do
+        [ "$(sqx "$CNTCTR_DB" "SELECT shown FROM mail WHERE post=$1")" = "$2" ] && return
+        sleep 0.1
+    done
+    bad "mail $1 did not charge body attempt $2"
+}
+expire_mail() { sqx "$CNTCTR_DB" "UPDATE mail SET lease_until=1 WHERE post=$1 AND state='staged'"; }
 mstate() { sqx "$CNTCTR_DB" "SELECT state||'/'||presentations||'/'||delivered FROM mail WHERE post=$1"; }
-pointer() { printf '[cntctr mail id=%s] body attached; if you see none, call board' "$1"; }
+pointer() { printf '[cntctr mail id=%s] body attached; if missing, call board id=%s' "$1" "$1"; }
 ctx_c() { printf '%s' "$1" | jq -r '.hookSpecificOutput.additionalContext // empty'; }
 ctx_a() { printf '%s' "$1" | jq -r '.injectSteps[0].systemMessage.systemMessage // empty'; }
 emptyans() { [ "$(printf '%s' "$1" | jq -c . 2>/dev/null)" = '{}' ]; }
@@ -985,9 +1014,34 @@ u5p1_run() {
 undelivered() { [ "$(sqx "$CNTCTR_DB" "SELECT delivered FROM mail WHERE post=$1")" = 0 ]; }
 
 u5p2_run() {
-    local P S Q m m2 ans out
+    local P S Q m m2 ans out body
     P=$(hk_agent claude u5_d1)
     S=$(newpane u5_d1_sender)
+    mkdir -p "$HOME/.local/share/cntctr"
+    m=$(mailput "$P" d1000099 "$(mail_text d1000099 'trace-private-body')" 1)
+    c_prompt "$P" "$(pointer "$m")" >/dev/null
+    [ ! -e "$HOME/.local/share/cntctr/hook-trace.log" ] && ok_ || bad "trace is disabled without marker"
+    c_stop "$P" >/dev/null
+    : > "$HOME/.local/share/cntctr/hook-trace"
+    m=$(mailput "$P" d1000098 "$(mail_text d1000098 'trace-private-body')" 1)
+    c_prompt "$P" "$(pointer "$m")" >/dev/null
+    c_stop "$P" >/dev/null
+    local log="$HOME/.local/share/cntctr/hook-trace.log"
+    same "trace writes one line per invocation" "$(wc -l < "$log" | tr -d ' ')" 2
+    jq -e --argjson id "$m" 'select(.event == "UserPromptSubmit" and .attached == 1 and (.before.mail | any(.post == $id and .state == "pending")) and (.after.mail | any(.post == $id and .state == "staged")))' "$log" >/dev/null && ok_ || bad "trace records attachment and mail transition"
+    jq -e 'select(.event == "Stop" and .delivered == 1 and .token != null and .after.session.last_event == "Stop")' "$log" >/dev/null && ok_ || bad "trace records delivery and token"
+    m=$(mailput "$P" d1000097 "$(mail_text d1000097 'trace-stop-body')" 0)
+    c_stop "$P" >/dev/null
+    jq -e --argjson id "$m" 'select(.event == "Stop" and .re_presented == 1 and .action == "re-presented" and (.before.mail | any(.post == $id and .state == "pending")) and (.after.mail | any(.post == $id and .state == "staged")))' "$log" >/dev/null && ok_ || bad "trace records Stop presentation"
+    c_stop "$P" true >/dev/null
+    refute "trace excludes body" "$(cat "$log")" "trace-private-body"
+    refute "trace excludes Stop body" "$(cat "$log")" "trace-stop-body"
+    rm "$HOME/.local/share/cntctr/hook-trace"
+    local lines
+    lines=$(wc -l < "$log")
+    c_prompt "$P" hello >/dev/null
+    same "trace stops when marker is removed" "$(wc -l < "$log")" "$lines"
+    c_stop "$P" >/dev/null
     # U7: a normal Stop of the staging turn delivers
     m=$(mailput "$P" d1000001 "$(mail_text d1000001 'normal stop mail')" 1)
     c_prompt "$P" "$(pointer "$m")" >/dev/null
@@ -995,13 +1049,16 @@ u5p2_run() {
     ans=$(c_stop "$P")
     emptyans "$ans" && ok_ || bad "U7 a normal Stop with nothing else pending passes" "  got: $ans"
     same "U7 a normal Stop of the staging turn delivers" "$(mstate "$m")" "delivered/1/1"
-    # U7: reply to the mail's task id delivers
+    # U7: reply closes the task gate and Stop acknowledges its full body.
     t set -s @cntctr_from_d1000002 "$S"; t set -s @cntctr_to_d1000002 "$P"; t set -s @cntctr_sender_d1000002 u5_d1_sender
     m=$(mailput "$P" d1000002 "$(mail_text d1000002 'reply me')" 1)
     c_prompt "$P" "$(pointer "$m")" >/dev/null
     same "U7 mail to be answered is staged" "$(mstate "$m")" "staged/1/0"
     call "$P" reply '{"id":"d1000002","text":"my answer"}' >/dev/null
-    same "U7 reply to the mail's id delivers" "$(mstate "$m")" "delivered/1/1"
+    same "U7 reply leaves the lease staged until Stop" "$(mstate "$m")" "staged/1/0"
+    same "U7 reply closes the task gate" "$(sqx "$CNTCTR_DB" "SELECT answered FROM task_gate WHERE task='d1000002'")" 1
+    c_stop "$P" >/dev/null
+    same "U7 Stop after reply finishes the lease" "$(mstate "$m")" "delivered/1/1"
     # U7: board returning the body delivers
     m=$(mailput "$P" d1000003 "$(mail_text d1000003 'board me')" 1)
     c_prompt "$P" "$(pointer "$m")" >/dev/null
@@ -1029,21 +1086,24 @@ u5p2_run() {
     a_pre "$Q" 0 "$(pointer "$m2")" >/dev/null
     a_stop "$Q" USER_CANCELED >/dev/null
     undelivered "$m2" && ok_ || bad "U7 a Stop with terminationReason USER_CANCELED does not deliver" "  got: $(mstate "$m2")"
+    expire_mail "$m2"
     a_pre "$Q" 0 "$(pointer "$m2")" >/dev/null
     a_stop "$Q" NO_TOOL_CALL >/dev/null
     same "U7 an agy Stop that ends normally delivers" "$(mstate "$m2")" "delivered/1/1"
 
-    # U8: staged mail and a new prompt with no Stop in between: pending again; shown again with a repeat note
+    # U8: an abandoned attempt stays staged until its lease expires.
     P=$(hk_agent claude u5_d3)
     m=$(mailput "$P" d3000001 "$(mail_text d3000001 'maybe seen mail')" 1)
     c_prompt "$P" "$(pointer "$m")" >/dev/null
     same "U8 mail is staged in the first turn" "$(mstate "$m")" "staged/1/0"
     c_prompt "$P" "an unrelated question" >/dev/null
-    same "U8 a new turn with no delivery makes staged mail pending again" "$(mstate "$m")" "pending/1/0"
+    same "U8 a new prompt cannot release a live lease" "$(mstate "$m")" "staged/1/0"
+    expire_mail "$m"
+    c_prompt "$P" "an unrelated question after expiry" >/dev/null
+    same "U8 an expired lease makes staged mail pending again" "$(mstate "$m")" "pending/1/0"
     sqx "$CNTCTR_DB" "UPDATE mail SET presentations=2 WHERE post=$m" # a second line was typed for it
     ans=$(c_prompt "$P" "$(pointer "$m")")
-    check "U8 the mail comes again" "$(ctx_c "$ans")" "maybe seen mail"
-    check "U8 and says it may be a repeat" "$(ctx_c "$ans")" "(may be a repeat)"
+    same "U8 small repeat has the full envelope" "$(ctx_c "$ans")" "$(mail_text d3000001 'maybe seen mail')"
     same "U8 the repeat is staged, still counted twice" "$(mstate "$m")" "staged/2/0"
     c_stop "$P" >/dev/null
     same "U8 the repeat is delivered by the Stop" "$(mstate "$m")" "delivered/2/1"
@@ -1052,7 +1112,250 @@ u5p2_run() {
     m=$(mailput "$Q" d4000001 "$(mail_text d4000001 'agy maybe seen')" 1)
     a_pre "$Q" 0 "$(pointer "$m")" >/dev/null
     a_pre "$Q" 0 "an unrelated question" >/dev/null
-    same "U8 agy: a new turn with no delivery makes staged mail pending again" "$(mstate "$m")" "pending/1/0"
+    same "U8 agy: a new turn leaves the live lease staged" "$(mstate "$m")" "staged/1/0"
+    expire_mail "$m"
+    a_pre "$Q" 0 "question after expiry" >/dev/null
+    same "U8 agy: a prompt can recover an expired lease" "$(mstate "$m")" "pending/1/0"
+
+    # A pointer may have been typed for a different prompt: its count alone is not a full presentation.
+    P=$(hk_agent claude repeat_pointer)
+    local wake_body
+    wake_body=$(mail_text e1000001 "$(head -c 1800 /dev/zero | tr '\0' x)")
+    m=$(mailput "$P" e1000001 "$wake_body" 1)
+    same "pointer-only wake has not shown mail" "$(sq "$CNTCTR_DB" "SELECT shown FROM mail WHERE post=$m")" 0
+    ans=$(c_stop "$P")
+    same "pointer-only wake first presents the entire large envelope" "$(printf '%s' "$ans" | jq -r '.reason')" "$wake_body"
+    same "first hook body increments shown" "$(sq "$CNTCTR_DB" "SELECT shown FROM mail WHERE post=$m")" 1
+
+    out=$(txt "$(call "$P" board "{\"id\":$m}")")
+    same "board id returns the exact staged body" "$out" "$wake_body"
+    same "complete exact lookup acknowledges staged mail" "$(mstate "$m")" "delivered/2/1"
+    out=$(txt "$(call "$P" board "{\"id\":$m}")")
+    same "board id still returns the exact delivered body" "$out" "$wake_body"
+    same "looking up delivered mail preserves its status" "$(mstate "$m")" "delivered/2/1"
+
+    # A blocked Stop and its continuation retain the turn token. An error leaves the lease unresolved.
+    Q=$(hk_agent agy repeat_block)
+    m=$(mailput "$Q" e1000002 "$(mail_text e1000002 'blocked-stop body')" 0)
+    ans=$(a_stop "$Q" NO_TOOL_CALL)
+    check "blocked Stop first shows the body" "$(printf '%s' "$ans" | jq -r '.reason')" "blocked-stop body"
+    a_stop "$Q" ERROR >/dev/null
+    expire_mail "$m"
+    ans=$(a_pre "$Q" 0 "$(pointer "$m")")
+    same "second hook presentation repeats the full small envelope" "$(ctx_a "$ans")" "$(mail_text e1000002 'blocked-stop body')"
+    same "second hook body increments shown" "$(sq "$CNTCTR_DB" "SELECT shown FROM mail WHERE post=$m")" 2
+
+    # Repeat size is measured inside the markers before JSON escaping.
+    local prefix tail body expected
+    P=$(hk_agent claude repeat_large)
+    prefix=$(head -c 399 /dev/zero | tr '\0' '"')
+    tail=$(head -c 700 /dev/zero | tr '\0' x)
+    body=$(printf '[cntctr from=sender id=e1000003]\n%sé%s\n[cntctr end id=e1000003]' "$prefix" "$tail")
+    m=$(mailput "$P" e1000003 "$body" 1)
+    ans=$(c_prompt "$P" "$(pointer "$m")")
+    same "first large presentation includes the entire envelope" "$(ctx_c "$ans")" "$body"
+    expire_mail "$m"
+    ans=$(c_prompt "$P" "$(pointer "$m")")
+    expected=$(printf '[cntctr from=sender id=e1000003]\n%s\n[cntctr end id=e1000003]\n[702 more bytes omitted: call board id=%s]' "$prefix" "$m")
+    same "large repeat ends on a UTF-8 boundary with exact omitted bytes" "$(ctx_c "$ans")" "$expected"
+    check "serialized quoted excerpt fits Claude's 8192-byte limit" "$((${#ans} <= 8192))" 1
+    ans=$(c_stop "$P")
+    emptyans "$ans" && ok_ || bad "clean Stop does not immediately repeat the excerpt" "  got: $ans"
+    same "clean Stop leaves the excerpt unread" "$(mstate "$m")" "staged/1/0"
+    expire_mail "$m"
+    ans=$(c_prompt "$P" "$(pointer "$m")")
+    same "third large presentation has the same exact excerpt" "$(ctx_c "$ans")" "$expected"
+    c_stop "$P" >/dev/null
+    same "clean Stop cannot acknowledge the third excerpt" "$(mstate "$m")" "staged/1/0"
+    expire_mail "$m"
+    c_prompt "$P" "recover the expired excerpt" >/dev/null
+    same "third expired body stalls without delivery" "$(mstate "$m")" "stalled/1/0"
+    same "excerpt stall tells the sender once" "$(notices "$m")" 1
+    out=$(txt "$(call "$P" board "{\"id\":$m}")")
+    same "board lookup returns the entire stalled body" "$out" "$body"
+    same "complete board lookup acknowledges the stalled body" "$(mstate "$m")" "delivered/1/1"
+
+    P=$(hk_agent claude repeat_limit)
+    body=$(head -c 1024 /dev/zero | tr '\0' x)
+    m=$(mailput "$P" e1000004 "$body" 1)
+    c_prompt "$P" "$(pointer "$m")" >/dev/null
+    expire_mail "$m"
+    ans=$(c_prompt "$P" "$(pointer "$m")")
+    same "1024-byte repeat stays full" "$(ctx_c "$ans")" "$body"
+    c_stop "$P" >/dev/null
+
+    P=$(hk_agent claude spill_from_stop)
+    tail=$(head -c 10000 /dev/zero | tr '\0' x)
+    body=$(mail_text e1000006 "$tail")
+    m=$(mailput "$P" e1000006 "$body" 0)
+    ans=$(c_stop "$P")
+    out=$(printf '%s' "$ans" | jq -r '.reason')
+    check "first Stop spill names a cache file" "$out" "$HOME/.cache/cntctr/mail/"
+    check "first Stop spill also names its durable lookup" "$out" "call board id=$m"
+    check "first Stop spill advertises the mail index" "$out" "board mode=mail"
+    check "first Stop spill fits the serialized hook budget" "$((${#ans} <= 8192))" 1
+    sqx "$CNTCTR_DB" "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<205)
+        INSERT INTO posts(scope,sender,text,at)
+        SELECT '$U5_SCOPE','sender','newer than spill',strftime('%s','now') FROM n;"
+    same "Stop preview ID retrieves the full mail after 205 newer posts" "$(txt "$(call "$P" board "{\"id\":$m}")")" "$body"
+
+    P=$(hk_agent claude spill_unavailable)
+    tail=$(head -c 10000 /dev/zero | tr '\0' x)
+    body=$(printf '[cntctr from=sender id=e1000005]\n%s\n[cntctr end id=e1000005]' "$tail")
+    m=$(mailput "$P" e1000005 "$body" 1)
+    local mail_cache="$HOME/.cache/cntctr/mail"
+    mkdir -p "$mail_cache"
+    mv "$mail_cache" "$mail_cache.saved"
+    touch "$mail_cache"
+    ans=$(c_prompt "$P" "$(pointer "$m")")
+    rm "$mail_cache"
+    mv "$mail_cache.saved" "$mail_cache"
+    expected=$(printf '[cntctr from=sender id=e1000005]\n%s\n[cntctr end id=e1000005]\n[9600 more bytes omitted: call board id=%s (index: board mode=mail)]' "${tail:0:400}" "$m")
+    same "spill failure still gives both markers and a working lookup" "$(ctx_c "$ans")" "$expected"
+
+    c_stop "$P" >/dev/null
+    same "clean Stop after a spill fallback leaves mail unread" "$(mstate "$m")" "staged/1/0"
+
+    # A wake for the newest of 205 mixed rows still presents the oldest fitting prefix.
+    local socket first last row piece assembled='' sep='' i
+    P=$(hk_agent claude mixed_budget)
+    socket=$(t display -p '#{socket_path}')
+    sqx "$CNTCTR_DB" "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<205)
+        INSERT INTO posts(scope,sender,text,at)
+        SELECT '$U5_SCOPE','mixed_fixture',printf('batch-%03d:',i) ||
+          CASE i%3 WHEN 1 THEN 'small' WHEN 2 THEN printf('%03000d',0) ELSE printf('%06000d',0) END,
+          strftime('%s','now') FROM n;
+        INSERT INTO mail(post,name,pane,socket,hooked,shown)
+        SELECT rowid,'mixed_budget','$P','$socket',1,CASE WHEN length(text)>6000 THEN 1 ELSE 0 END
+        FROM posts WHERE scope='$U5_SCOPE' AND sender='mixed_fixture';"
+    first=$(sq "$CNTCTR_DB" "SELECT min(post) FROM mail WHERE pane='$P'")
+    last=$(sq "$CNTCTR_DB" "SELECT max(post) FROM mail WHERE pane='$P'")
+    for i in 1 2 3 4 5 6 7; do
+        row=$((first + i - 1))
+        piece=$(sq "$CNTCTR_DB" "SELECT text FROM posts WHERE rowid=$row")
+        if [ "$((i % 3))" -eq 0 ]; then
+            piece=$(printf '%s\n[5610 more bytes omitted: call board id=%s]' "${piece:0:400}" "$row")
+        fi
+        assembled="$assembled$sep$piece"
+        sep=$'\n\n'
+    done
+    ans=$(c_prompt "$P" "$(pointer "$last")")
+    same "205 mixed mails yield the exact oldest fitting seven rows" "$(ctx_c "$ans")" "$assembled"
+    check "205 mixed mails stay within the serialized hook budget" "$((${#ans} <= 8192))" 1
+    same "only the seven emitted rows are staged" "$(sq "$CNTCTR_DB" "SELECT count(*) FROM mail WHERE pane='$P' AND state='staged'")" 7
+    same "the newest wake leaves the newest mail pending" "$(mstate "$last")" "pending/0/0"
+    c_stop "$P" true >/dev/null
+    same "one Stop delivers only the five full bodies in a mixed answer" "$(sq "$CNTCTR_DB" "SELECT count(*) FROM mail WHERE pane='$P' AND delivered=1")" 5
+    same "the two excerpted bodies in a mixed answer remain unread" "$(sq "$CNTCTR_DB" "SELECT count(*) FROM mail WHERE pane='$P' AND shown=2 AND state='staged' AND delivered=0")" 2
+    out=$(txt "$(call "$P" board '{"mode":"mail","offset":200}')")
+    same "index beyond the 200th item returns five entries and a footer" "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" 6
+    same "index total is independent of the recent board cap" "$(printf '%s\n' "$out" | tail -n 1)" "205 total mail"
+
+
+    # An exact mail lookup must work after the mail falls outside the recent board window.
+    P=$(hk_agent claude lookup_owner)
+    Q=$(hk_agent claude lookup_other)
+    m=$(mailput "$P" e1000010 "$(mail_text e1000010 'old lookup body')" 0)
+    sqx "$CNTCTR_DB" "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<205)
+        INSERT INTO posts(scope,sender,text,at) SELECT '$U5_SCOPE','sender','newer',strftime('%s','now') FROM n"
+    out=$(txt "$(call "$P" board "{\"id\":$m}")")
+    check "board id retrieves old mail beyond 200 posts" "$out" "old lookup body"
+    ans=$(call "$Q" board "{\"id\":$m}")
+    same "board id rejects another agent's mail" "$(iserr "$ans")" true
+    same "board id does not disclose another agent's mail" "$(txt "$ans")" "mail not found"
+
+    # A name fallback is scoped to the project and server. A live pane survives a cwd change.
+    local lookup_dir="$TMPD/other_lookup_project" same_name other_sock
+    mkdir "$lookup_dir"
+    git -C "$lookup_dir" init -q
+    same_name=$(newpane lookup_owner)
+    same "board id permits the same name on the same project and socket" "$(txt "$(call "$same_name" board "{\"id\":$m}")")" "$(mail_text e1000010 'old lookup body')"
+    t respawn-pane -k -t "$same_name" -c "$lookup_dir" cat
+    t set -p -t "$same_name" @cntctr_name lookup_owner
+    same "board id denies a same-name caller in a different project" "$(txt "$(call "$same_name" board "{\"id\":$m}")")" "mail not found"
+    t2 new-session -d -s lookup -c "$PWD" cat
+    other_sock=$(t2 display -p '#{socket_path}')
+    same_name=$(t2 display -p '#{pane_id}')
+    t2 set -p -t "$same_name" @cntctr_name lookup_owner
+    ans=$(TMUX="$other_sock,0,0" call_raw "$same_name" board "{\"id\":$m}")
+    same "board id denies a same-name caller on a different socket" "$(txt "$ans")" "mail not found"
+    t2 kill-server
+    t respawn-pane -k -t "$P" -c "$lookup_dir" cat
+    t set -p -t "$P" @cntctr_name lookup_owner
+    same "board id permits the bound pane after its cwd changes" "$(txt "$(call "$P" board "{\"id\":$m}")")" "$(mail_text e1000010 'old lookup body')"
+
+    # Discard the first answer. The continuation Stop acknowledges the staged attempt.
+    P=$(hk_agent claude mail_index_owner)
+    body=$(mail_text e1000015 "$(printf 'index recovery preview\nbody available only by ID')")
+    m=$(mailput "$P" e1000015 "$body" 0)
+    c_stop "$P" >/dev/null
+    same "discarded first Stop still records one attempt" "$(sq "$CNTCTR_DB" "SELECT shown FROM mail WHERE post=$m")" 1
+    c_stop "$P" true >/dev/null
+    same "continuation Stop acknowledges the full attempt" "$(mstate "$m")" "delivered/1/1"
+
+    local pending staged stalled page_ids
+    pending=$(mailput "$P" e1000016 "$(mail_text e1000016 'pending index mail')" 0)
+    staged=$(mailput "$P" e1000017 "$(mail_text e1000017 'staged index mail')" 1)
+    stalled=$(mailput "$P" e1000018 "$(mail_text e1000018 'stalled index mail')" 3)
+    sqx "$CNTCTR_DB" "UPDATE mail SET state='staged',shown=1,lease_until=strftime('%s','now')+300 WHERE post=$staged;
+        UPDATE mail SET state='stalled',shown=3 WHERE post=$stalled;
+        WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<205)
+        INSERT INTO posts(scope,sender,text,at) SELECT '$U5_SCOPE','sender','newer than lost attempt',strftime('%s','now') FROM n;"
+    out=$(txt "$(call "$P" board '{"limit":200}')")
+    refute "recent board no longer lists the lost body" "$out" "index recovery preview"
+    check "recent board points to omitted mail" "$out" "board mode=mail"
+    out=$(txt "$(call "$P" board '{"mode":"mail","limit":2}')")
+    page_ids=$(printf '%s\n' "$out" | sed -n 's/^id=\([0-9]*\) .*/\1/p')
+    same "index page one lists newest mail without gaps" "$page_ids" "$(printf '%s\n%s' "$stalled" "$staged")"
+    check "index page one reports total and next cursor" "$out" "4 total mail [more: call board mode=mail before=$staged limit=2]"
+    check "index includes the stalled state and both counters" "$out" "id=$stalled sender=sender state=stalled attempts=3 presentations=3 bytes="
+    same "listing staged mail does not acknowledge it" "$(mstate "$staged")" "staged/1/0"
+    out=$(txt "$(call "$P" board '{"mode":"mail","limit":2,"offset":2}')")
+    page_ids=$(printf '%s\n' "$out" | sed -n 's/^id=\([0-9]*\) .*/\1/p')
+    same "index page two continues with no overlap" "$page_ids" "$(printf '%s\n%s' "$pending" "$m")"
+    same "final index footer gives the same total" "$(printf '%s\n' "$out" | tail -n 1)" "4 total mail"
+    check "index entry exposes delivered ID and byte count with one-line excerpt" "$out" "id=$m sender=sender state=delivered attempts=1 presentations=1 bytes=${#body} | index recovery preview..."
+    refute "index omits the remaining body" "$out" "body available only by ID"
+    same "index output has one line per entry and one footer" "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" 3
+    mailput "$P" e1000019 "$(mail_text e1000019 'arrived between index pages')" 0 >/dev/null
+    ans=$(call "$P" board "$(printf '{"mode":"mail","limit":2,"before":%s}' "$staged")")
+    out=$(txt "$ans")
+    page_ids=$(printf '%s\n' "$out" | sed -n 's/^id=\([0-9]*\) .*/\1/p')
+    same "cursor page neither repeats nor skips after insertion" "$page_ids" "$(printf '%s\n%s' "$pending" "$m")"
+    same "cursor footer counts new mail without advertising an empty page" "$(printf '%s\n' "$out" | tail -n 1)" "5 total mail"
+    same "exact lookup recovers the entire lost body by listed ID" "$(txt "$(call "$P" board "{\"id\":$m}")")" "$body"
+    same "index leaves pending mail pending" "$(mstate "$pending")" "pending/0/0"
+
+    t2 new-session -d -s mail_index -c "$PWD" cat
+    other_sock=$(t2 display -p '#{socket_path}')
+    same_name=$(t2 display -p '#{pane_id}')
+    t2 set -p -t "$same_name" @cntctr_name mail_index_owner
+    ans=$(TMUX="$other_sock,0,0" call_raw "$same_name" board '{"mode":"mail"}')
+    same "same-name caller on another socket cannot list the mail index" "$(txt "$ans")" "0 total mail"
+    t2 kill-server
+
+    # The first page must stop before the two-byte character at its boundary.
+    P=$(hk_agent claude lookup_large)
+    local page1 page2 page3 original replies
+    body=$(printf '%sé%s' "$(head -c 32767 /dev/zero | tr '\0' x)" "$(head -c 37000 /dev/zero | tr '\0' y)")
+    m=$(mailput "$P" e1000012 "$body" 0)
+    replies=$(SKIP=1 session "$P" 5 "$INIT" \
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"board\",\"arguments\":{\"id\":$m}}}" \
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"board\",\"arguments\":{\"id\":$m,\"offset\":32768}}}" \
+        "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"board\",\"arguments\":{\"id\":$m,\"offset\":32767}}}" \
+        "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"board\",\"arguments\":{\"id\":$m,\"offset\":65535}}}")
+    out=$(printf '%s\n' "$replies" | jq -r 'select(.id == 2) | .result.content[0].text')
+    same "first page reports the exact UTF-8 continuation offset" "${out##*$'\n'}" "[37002 bytes remain; call board id=$m offset=32767]"
+    page1=${out%$'\n'*}
+    out=$(printf '%s\n' "$replies" | jq -r 'select(.id == 3) | .result.content[0].text')
+    same "board rejects an offset inside the multibyte character" "$out" "board offset is outside the mail or splits UTF-8"
+    out=$(printf '%s\n' "$replies" | jq -r 'select(.id == 4) | .result.content[0].text')
+    same "second page reports the next exact byte offset" "${out##*$'\n'}" "[4234 bytes remain; call board id=$m offset=65535]"
+    page2=${out%$'\n'*}
+    page3=$(printf '%s\n' "$replies" | jq -r 'select(.id == 5) | .result.content[0].text')
+    original="$page1$page2$page3"
+    [ "$original" = "$body" ] && ok_ || bad "all UTF-8 board pages reconstruct the exact original bytes"
+    same "paginated lookups leave the mail unread" "$(mstate "$m")" "pending/0/0"
 
     # U10: mail staged by the prompt hook is not presented again by the Stop of the same turn
     P=$(hk_agent claude u5_d5)
@@ -1065,6 +1368,9 @@ u5p2_run() {
     refute "U10 the hold does not repeat the staged mail" "$(printf '%s' "$ans" | jq -r '.reason')" "first in the turn"
     same "U10 the staged mail is delivered by that Stop" "$(mstate "$m")" "delivered/1/1"
     same "U10 the held mail is staged and counted once" "$(mstate "$m2")" "staged/1/0"
+    ans=$(c_stop "$P")
+    emptyans "$ans" && ok_ || bad "U10 another non-continuation Stop cannot hold or ack" "  got: $ans"
+    same "U10 the held mail still awaits continuation" "$(mstate "$m2")" "staged/1/0"
     ans=$(c_stop "$P" true)
     emptyans "$ans" && ok_ || bad "U10 the second Stop of the turn is never held" "  got: $ans"
     same "U10 the second Stop delivers the held mail" "$(mstate "$m2")" "delivered/1/1"
@@ -1097,9 +1403,10 @@ u5p3_run() {
     refute "U6 send to a hook agent is not reported as board only" "$out" "on board"
     task=${out#sent id=}
     id=$(mailid "$task")
-    expect_screen "U6 the pane gets the pointer line" "$P" "[cntctr mail id=$id] body attached; if you see none, call board"
+    expect_screen "U6 the pane gets the pointer line" "$P" "$(pointer "$id")"
     same "U6 the pane holds that one line and nothing else" "$(screen_lines "$P")" "$(pointer "$id")"
     same "U6 the stored mail is pending with one presentation" "$(mstate "$id")" "pending/1/0"
+    same "U6 the pointer spends one wake charge" "$(sqx "$CNTCTR_DB" "SELECT wake_attempts FROM mail WHERE post=$id")" 1
     same "U6 the wake is reserved" "$(sqx "$CNTCTR_DB" "SELECT wake_reserved FROM hook_sessions WHERE pane='$P'")" 1
     ans=$(c_prompt "$P" "$(pointer "$id")")
     ctx=$(ctx_c "$ans")
@@ -1219,7 +1526,7 @@ u5p3_run() {
     P=$(hk_agent claude u5_h1); R=$(newpane u5_h1r)
     out=$(txt "$(call "$S" send '{"to":"u5_h1","text":"mail that no hook presents"}')")
     task=${out#sent id=}; id=$(mailid "$task")
-    expect_screen "U16 the pane has the line" "$P" "[cntctr mail id=$id] body attached; if you see none, call board"
+    expect_screen "U16 the pane has the line" "$P" "$(pointer "$id")"
     same "U16 no hook event came; the mail is pending" "$(mstate "$id")" "pending/1/0"
     refute "U16 another agent's board does not list it" "$(txt "$(call "$R" board '{}')")" "mail that no hook presents"
     refute "U16 the sender's board does not list it" "$(txt "$(call "$S" board '{}')")" "mail that no hook presents"
@@ -1235,7 +1542,7 @@ u5p3_run() {
     check "U17 with the text" "$(screen "$N")" "mail for an agent without hooks"
     check "U17 and the header" "$(screen "$N")" "[cntctr from=u5_snd id=$task]"
     refute "U17 no pointer line is typed" "$(screen "$N")" "[cntctr mail id="
-    same "U17 no mail row is kept for it" "$(sqx "$CNTCTR_DB" "SELECT count(*) FROM mail WHERE pane='$N'")" 0
+    same "U17 terminal submission finishes one charged attempt" "$(sqx "$CNTCTR_DB" "SELECT state || '/' || shown || '/' || delivered FROM mail WHERE pane='$N' AND task='$task'")" "delivered/1/1"
 
     # the retry thread wakes an idle agent that has hooks and pending mail: one line
     P=$(hk_agent claude u5_j1)
@@ -1256,6 +1563,57 @@ u5p3_run() {
     sleep 2
     same "the retry thread types nothing into a busy hook agent" "$(screen "$P")" "$before"
     daemon_stop
+
+    # A prompt can claim mail before the new hook generation sees its first Stop.
+    P=$(hk_agent claude u5_first_stop)
+    c_start "$P" >/dev/null
+    id=$(mailput "$P" j3000001 "$(mail_text j3000001 'first Stop owns this body')" 1)
+    ans=$(c_prompt "$P" "$(pointer "$id")")
+    check "fresh generation attaches body before first Stop" "$(ctx_c "$ans")" "first Stop owns this body"
+    before=$(screen "$P")
+    daemon_start "$P"
+    daemon_hello
+    sleep 2
+    same "watcher leaves body owned by fresh hook generation" "$(mstate "$id")" "staged/1/0"
+    same "watcher does not paste an already attached body" "$(screen "$P")" "$before"
+    c_stop "$P" >/dev/null
+    same "first Stop acknowledges its own attachment" "$(mstate "$id")" "delivered/1/1"
+    daemon_stop
+
+    # A socket-scoped name can recover old mail, but cannot attach mail bound to a closed pane.
+    P=$(hk_agent claude u5_reused_name)
+    id=$(mailput "$P" j4000001 "$(mail_text j4000001 'board recovery on reused name')" 0)
+    t kill-pane -t "$P"
+    P=$(hk_agent claude u5_reused_name)
+    id2=$(mailput "$P" j4000002 "$(mail_text j4000002 'mail for the replacement pane')" 0)
+    daemon_start "$P"
+    daemon_hello
+    expect_screen "replacement pane wakes for mail it can attach" "$P" "$(pointer "$id2")"
+    refute "replacement pane gets no pointer for the closed pane" "$(screen "$P")" "$(pointer "$id")"
+    same "closed-pane row spent no wake presentations" "$(mstate "$id")" "pending/0/0"
+    daemon_stop
+    check "reused name can still recover old mail by ID" "$(txt "$(call "$P" board "{\"id\":$id}")")" "board recovery on reused name"
+
+    # Restart the watcher and clear the idle reservation between unconsumed wakes.
+    # No hook consumes the line, so these only exercise the durable wake budget.
+    P=$(hk_agent claude u5_wake_budget)
+    id=$(mailput "$P" j5000001 "$(mail_text j5000001 'unconsumed wake budget')" 0)
+    local wake
+    for wake in 1 2 3; do
+        daemon_start "$P"
+        daemon_hello
+        wait_mstate "wake-only attempt $wake survives watcher restart" "$id" "pending/$wake/0"
+        daemon_stop
+        sqx "$CNTCTR_DB" "UPDATE hook_sessions SET wake_reserved=0,wake_at=NULL WHERE pane='$P';"
+    done
+    id2=$(mailput "$P" j5000002 "$(mail_text j5000002 'mail behind exhausted wakes')" 0)
+    daemon_start "$P"
+    daemon_hello
+    expect_screen "exhausted wake budget does not block later mail" "$P" "$(pointer "$id2")"
+    same "fourth unconsumed wake did not increment presentations" "$(mstate "$id")" "pending/3/0"
+    daemon_stop
+    ans=$(c_prompt "$P" "$(pointer "$id")")
+    check "exhausted wake can still attach its first body" "$(ctx_c "$ans")" "unconsumed wake budget"
 }
 
 # list_call: the long-lived server (daemon_start) learns its agent's identity, which starts its mail retry thread
@@ -1263,7 +1621,7 @@ daemon_hello() { daemon_send '{"jsonrpc":"2.0","id":2,"method":"tools/call","par
 notices() { sqx "$CNTCTR_DB" "SELECT count(*) FROM posts WHERE text LIKE '%undelivered after 3 attempts: $1 to %'"; }
 
 u5p4_run() {
-    local S Q P id task out i before ans lines
+    local S Q P id task out i before ans lines payload envelope
     export CNTCTR_PASTE_WAIT_MS=100
     S=$(newpane u5_snd4)
 
@@ -1276,9 +1634,11 @@ u5p4_run() {
     wait_mstate "U11 the first line is typed and counted" "$id" "pending/1/0"
     for i in 1 2 3; do
         ans=$(a_pre "$Q" 0 "$(pointer "$id")")
-        check "U11 presentation $i attaches the mail" "$(ctx_a "$ans")" "mail that is never delivered"
+        same "U11 presentation $i has the full small envelope" "$(ctx_a "$ans")" "$(sq "$CNTCTR_DB" "SELECT text FROM posts WHERE rowid=$id")"
         same "U11 presentation $i is staged" "$(mstate "$id")" "staged/$i/0"
         a_stop "$Q" ERROR >/dev/null
+        expire_mail "$id"
+        a_stop "$Q" ERROR >/dev/null # Reconcile the expired lease during an event.
         if [ "$i" -lt 3 ]; then wait_mstate "U11 after an error Stop the retry thread types the line again" "$id" "pending/$((i + 1))/0"; fi
     done
     wait_mstate "U11 the third presentation went unanswered: stalled" "$id" "stalled/3/0"
@@ -1288,7 +1648,7 @@ u5p4_run() {
     sleep 3
     same "U11 the retry thread types nothing for a stalled mail" "$(screen "$Q")" "$before"
     same "U11 the sender has one undelivered mail" "$(notices "$id")" 1
-    check "U11 it names the mail and the addressee" "$(txt "$(call "$S" board '{}')")" "undelivered after 3 attempts: $id to u5_k1"
+    check "U11 it names the mail and the addressee" "$(txt "$(call "$S" board '{}')")" "undelivered after 3 attempts: $id to u5_k1; recipient can call board id=$id"
     # a server restart does not reset the count and does not tell the sender again
     daemon_stop
     daemon_start "$Q"
@@ -1300,6 +1660,35 @@ u5p4_run() {
     check "U11 the addressee's board lists the stalled mail" "$(txt "$(call "$Q" board '{}')")" "mail that is never delivered"
     check "U11 and its unread notice counted it before the read" "$(sqx "$CNTCTR_DB" "SELECT count(*) FROM mail WHERE pane='$Q'")" 1
     daemon_stop
+
+    # Replaying an old line without a Stop still spends the body budget.
+    P=$(hk_agent claude stale_replay)
+    envelope=$(mail_text e4000001 'stale pointer replay body')
+    id=$(mailput "$P" e4000001 "$envelope" 9)
+    for i in 1 2 3; do
+        ans=$(c_prompt "$P" "$(pointer "$id")")
+        same "stale replay body $i" "$(ctx_c "$ans")" "$envelope"
+        same "stale replay charges body $i" "$(sq "$CNTCTR_DB" "SELECT shown FROM mail WHERE post=$id")" "$i"
+        expire_mail "$id"
+    done
+    sqx "$CNTCTR_DB" "CREATE TRIGGER fail_stall_notice BEFORE INSERT ON posts
+        WHEN NEW.sender='cntctr' AND NEW.text LIKE '%undelivered after 3 attempts: $id to %'
+        BEGIN SELECT RAISE(ABORT, 'injected notice error'); END;"
+    ans=$(c_prompt "$P" "$(pointer "$id")")
+    emptyans "$ans" && ok_ || bad "fourth stale replay attaches nothing" "  got: $ans"
+    same "failed stall notice rolls back lease expiry" "$(mstate "$id")" "staged/9/0"
+    same "failed notice leaves no partial board post" "$(notices "$id")" 0
+    local other other_id
+    other=$(hk_agent claude independent_stall_notice)
+    other_id=$(mailput "$other" e4000010 "$(mail_text e4000010 'unrelated fresh body')" 1)
+    ans=$(c_prompt "$other" "$(pointer "$other_id")")
+    check "failed stall notice leaves unrelated hook delivery working" "$(ctx_c "$ans")" "unrelated fresh body"
+    same "unrelated mail records its own claim" "$(mstate "$other_id")" staged/1/0
+    sqx "$CNTCTR_DB" "DROP TRIGGER fail_stall_notice"
+    ans=$(c_prompt "$P" "$(pointer "$id")")
+    emptyans "$ans" && ok_ || bad "fifth stale replay attaches nothing" "  got: $ans"
+    same "stale replay stalls with the wake count unchanged" "$(mstate "$id")" "stalled/9/0"
+    same "stale replay tells the sender once" "$(notices "$id")" 1
 
     # U11b: the hook command stops running: after the wake window (1 s here, 30 s by default) the mail is pasted as a full envelope
     export CNTCTR_WAKE_SEC=1
@@ -1320,17 +1709,74 @@ u5p4_run() {
     same "U11b the next prompt event gives the hooks back" "$(sqx "$CNTCTR_DB" "SELECT broken FROM hook_sessions WHERE pane='$P'")" 0
     daemon_stop
 
-    # U11b: with the full paste failing as well, the pointer is typed three times at most, then the mail is stalled
+    # A quiet hook gets the same excerpt and body cap as a responding hook.
+    P=$(hk_agent claude quiet_repeat)
+    payload=$(head -c 1100 /dev/zero | tr '\0' x)
+    envelope=$(printf '[cntctr from=sender id=e4000002]\n%s\n[cntctr end id=e4000002]' "$payload")
+    id=$(mailput "$P" e4000002 "$envelope" 0)
+    sqx "$CNTCTR_DB" "UPDATE mail SET shown=1, hooked=1 WHERE post=$id; UPDATE hook_sessions SET broken=1 WHERE pane='$P'"
+    daemon_start "$P"
+    daemon_hello
+    expect_screen "quiet repeat keeps the original closing marker" "$P" "[cntctr end id=e4000002]"
+    expect_screen "quiet repeat names the exact omitted byte count and lookup" "$P" "[700 more bytes omitted: call board id=$id]"
+    refute "quiet repeat does not paste the full payload" "$(screen "$P")" "$payload"
+    for i in 2 3; do
+        wait_shown "$id" "$i"
+        expire_mail "$id"
+    done
+    wait_mstate "quiet repeat stops after the third body" "$id" "stalled/0/0"
+    same "quiet repeat charges the two fallbacks and the first hook body" "$(sq "$CNTCTR_DB" "SELECT shown FROM mail WHERE post=$id")" 3
+    same "quiet repeat tells the sender once" "$(notices "$id")" 1
+    daemon_stop
+
+    # A DB failure after a full paste must preserve the charged attempt.
+    P=$(hk_agent claude quiet_charge)
+    payload=$(head -c 800 /dev/zero | tr '\0' x)
+    envelope=$(printf '[cntctr from=sender id=e4000003]\n%600s\nFULL-ONLY-CHARGE-MARKER\n%s\n[cntctr end id=e4000003]' x "$payload")
+    id=$(mailput "$P" e4000003 "$envelope" 0)
+    sqx "$CNTCTR_DB" "UPDATE hook_sessions SET broken=1 WHERE pane='$P';
+        CREATE TRIGGER fail_paste_delivery BEFORE UPDATE OF delivered ON mail
+        WHEN OLD.post=$id AND NEW.delivered=1
+        BEGIN SELECT RAISE(ABORT, 'injected post-paste commit error'); END;"
+    daemon_start "$P"
+    daemon_hello
+    expect_screen "quiet paste reaches the pane before the delivery update fails" "$P" "FULL-ONLY-CHARGE-MARKER"
+    for i in 1 2 3; do
+        wait_shown "$id" "$i"
+        expire_mail "$id"
+    done
+    wait_mstate "quiet paste spends three body attempts despite the update failure" "$id" "stalled/0/0"
+    same "quiet paste never retries the full oversized body" "$(screen "$P" | grep -c 'FULL-ONLY-CHARGE-MARKER')" 2
+    same "failed delivery update still leaves three recorded attempts" "$(sq "$CNTCTR_DB" "SELECT shown FROM mail WHERE post=$id")" 3
+    sqx "$CNTCTR_DB" "DROP TRIGGER fail_paste_delivery"
+    daemon_stop
+
+    # Hold Enter after the paste so a recovering hook overlaps terminal delivery.
+    P=$(hk_agent claude recovering_paste)
+    envelope=$(mail_text e4000004 'body already pasted before Enter')
+    id=$(mailput "$P" e4000004 "$envelope" 0)
+    sqx "$CNTCTR_DB" "UPDATE hook_sessions SET broken=1 WHERE pane='$P'"
+    CNTCTR_ENTER_DELAY_MS=3500 daemon_start "$P"
+    daemon_hello
+    expect_screen "quiet fallback has already pasted the body" "$P" "body already pasted before Enter"
+    ans=$(c_prompt "$P" "$(pointer "$id")")
+    emptyans "$ans" && ok_ || bad "recovering hook cannot stage an in-flight paste" "  got: $ans"
+    wait_mstate "the in-flight terminal attempt finalizes" "$id" "delivered/0/1"
+    same "terminal attempt and racing hook spend one presentation" "$(sq "$CNTCTR_DB" "SELECT shown FROM mail WHERE post=$id")" 1
+    daemon_stop
+
+    # Failed body pastes can yield three pointers without spending any body budget.
     P=$(hk_agent claude u5_l2 sh -c 'exec /bin/cat')   # no bracketed paste: a multi-line paste is refused, one line is not
     daemon_start "$P"
     daemon_hello
     out=$(txt "$(call "$S" send '{"to":"u5_l2","text":"mail that cannot be pasted"}')")
     task=${out#sent id=}; id=$(mailid "$task")
-    wait_mstate "U11b the mail is stalled after three pointers" "$id" "stalled/3/0"
+    wait_mstate "U11b three pointers leave mail pending" "$id" "pending/3/0"
     lines=$(screen "$P" | grep -c '\[cntctr mail id=')   # cat shows each typed line twice
     same "U11b the pointer was typed three times" "$lines" 6
     refute "U11b the text itself was never typed" "$(screen "$P")" "mail that cannot be pasted"
-    same "U11b the sender has the undelivered mail, once" "$(notices "$id")" 1
+    same "U11b pointers leave the body budget untouched" "$(sq "$CNTCTR_DB" "SELECT shown FROM mail WHERE post=$id")" 0
+    same "U11b pointer-only fallback sends no stall notice" "$(notices "$id")" 0
     daemon_stop
     unset CNTCTR_WAKE_SEC CNTCTR_PASTE_WAIT_MS
 }
@@ -1456,6 +1902,66 @@ f6_1() {
     same "F1a the mail is untouched" "$(mstate "$m")" "pending/0/0"
     exec 24>&- 25<&-; kill "$HK_PID_c2" 2>/dev/null; wait "$HK_PID_c2" 2>/dev/null
     t2 kill-server 2>/dev/null
+
+    # A second server on the same project cannot use a recycled name to get mail.
+    local shared_dir="$TMPD/f6_shared_project" saved_scope="$U5_SCOPE"
+    mkdir "$shared_dir"
+    git -C "$shared_dir" init -q
+    W=$(hk_agent claude f6_shared_name)
+    t respawn-pane -k -t "$W" -c "$shared_dir" cat
+    t set -p -t "$W" @cntctr_name f6_shared_name
+    U5_SCOPE=$(txt "$(call "$W" project '{}')" | sed -n 's/^project \(.*\) (root .*/\1/p')
+    m=$(mailput "$W" f6a00002 "$(mail_text f6a00002 'first socket private body')" 0)
+    t2 new-session -d -s shared -c "$shared_dir" cat
+    sock2=$(t2 display -p '#{socket_path}')
+    U=$(t2 display -p '#{pane_id}')
+    t2 set -p -t "$U" @cntctr_name f6_shared_name
+    t2 set -p -t "$U" @cntctr_srv $$
+    ans=$(TMUX="$sock2,0,0" call_raw "$U" list '{}')
+    refute "foreign socket mail does not count as an unread board post" "$(notice "$ans")" "unread board post"
+    ans=$(TMUX="$sock2,0,0" call_raw "$U" board '{}')
+    refute "recent board hides same-name mail from a different socket" "$(txt "$ans")" "first socket private body"
+    same "recent board cannot acknowledge foreign-socket mail" "$(mstate "$m")" "pending/0/0"
+    sqx "$CNTCTR_DB" "UPDATE mail SET state='pending', delivered=0, shown=0, presentations=0 WHERE post=$m"
+
+    # Run its retry watcher and wait for an eligible control to prove the scan ran.
+    local first_socket retry_control wake_control
+    first_socket=$(t display -p '#{socket_path}')
+    retry_control=$(mailput "$W" f6a00003 "$(mail_text f6a00003 'second socket retry control')" 0)
+    sqx "$CNTCTR_DB" "UPDATE mail SET socket='$sock2',pane='$U' WHERE post=$retry_control"
+    TMUX="$sock2,0,0" daemon_start "$U"
+    daemon_hello
+    wait_mstate "second socket retry delivers its positive control" "$retry_control" "delivered/0/1"
+    refute "terminal retry skips same-name mail from a different socket" "$(t2 capture-pane -p -J -t "$U")" "first socket private body"
+    same "terminal retry cannot acknowledge foreign-socket mail" "$(mstate "$m")" "pending/0/0"
+    daemon_stop
+    sqx "$CNTCTR_DB" "UPDATE mail SET state='pending', delivered=0, shown=0, presentations=0 WHERE post=$m"
+
+    rm -f "$TMPD/hk_claude2_in" "$TMPD/hk_claude2_out"
+    mkfifo "$TMPD/hk_claude2_in" "$TMPD/hk_claude2_out"
+    TMUX="$sock2,0,0" "$TMPD/hook_harness/claude" "$BIN" claude < "$TMPD/hk_claude2_in" > "$TMPD/hk_claude2_out" &
+    HK_PID_c2=$!
+    exec 24> "$TMPD/hk_claude2_in" 25< "$TMPD/hk_claude2_out"
+    read -r n <&25
+    t2 set -p -t "$U" @cntctr_srv $$
+    hk claude2 UserPromptSubmit "$U" '{"session_id":"foreign","hook_event_name":"UserPromptSubmit","prompt":"hello"}' >/dev/null
+    hk claude2 Stop "$U" '{"session_id":"foreign","hook_event_name":"Stop","stop_hook_active":false}' >/dev/null
+    wake_control=$(mailput "$W" f6a00004 "$(mail_text f6a00004 'second socket wake control')" 0)
+    sqx "$CNTCTR_DB" "UPDATE mail SET socket='$sock2',pane='$U' WHERE post=$wake_control"
+    t2 set -p -t "$U" @cntctr_srv $$
+    TMUX="$sock2,0,0" daemon_start "$U"
+    daemon_hello
+    wait_mstate "second socket hook wakes for its positive control" "$wake_control" "pending/1/0"
+    refute "hook wake skips same-name mail from a different socket" "$(t2 capture-pane -p -J -t "$U")" "$(pointer "$m")"
+    same "hook wake leaves foreign-socket mail unchanged" "$(mstate "$m")" "pending/0/0"
+    same "original mail remains on the first socket" "$(sqx "$CNTCTR_DB" "SELECT socket FROM mail WHERE post=$m")" "$first_socket"
+    daemon_stop
+    exec 24>&- 25<&-
+    kill "$HK_PID_c2" 2>/dev/null
+    wait "$HK_PID_c2" 2>/dev/null
+    t2 kill-server 2>/dev/null
+
+    U5_SCOPE="$saved_scope"
 
     # (b) a session whose SessionStart was never recorded, after a restart, with old mail for a dead agent
     U=$(newpane f6_user); t set -p -t "$U" @cntctr_harness claude
@@ -1626,15 +2132,21 @@ f6_5() {
     ans=$(c_prompt "$P" "$(pointer "$id")")
     check "F5 the prompt attaches the mail" "$(ctx_c "$ans")" "mail whose turn is cancelled"
     same "F5 the mail is staged" "$(mstate "$id")" "staged/1/0"
-    # the user cancels: no Stop comes. The screen reads idle; after the wake window the mail is pending and the line is typed again
+    # Simulate the lease expiring without a Stop, after the last event becomes stale.
+    expire_mail "$id"
+    sqx "$CNTCTR_DB" "UPDATE hook_sessions SET at=1 WHERE pane='$P'"
     wait_mstate "F5 with no Stop and an idle screen the mail is pending again and the line is typed a second time" "$id" "pending/2/0"
     lines=$(screen "$P" | grep -c '\[cntctr mail id=')   # cat shows each typed line twice
     same "F5 the pointer is on the screen twice, typed twice" "$lines" 4
     ans=$(c_prompt "$P" "$(pointer "$id")")
-    check "F5 the second presentation attaches it again" "$(ctx_c "$ans")" "mail whose turn is cancelled"
+    same "F5 retry has the full small envelope" "$(ctx_c "$ans")" "$(sq "$CNTCTR_DB" "SELECT text FROM posts WHERE rowid=$id")"
+    expire_mail "$id"
+    sqx "$CNTCTR_DB" "UPDATE hook_sessions SET at=1 WHERE pane='$P'"
     wait_mstate "F5 again no Stop: pending, typed a third time" "$id" "pending/3/0"
     ans=$(c_prompt "$P" "$(pointer "$id")")
-    check "F5 the third presentation attaches it" "$(ctx_c "$ans")" "mail whose turn is cancelled"
+    same "F5 third presentation has the full small envelope" "$(ctx_c "$ans")" "$(sq "$CNTCTR_DB" "SELECT text FROM posts WHERE rowid=$id")"
+    expire_mail "$id"
+    sqx "$CNTCTR_DB" "UPDATE hook_sessions SET at=1 WHERE pane='$P'"
     wait_mstate "F5 the third presentation ended without delivery: stalled" "$id" "stalled/3/0"
     same "F5 the sender is told once" "$(notices "$id")" 1
     sleep 3
@@ -1643,7 +2155,7 @@ f6_5() {
     unset CNTCTR_WAKE_SEC
 }
 
-# f6_8: an agy end of turn with a terminationReason this code does not know gave no reminder: the mail goes back to pending, the parent is told nothing
+# f6_8: an unrecognized agy terminationReason leaves its claim unresolved and sends no reminder.
 f6_8() {
     local PAR AW out T id ans
     PAR=$(newpane f6_par8)
@@ -1654,7 +2166,7 @@ f6_8() {
     check "F8 the mail is attached" "$(ctx_a "$ans")" "a job that ends in a strange way"
     ans=$(a_stop "$AW" MAX_STEPS)
     emptyans "$ans" && ok_ || bad "F8 a Stop with an unknown terminationReason passes" "  got: $ans"
-    same "F8 its mail is back to pending" "$(mstate "$id")" "pending/1/0"
+    same "F8 an unrecognized Stop leaves its lease unacknowledged" "$(mstate "$id")" "staged/1/0"
     same "F8 the parent is not told 'no reply after one reminder'" "$(stopped "$T")" 0
 }
 
@@ -1664,7 +2176,7 @@ f6_9() {
     sockpath=$(t display -p '#{socket_path}')
     rm -f "$d" "$d-wal" "$d-shm"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
-    same "F9 a new database carries a schema version" "$(sqx "$d" 'PRAGMA user_version')" 1
+    same "F9 a new database carries a schema version" "$(sqx "$d" 'PRAGMA user_version')" 8
     same "F9 and the machine row" "$(sqx "$d" "SELECT count(*) FROM meta WHERE k='machine'")" 1
     sqx "$d" "DELETE FROM meta WHERE k='machine'"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
@@ -1672,7 +2184,22 @@ f6_9() {
     sqx "$d" "ALTER TABLE mail DROP COLUMN socket; ALTER TABLE task_gate DROP COLUMN answered; PRAGMA user_version=0"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
     same "F9 an older database gets its columns back" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")$(sqx "$d" "SELECT count(*) FROM pragma_table_info('task_gate') WHERE name='answered'")" 11
-    same "F9 and the current version" "$(sqx "$d" 'PRAGMA user_version')" 1
+    same "F9 and the current version" "$(sqx "$d" 'PRAGMA user_version')" 8
+    sqx "$d" "ALTER TABLE mail DROP COLUMN wake_attempts; PRAGMA user_version=6"
+    CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
+    same "F9 version six migrates the durable wake counter" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='wake_attempts'")$(sqx "$d" 'PRAGMA user_version')" 18
+    sqx "$d" "ALTER TABLE mail DROP COLUMN lease_until;
+      INSERT INTO posts(rowid,scope,sender,text,at) VALUES(41,'scope','sender','first',1),(42,'scope','sender','last',2);
+      INSERT INTO mail(post,name,pane,socket,state,shown,wake_attempts,staged_turn)
+        VALUES(41,'worker','%1','oldsocket','staged',2,1,'old:1'),(42,'worker','%1','oldsocket','staged',3,2,'old:1');
+      INSERT INTO hook_sessions(socket,pane,harness,session_id,harness_pid,last_event,at)
+        VALUES('oldsocket','%1','claude','legacy',1,'UserPromptSubmit',1);
+      PRAGMA user_version=7;"
+    CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
+    CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
+    same "F9 leases preserve legacy ids, bindings and charges" "$(sqx "$d" "SELECT group_concat(post||':'||pane||':'||socket||':'||state||':'||shown||':'||wake_attempts||':'||lease_until) FROM mail WHERE post IN(41,42)")" '41:%1:oldsocket:pending:2:1:0,42:%1:oldsocket:stalled:3:2:0'
+    same "F9 migration creates one durable sender notice" "$(sqx "$d" "SELECT count(*) FROM posts JOIN mail ON post=posts.rowid WHERE name='sender' AND text LIKE '%board id=42'")" 1
+    same "F9 migration seeds the active hook generation" "$(sqx "$d" "SELECT length(generation) FROM hook_sessions WHERE session_id='legacy'")" 32
 }
 
 # ---- fix round 7 (F7_1 to F7_6) ----
@@ -1719,22 +2246,25 @@ f7_1() {
     same "F7.1 served: the Stop delivers it" "$(mstate "$id2")" "delivered/1/1"
 }
 
-# f7_2: a database stamped at a higher schema version (a newer build wrote it) is opened as it is and never stamped down
+# f7_2: a newer database is left untouched and writer paths refuse it.
 f7_2() {
     local d="$TMPD/f7_2.db" sockpath
     sockpath=$(t display -p '#{socket_path}')
     rm -f "$d" "$d-wal" "$d-shm"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
-    sqx "$d" "ALTER TABLE mail DROP COLUMN socket; PRAGMA user_version=7"
-    CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
-    same "F7.2 a newer database keeps its higher stamp" "$(sqx "$d" 'PRAGMA user_version')" 7
+    sqx "$d" "ALTER TABLE mail DROP COLUMN socket; PRAGMA user_version=999"
+    same "F7.2 hook refuses newer schema" "$(CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0)" no
+    local response
+    response=$(CNTCTR_DB=$d rpc "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"recall","arguments":{}}}' | tail -n 1)
+    check "F7.2 MCP reports newer schema" "$(txt "$response")" 'newer schema'
+    same "F7.2 a newer database keeps its higher stamp" "$(sqx "$d" 'PRAGMA user_version')" 999
     same "F7.2 and is not migrated by this build" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")" 0
     sqx "$d" "PRAGMA user_version=0"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
-    same "F7.2 an older database is migrated and stamped" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")$(sqx "$d" 'PRAGMA user_version')" 11
+    same "F7.2 an older database is migrated and stamped" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")$(sqx "$d" 'PRAGMA user_version')" 18
 }
 
-# f7_3: staged mail is released after a cancelled turn only for a spawned worker; a user's own session is left to its next prompt event
+# f7_3: an abandoned user's claim is protected until its lease expires.
 f7_3() {
     local S P out task id ans
     S=$(newpane f7_snd3)
@@ -1755,7 +2285,10 @@ f7_3() {
     same "F7.3 with no Stop it stays staged for a session with no parent" "$(mstate "$id")" "staged/1/0"
     same "F7.3 and nothing more was typed" "$(screen "$P" | grep -c '\[cntctr mail id=')" 2   # cat shows each typed line twice
     ans=$(c_prompt "$P" "my next question")
-    same "F7.3 the user's next prompt event makes it pending again" "$(mstate "$id")" "pending/1/0"
+    same "F7.3 the user's next prompt leaves the live lease staged" "$(mstate "$id")" "staged/1/0"
+    expire_mail "$id"
+    c_prompt "$P" "my question after expiry" >/dev/null
+    same "F7.3 the expired lease becomes pending again" "$(mstate "$id")" "pending/1/0"
     daemon_stop
     unset CNTCTR_WAKE_SEC
 }
@@ -1848,11 +2381,399 @@ f8_4() {
     sqlite3 "$old" < tests/schema_v0.1.0.sql   # what a 0.1.0 database holds
     CNTCTR_DB=$old TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null   # opening migrates it
     sqlite3 "$stamped" < tests/schema_stamp1.sql   # a database stamped version 1, the schema of that version
+    sqx "$stamped" "INSERT INTO mail(post,name,pane,staged_turn,presentations)
+        VALUES(1,'legacy','%1','old-turn',0),(2,'wake_only','%2',NULL,9);"
     CNTCTR_DB=$stamped TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
+    same "F8.4 legacy staging token preserves one body attempt" "$(sqx "$stamped" "SELECT shown FROM mail WHERE post=1")" 1
+    same "F8.4 legacy token does not prove a full body" "$(sqx "$stamped" "SELECT staged_full FROM mail WHERE post=1")" 0
+    same "F8.4 pointer-only history keeps zero body attempts" "$(sqx "$stamped" "SELECT shown FROM mail WHERE post=2")" 0
+    sqx "$stamped" "UPDATE mail SET shown=2, staged_full=1 WHERE post=1;
+        INSERT INTO mail(post,name,pane,staged_turn) VALUES(3,'legacy_v3','%3','old-turn');
+        PRAGMA user_version=3;"
+    CNTCTR_DB=$stamped TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
+    same "F8.4 migration preserves existing count and full-body flag" "$(sqx "$stamped" "SELECT shown||'/'||staged_full FROM mail WHERE post=1")" "2/1"
+    same "F8.4 v3 token with zero attempts is backfilled" "$(sqx "$stamped" "SELECT shown||'/'||staged_full FROM mail WHERE post=3")" "1/0"
     CNTCTR_DB=$fresh TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
     same "F8.4 the stamped database has the tables and columns of a new one" "$(sqx "$stamped" "$cols")" "$(sqx "$fresh" "$cols")"
     same "F8.4 the migrated database has the tables and columns of a new one" "$(sqx "$old" "$cols")" "$(sqx "$fresh" "$cols")"
     check "F8.4 (and the list is not empty)" "$(sqx "$fresh" "$cols")" "mail.socket"
+}
+
+# W1-3: hold a recorded Stop while the same harness records the next turn.
+f8_5() {
+    local P old id ans ready old_claim new_claim
+    P=$(hk_agent claude late_stop)
+    old=$(mailput "$P" f8000004 "$(mail_text f8000004 'mail for turn N')" 1)
+    c_prompt "$P" "$(pointer "$old")" >/dev/null
+    old_claim=$(sqx "$CNTCTR_DB" "SELECT shown||'/'||staged_turn FROM mail WHERE post=$old")
+    id=$(mailput "$P" f8000005 "$(mail_text f8000005 'mail for turn N plus one')" 1)
+    printf '%s' '{"session_id":"S1","hook_event_name":"Stop","stop_hook_active":false}' > "$TMPD/late_stop_event"
+    touch "$TMPD/hold_stop"
+    printf 'Stop %s %s %s async\n' "$TMPD/late_stop_event" "$P" "$TMPD/late_stop_answer" >&20
+    read -r ready <&21
+    waitfor_hook_pause "$TMPD/hold_stop.ready"
+    same "paused Stop has captured its old claim before acknowledging" "$(mstate "$old")" staged/1/0
+    ans=$(c_prompt "$P" "$(pointer "$id")")
+    same "newer prompt stages the exact mail body" "$(ctx_c "$ans")" "$(mail_text f8000005 'mail for turn N plus one')"
+    new_claim=$(sqx "$CNTCTR_DB" "SELECT shown||'/'||staged_turn FROM mail WHERE post=$id")
+    rm -f "$TMPD/hold_stop"
+    waitfor_hook_pause "$TMPD/late_stop_answer"
+    ans=$(cat "$TMPD/late_stop_answer")
+    emptyans "$ans" && ok_ || bad "displaced Stop returns a neutral answer" "  got: $ans"
+    same "old Stop acknowledges exactly mail staged in its turn" "$(mstate "$old")" "delivered/1/1"
+    same "old Stop cannot acknowledge mail staged in the newer turn" "$(mstate "$id")" "staged/1/0"
+    same "old Stop finishes its exact attempt and token" \
+        "$(sqx "$CNTCTR_DB" "SELECT shown||'/'||staged_turn FROM mail WHERE post=$old")" "$old_claim"
+    same "superseded Stop preserves the newer attempt and token" \
+        "$(sqx "$CNTCTR_DB" "SELECT shown||'/'||staged_turn FROM mail WHERE post=$id")" "$new_claim"
+    c_stop "$P" >/dev/null
+    same "Stop of the newer turn acknowledges its own mail" "$(mstate "$id")" "delivered/1/1"
+
+    # A new SessionStart can reuse the same session ID and turn number.
+    local old_token new_token
+    c_start "$P" >/dev/null
+    id=$(mailput "$P" f8000006 "$(mail_text f8000006 'mail across session restart')" 1)
+    c_prompt "$P" "$(pointer "$id")" >/dev/null
+    old_token=$(sqx "$CNTCTR_DB" "SELECT staged_turn FROM mail WHERE post=$id")
+    c_start "$P" >/dev/null
+    same "session restart preserves the active lease" "$(mstate "$id")" "staged/1/0"
+    expire_mail "$id"
+    ans=$(c_prompt "$P" "$(pointer "$id")")
+    same "new generation can restage mail left by the old generation" "$(ctx_c "$ans")" "$(mail_text f8000006 'mail across session restart')"
+    new_token=$(sqx "$CNTCTR_DB" "SELECT staged_turn FROM mail WHERE post=$id")
+    [ -n "$old_token" ] && [ -n "$new_token" ] && [ "$old_token" != "$new_token" ] && ok_ || bad "new generation has a distinct turn token"
+
+}
+
+waitfor_hook_pause() {
+    local i
+    for i in $(seq 100); do
+        [ -s "$1" ] && return
+        sleep 0.01
+    done
+    bad "hook synchronization timed out for $1"
+}
+
+wait_for_mail_enter() {
+    local i
+    for i in $(seq 160); do
+        [ -s "$1" ] && return
+        sleep 0.05
+    done
+    bad "tmux Enter did not reach the lease barrier $1"
+}
+
+# Attach a pointer while its injector is still returning from tmux, in both modes.
+lease_early_prompt() {
+    local S P first id kind bar job out ctx
+    S=$(newpane lease_waker)
+    for kind in healthy quiet; do
+        if [ "$kind" = quiet ]; then
+            P=$(hk_agent claude lease_quiet /bin/cat)
+            sqx "$CNTCTR_DB" "UPDATE hook_sessions SET broken=1 WHERE pane='$P'"
+        else
+            P=$(hk_agent claude lease_healthy)
+        fi
+        first=$(mailput "$P" l0000001 "$(mail_text l0000001 "$kind first row")" 0)
+        bar="$TMPD/$kind-enter"
+        : > "$bar"
+        CNTCTR_TEST_MAIL_ENTER="$bar" CNTCTR_TEST_MAIL_WHEN=after \
+            call "$S" send "{\"to\":\"lease_$kind\",\"text\":\"$kind pointer body\"}" > "$bar.out" &
+        job=$!
+        wait_for_mail_enter "$bar.ready"
+        id=$(sqx "$CNTCTR_DB" "SELECT max(post) FROM mail WHERE pane='$P'")
+        same "$kind wake charges before returning from tmux" \
+            "$(sqx "$CNTCTR_DB" "SELECT wake_attempts||'/'||shown FROM mail WHERE post=$id")" 1/0
+        same "$kind wake reserves the pane once" "$(sqx "$CNTCTR_DB" "SELECT wake_reserved FROM hook_sessions WHERE pane='$P'")" 1
+        out=$(c_prompt "$P" "$(pointer "$id")")
+        ctx=$(ctx_c "$out")
+        check "$kind prompt claims the wake row" "$ctx" "$kind pointer body"
+        check "$kind prompt also claims the older row" "$ctx" "$kind first row"
+        same "$kind prompt consumes reservation at claim" "$(sqx "$CNTCTR_DB" "SELECT wake_reserved FROM hook_sessions WHERE pane='$P'")" 0
+        same "$kind older row spends no wake charge" "$(sqx "$CNTCTR_DB" "SELECT wake_attempts FROM mail WHERE post=$first")" 0
+        rm -f "$bar"
+        wait "$job" || bad "$kind wake sender failed"
+        c_stop "$P" >/dev/null
+        same "$kind Stop acknowledges both charged rows" \
+            "$(sqx "$CNTCTR_DB" "SELECT count(*) FROM mail WHERE post IN ($first,$id) AND shown=1 AND state='delivered'")" 2
+    done
+}
+
+lease_ordinary_prompt() {
+    local S P id now out before
+    S=$(newpane lease_prompt_sender); P=$(hk_agent claude lease_prompt_live)
+    out=$(txt "$(call "$S" send '{"to":"lease_prompt_live","text":"keep queued after ordinary prompt"}')")
+    id=$(mailid "${out#sent id=}")
+    same "wake is reserved before an ordinary prompt" "$(sqx "$CNTCTR_DB" "SELECT wake_reserved FROM hook_sessions WHERE pane='$P'")" 1
+    # Put the original deadline one second away under the watcher interval.
+    now=$(date +%s)
+    sqx "$CNTCTR_DB" "UPDATE hook_sessions SET wake_at=$((now-2)) WHERE pane='$P'"
+    before=$(screen "$P")
+    out=$(c_prompt "$P" 'ordinary user prompt')
+    emptyans "$out" && ok_ || bad "ordinary prompt does not attach mail" "  got: $out"
+    same "ordinary prompt clears wake reservation and timestamp" \
+        "$(sqx "$CNTCTR_DB" "SELECT wake_reserved||'/'||(wake_at IS NULL) FROM hook_sessions WHERE pane='$P'")" 0/1
+    sleep 2
+    CNTCTR_WAKE_SEC=3 daemon_start "$P"
+    daemon_hello
+    same "responsive generation stays healthy across the old wake deadline" \
+        "$(sqx "$CNTCTR_DB" "SELECT broken FROM hook_sessions WHERE pane='$P'")" 0
+    same "old deadline submits no terminal body" "$(screen "$P")" "$before"
+    same "mail remains queued without a body claim" "$(mstate "$id")" pending/1/0
+    daemon_stop
+}
+
+lease_failed_pointer_claim() {
+    local S P id out now
+    S=$(newpane lease_claim_sender); P=$(hk_agent claude lease_claim_live)
+    out=$(txt "$(call "$S" send '{"to":"lease_claim_live","text":"wake with rejected claim"}')")
+    id=$(mailid "${out#sent id=}")
+    now=$(date +%s)
+    sqx "$CNTCTR_DB" "UPDATE hook_sessions SET wake_at=$((now-2)) WHERE pane='$P';
+        CREATE TRIGGER reject_pointer_claim BEFORE UPDATE OF state ON mail
+        WHEN NEW.post=$id AND NEW.state='staged' BEGIN SELECT RAISE(ABORT,'rejected pointer claim'); END"
+    same "wake is reserved before a failed pointer claim" "$(sqx "$CNTCTR_DB" "SELECT wake_reserved FROM hook_sessions WHERE pane='$P'")" 1
+    out=$(c_prompt "$P" "$(pointer "$id")")
+    emptyans "$out" && ok_ || bad "failed pointer claim returns no mail"
+    sleep 2
+    CNTCTR_WAKE_SEC=3 daemon_start "$P"
+    daemon_hello
+    same "failed pointer claim leaves the responsive hook healthy" \
+        "$(sqx "$CNTCTR_DB" "SELECT wake_reserved||'/'||broken||(case when wake_at is null then '/empty' else '/set' end) FROM hook_sessions WHERE pane='$P'")" 0/0/empty
+    same "rejected body claim remains pending" "$(mstate "$id")" pending/1/0
+    refute "failed pointer does not submit a terminal body" "$(screen "$P")" "wake with rejected claim"
+    daemon_stop
+    sqx "$CNTCTR_DB" "DROP TRIGGER reject_pointer_claim"
+}
+
+lease_start_second() {
+    local P S old id epoch out
+    P=$(newpane lease_start_second); S=$(newpane lease_start_second_sender)
+    epoch=$(t display -p '#{start_time}')
+    old=$(mailput "$P" l0000081 "$(mail_text l0000081 'old ambiguous same-second row')" 0 "$epoch")
+    sqx "$CNTCTR_DB" "CREATE TRIGGER send_at_server_start AFTER INSERT ON posts
+        WHEN NEW.text LIKE '%fresh same-second body%' BEGIN UPDATE posts SET at=$epoch WHERE rowid=NEW.rowid; END"
+    out=$(txt "$(call "$S" send '{"to":"lease_start_second","text":"fresh same-second body"}')")
+    id=$(mailid "${out#sent id=}")
+    same "new send is stamped in the server start second" "$(sqx "$CNTCTR_DB" "SELECT at FROM posts WHERE rowid=$id")" "$epoch"
+    same "direct send finishes the new row in the start second" "$(mstate "$id")" delivered/0/1
+    check "recipient receives fresh same-second body" "$(screen "$P")" "fresh same-second body"
+    daemon_start "$P"
+    daemon_hello
+    daemon_stop
+    same "watcher leaves an ambiguous old same-second row pending" "$(mstate "$old")" pending/0/0
+    refute "old same-second body stays off terminal" "$(screen "$P")" "old ambiguous same-second row"
+    P=$(hk_agent claude lease_hook_start_second)
+    out=$(txt "$(call "$S" send '{"to":"lease_hook_start_second","text":"fresh same-second body for hook"}')")
+    sqx "$CNTCTR_DB" "DROP TRIGGER send_at_server_start"
+    check "same-second send to a hook reports board fallback" "$out" " on board"
+    out=${out% on board}
+    id=$(mailid "${out#sent id=}")
+    same "board-only same-second row spends no automatic attempts" \
+        "$(sqx "$CNTCTR_DB" "SELECT shown||'/'||wake_attempts FROM mail WHERE post=$id")" 0/0
+    out=$(c_prompt "$P" "$(pointer "$id")")
+    emptyans "$out" && ok_ || bad "ambiguous same-second pointer stays off the hook"
+    check "hook recipient can recover the fresh body by ID" "$(txt "$(call "$P" board "{\"id\":$id}")")" "fresh same-second body for hook"
+}
+
+lease_failed_spill() {
+    local P id out payload before after
+    P=$(hk_agent claude lease_failed_spill)
+    payload=$(head -c 18000 /dev/zero | tr '\0' x)
+    id=$(mailput "$P" l0000082 "$(mail_text l0000082 "$payload")" 1)
+    before=$(find "$HOME/.cache" -name 'mail-*' -type f 2>/dev/null | wc -l | tr -d ' ')
+    sqx "$CNTCTR_DB" "CREATE TRIGGER fail_spill_claim BEFORE UPDATE OF state ON mail
+        WHEN NEW.post=$id AND NEW.state='staged' BEGIN SELECT RAISE(ABORT,'failed spill claim'); END"
+    out=$(c_prompt "$P" "$(pointer "$id")")
+    emptyans "$out" && ok_ || bad "failed oversized claim returns neutral output"
+    same "failed oversized claim leaves mail pending" "$(mstate "$id")" pending/1/0
+    after=$(find "$HOME/.cache" -name 'mail-*' -type f 2>/dev/null | wc -l | tr -d ' ')
+    same "failed oversized claim leaves no orphan spill" "$after" "$before"
+    sqx "$CNTCTR_DB" "DROP TRIGGER fail_spill_claim"
+}
+
+lease_late_terminal() {
+    local S P bar job id out reconciling=${1:-0}
+    S=$(newpane lease_terminal_sender); P=$(newpane "lease_late_$reconciling")
+    bar="$TMPD/terminal-enter-$reconciling"
+    : > "$bar"
+    CNTCTR_TEST_MAIL_ENTER="$bar" CNTCTR_TEST_MAIL_WHEN=before \
+        call "$S" send "{\"to\":\"lease_late_$reconciling\",\"text\":\"late submission lease body\"}" > "$bar.out" &
+    job=$!
+    wait_for_mail_enter "$bar.ready"
+    id=$(sqx "$CNTCTR_DB" "SELECT max(post) FROM mail WHERE pane='$P'")
+    same "terminal attempt is durable before Enter" \
+        "$(sqx "$CNTCTR_DB" "SELECT state||'/'||shown||'/'||(lease_until>strftime('%s','now')) FROM mail WHERE post=$id")" staged/1/1
+    if [ "$reconciling" -eq 0 ]; then
+        sqx "$CNTCTR_DB" "CREATE TRIGGER defer_terminal_reconcile BEFORE UPDATE OF state ON mail
+            WHEN OLD.post=$id AND NEW.state='pending' BEGIN SELECT RAISE(IGNORE); END"
+    fi
+    expire_mail "$id"
+    if [ "$reconciling" -eq 1 ]; then
+        c_start "$P" >/dev/null
+        out=$(c_prompt "$P" "$(pointer "$id")")
+        emptyans "$out" && ok_ || bad "terminal row lock protects the paused emitter" "  got: $out"
+    fi
+    rm -f "$bar"
+    wait "$job" || bad "paused terminal sender failed"
+    check "late Enter finishes submitting the body" "$(screen "$P")" "late submission lease body"
+    check "sender sees the expired submission left on board" "$(txt "$(cat "$bar.out")")" "on board"
+    if [ "$reconciling" -eq 1 ]; then
+        same "late terminal submission cannot finish a reclaimed row" "$(mstate "$id")" pending/0/0
+    else
+        same "late terminal submission cannot finish before reconcile" \
+            "$(sqx "$CNTCTR_DB" "SELECT state||'/'||shown||'/'||delivered FROM mail WHERE post=$id")" staged/1/0
+        sqx "$CNTCTR_DB" "DROP TRIGGER defer_terminal_reconcile"
+        c_start "$P" >/dev/null
+        same "hook entry makes the expired claim reclaimable" "$(mstate "$id")" pending/0/0
+    fi
+    out=$(c_prompt "$P" "$(pointer "$id")")
+    check "next hook can claim the re-pended terminal body" "$(ctx_c "$out")" "late submission lease body"
+    c_stop "$P" >/dev/null
+    same "the new attempt alone finishes the row" \
+        "$(sqx "$CNTCTR_DB" "SELECT state||'/'||shown FROM mail WHERE post=$id")" delivered/2
+}
+
+lease_failed_stop() {
+    local P first id event row out q
+    P=$(hk_agent claude lease_failed_stop)
+    first=$(mailput "$P" l0000012 "$(mail_text l0000012 'first Stop claim')" 0)
+    id=$(mailput "$P" l0000002 "$(mail_text l0000002 'rollback owned Stop claim')" 1)
+    c_prompt "$P" "$(pointer "$id")" >/dev/null
+    q="SELECT generation||'/'||turn||'/'||event_seq||'/'||last_event||'/'||at FROM hook_sessions WHERE pane='$P'"
+    event=$(sqx "$CNTCTR_DB" "$q")
+    row=$(sqx "$CNTCTR_DB" "SELECT state||'/'||shown||'/'||staged_turn||'/'||lease_until FROM mail WHERE post=$id")
+    sqx "$CNTCTR_DB" "CREATE TRIGGER fail_stop_ack BEFORE UPDATE OF delivered ON mail
+        WHEN NEW.post=$id AND NEW.delivered=1 BEGIN SELECT RAISE(ABORT,'failed Stop acknowledgement'); END"
+    out=$(c_stop "$P")
+    emptyans "$out" && ok_ || bad "failed Stop sends no decision" "  got: $out"
+    same "failed Stop rolls back its event and turn" "$(sqx "$CNTCTR_DB" "$q")" "$event"
+    same "failed Stop also rolls back the earlier acknowledgement" "$(mstate "$first")" staged/1/0
+    same "failed Stop rolls back its claim decision" \
+        "$(sqx "$CNTCTR_DB" "SELECT state||'/'||shown||'/'||staged_turn||'/'||lease_until FROM mail WHERE post=$id")" "$row"
+    sqx "$CNTCTR_DB" "DROP TRIGGER fail_stop_ack"
+    c_stop "$P" >/dev/null
+    same "retry acknowledges both original claims" "$(mstate "$first")/$(mstate "$id")" delivered/1/1/delivered/1/1
+}
+
+lease_legacy_stage() {
+    local P id db
+    P=$(hk_agent claude lease_legacy)
+    id=$(mailput "$P" l0000003 "$(mail_text l0000003 'active legacy claim')" 1)
+    c_prompt "$P" "$(pointer "$id")" >/dev/null
+    db="$TMPD/legacy-active.db"
+    sqx "$CNTCTR_DB" ".backup '$db'"
+    sqx "$db" "ALTER TABLE mail DROP COLUMN lease_until;
+        UPDATE hook_sessions SET generation='' WHERE pane='$P'; PRAGMA user_version=7"
+    same "migration keeps the active session responsive" "$(CNTCTR_DB="$db" "$BIN" hook status "$P")" yes
+    same "migration seeds the active session generation" \
+        "$(sqx "$db" "SELECT length(generation) FROM hook_sessions WHERE pane='$P'")" 32
+    same "legacy staged claim is reclaimable with its attempt intact" \
+        "$(sqx "$db" "SELECT state||'/'||shown||'/'||lease_until FROM mail WHERE post=$id")" pending/1/0
+}
+
+lease_idle_watcher() {
+    local P log before
+    P=$(newpane lease_idle_watcher)
+    log="$TMPD/idle-tmux.log"
+    CNTCTR_WAKE_SEC=1 CNTCTR_TEST_IDLE_LOG="$log" daemon_start "$P"
+    daemon_hello
+    sleep 1
+    before=$(wc -l < "$log")
+    sleep 6   # the idle poll is capped at 4 intervals (4 s here); wait past one capped wake
+    same "idle watcher makes no tmux calls across a capped idle wake" "$(wc -l < "$log")" "$before"
+    daemon_stop
+}
+
+lease_stall_notice_wakes() {
+    local S P id
+    S=$(newpane lease_stall_sender); P=$(hk_agent claude lease_stall_worker)
+    CNTCTR_WAKE_SEC=1 daemon_start "$S"
+    daemon_hello
+    # Ensure the sender has scanned its empty queue before giving the hook any work.
+    sleep 1
+    id=$(mailput "$P" l0000083 "$(mail_text l0000083 'stall for idle sender')" 1)
+    sqx "$CNTCTR_DB" "UPDATE posts SET sender='lease_stall_sender' WHERE rowid=$id;
+        UPDATE mail SET state='staged',shown=3,lease_until=1,from_pane='$S' WHERE post=$id"
+    c_prompt "$P" 'ordinary prompt after lease expiry' >/dev/null
+    same "hook stalls exhausted mail" "$(mstate "$id")" stalled/1/0
+    expect_screen "hook stall wakes an idle sender without another event" "$S" "undelivered after 3 attempts: $id"
+    same "hook created one notice for the sleeping sender" "$(notices "$id")" 1
+    same "stall notice carries no return route" "$(sqx "$CNTCTR_DB" "SELECT '['||from_pane||'/'||from_scope||']' FROM mail JOIN posts ON posts.rowid=mail.post WHERE text LIKE '%undelivered after 3 attempts: $id to %'")" "[/]"
+    daemon_stop
+}
+
+lease_attach_idle_watcher() {
+    local S P id i
+    S=$(newpane lease_attach_sender); P=$(hk_agent claude lease_attach_worker)
+    CNTCTR_WAKE_SEC=1 daemon_start "$S"
+    daemon_hello
+    sleep 1   # the sender's watcher has scanned an empty queue and sleeps
+    id=$(mailput "$P" l0000084 "$(mail_text l0000084 'third body for idle sender')" 1)
+    sqx "$CNTCTR_DB" "UPDATE posts SET sender='lease_attach_sender' WHERE rowid=$id;
+        UPDATE mail SET shown=2,from_pane='$S' WHERE post=$id"
+    c_prompt "$P" "$(pointer "$id")" >/dev/null
+    same "pointer attach stages the third body" "$(sqx "$CNTCTR_DB" "SELECT state||'/'||shown FROM mail WHERE post=$id")" staged/3
+    expire_mail "$id"   # no hook event or FIFO byte follows
+    for i in $(seq 100); do [ "$(mstate "$id")" = stalled/1/0 ] && break; sleep 0.1; done
+    same "idle watcher stalls the attached lease on its own" "$(mstate "$id")" stalled/1/0
+    for i in $(seq 50); do [ "$(notices "$id")" = 1 ] && break; sleep 0.1; done
+    same "idle watcher creates the notice on its own" "$(notices "$id")" 1
+    daemon_stop
+}
+
+lease_deadlines() {
+    local S P id fifo start i out
+    S=$(newpane lease_deadline_watcher); P=$(hk_agent claude lease_deadline_target)
+    id=$(mailput "$P" l0000004 "$(mail_text l0000004 'dropped hook response near the cap')" 1)
+    sqx "$CNTCTR_DB" "UPDATE mail SET shown=2,wake_attempts=3 WHERE post=$id"
+    c_prompt "$P" "$(pointer "$id")" >/dev/null
+    same "dropping host response keeps the third attempt charged" \
+        "$(sqx "$CNTCTR_DB" "SELECT state||'/'||shown||'/'||wake_attempts FROM mail WHERE post=$id")" staged/3/3
+    start=$(date +%s)
+    sqx "$CNTCTR_DB" "UPDATE hook_sessions SET wake_reserved=1,wake_at=$((start-5)) WHERE pane='$P';
+        UPDATE mail SET pane='%99999',lease_until=$((start+3)) WHERE post=$id"
+    CNTCTR_WAKE_SEC=8 daemon_start "$S"
+    daemon_hello
+    fifo="$(realpath "${TMPDIR:-/tmp}")/cntctr-$(id -u)/tools/$DPID.fifo"
+    for i in $(seq 50); do [ -p "$fifo" ] && break; sleep 0.02; done
+    if [ -p "$fifo" ]; then
+        printf m > "$fifo"
+    else
+        bad "deadline watcher registered its FIFO"
+    fi
+    for i in $(seq 120); do
+        [ "$(sqx "$CNTCTR_DB" "SELECT state FROM mail WHERE post=$id")" = stalled ] && break
+        [ "$(date +%s)" -lt "$((start+7))" ] || break
+        sleep 0.05
+    done
+    same "early FIFO scan preserves the original wake deadline" \
+        "$(sqx "$CNTCTR_DB" "SELECT wake_reserved||'/'||broken FROM hook_sessions WHERE pane='$P'")" 0/1
+    same "watcher stalls an expired cap even with no eligible recipient" "$(mstate "$id")" stalled/1/0
+    same "lease expiry and one sender notice commit together" "$(notices "$id")" 1
+    daemon_stop
+    daemon_start "$S"
+    daemon_hello
+    same "restart cannot give the capped row another body charge" \
+        "$(sqx "$CNTCTR_DB" "SELECT state||'/'||shown FROM mail WHERE post=$id")" stalled/3
+    same "restart cannot duplicate sender notice" "$(notices "$id")" 1
+    daemon_stop
+}
+
+f8_6() {
+    lease_idle_watcher
+    lease_stall_notice_wakes
+    lease_attach_idle_watcher
+    lease_early_prompt
+    lease_ordinary_prompt
+    lease_failed_pointer_claim
+    lease_start_second
+    lease_failed_spill
+    lease_late_terminal
+    lease_late_terminal 1
+    lease_failed_stop
+    lease_legacy_stage
+    lease_deadlines
 }
 
 u5p6_run() {
@@ -1860,7 +2781,7 @@ u5p6_run() {
     local f
     for f in ${F6:-1 2 3 4 5 6 7 8 9}; do declare -F "f6_$f" >/dev/null && "f6_$f"; done
     for f in ${F7:-1 2 3 4 5 6}; do declare -F "f7_$f" >/dev/null && "f7_$f"; done
-    for f in ${F8:-1 2 3 4}; do declare -F "f8_$f" >/dev/null && "f8_$f"; done
+    for f in ${F8:-1 2 3 4 5 6}; do declare -F "f8_$f" >/dev/null && "f8_$f"; done
     unset CNTCTR_PASTE_WAIT_MS
 }
 
@@ -1870,6 +2791,14 @@ u5_run() {   # U5PARTS="p3 p4" runs just those parts, in that order
     for part in ${U5PARTS:-p1 p2 p3 p4 p5 p6}; do "u5${part}_run"; done
     hk_stop
 }
+if [ "${ONLY:-}" = mail-lease ]; then
+    hk_boot
+    F6=none F7=none F8='5 6' u5p6_run
+    hk_stop
+    echo "$pass passed, $fail failed"
+    [ "$fail" -eq 0 ]; exit $?
+fi
+
 if [ "${ONLY:-}" = u5 ] || [ "${ONLY:-}" = u5p1 ] || [ "${ONLY:-}" = u5p2 ] || [ "${ONLY:-}" = u5p3 ] || [ "${ONLY:-}" = u5p4 ] || [ "${ONLY:-}" = u5p5 ] || [ "${ONLY:-}" = u5p6 ]; then
     case $ONLY in
         u5) u5_run ;;
@@ -2439,16 +3368,17 @@ check "note cannot write history" "$(txt "$(call "$KA" note '{"layer":"history",
 
 mkdir "$TMPD/repo" "$TMPD/plain"
 git -C "$TMPD/repo" init -q
-git -C "$TMPD/repo" remote add origin git@GitHub.com:X/y.git
+remote_repo="y-$(basename "$TMPD")"
+git -C "$TMPD/repo" remote add origin "git@GitHub.com:X/$remote_repo.git"
 KR=$(t new-window -d -n kr -c "$TMPD/repo" -P -F '#{pane_id}' cat)
 t set -p -t "$KR" @cntctr_name kr
-check "project key from the origin remote" "$(txt "$(call "$KR" project '{}')")" "project github.com/X/y (root "
-git -C "$TMPD/repo" remote set-url origin https://github.com/X/y.git/
-check "https remote normalizes the same" "$(txt "$(call "$KR" project '{}')")" "project github.com/X/y (root "
+check "project key from the origin remote" "$(txt "$(call "$KR" project '{}')")" "project github.com/X/$remote_repo (root "
+git -C "$TMPD/repo" remote set-url origin "https://github.com/X/$remote_repo.git/"
+check "https remote normalizes the same" "$(txt "$(call "$KR" project '{}')")" "project github.com/X/$remote_repo (root "
 same "project override" "$(txt "$(call "$KR" project '{"key":"foo"}')" | cut -d' ' -f1-2)" "project foo"
 same "override persists" "$(txt "$(call "$KR" project '{}')" | cut -d' ' -f1-2)" "project foo"
 call "$KR" project '{"key":""}' >/dev/null
-check "empty key removes the override" "$(txt "$(call "$KR" project '{}')")" "project github.com/X/y"
+check "empty key removes the override" "$(txt "$(call "$KR" project '{}')")" "project github.com/X/$remote_repo"
 KP=$(t new-window -d -n kp -c "$TMPD/plain" -P -F '#{pane_id}' cat)
 t set -p -t "$KP" @cntctr_name kp
 check "outside git the key is the directory" "$(txt "$(call "$KP" project '{}')")" "/plain (root "
@@ -2499,8 +3429,9 @@ call "$KB" reply "{\"id\":\"$hid\",\"text\":\"ok\",\"insights\":[\"$long\"]}" >/
 out=$(txt "$(call "$KA" recall '{}')")
 check "long unicode insight is listed" "$out" "[insight] xéé"
 refute "titles are cut on a character boundary" "$out" "�"
-out=$(CNTCTR_DB=/nonexistent/x.db call "$KA" send '{"to":"kb","text":"still delivered"}')
-check "send works without a knowledge store" "$(txt "$out")" "sent id="
+out=$(CNTCTR_DB=/nonexistent/x.db call "$KA" send '{"to":"kb","text":"mail requires a durable store"}')
+same "send reports an unavailable durable mail store" "$(txt "$out")" "could not store message for kb"
+refute "unavailable store leaves the pane clear of uncharged mail" "$(screen "$KB")" "mail requires a durable store"
 same "note reports a missing store" "$(txt "$(CNTCTR_DB=/nonexistent/x.db call "$KA" note '{"layer":"insight","title":"x","summary":"y"}')" | cut -c1-30)" "knowledge store unavailable: u"
 call "$KA" send '{"to":"kb","text":"why does Enter get lost in copy-mode?"}' >/dev/null
 expect_screen "envelope points at recall" "$KB" "[cntctr knowledge: call recall for more]"
@@ -2677,6 +3608,26 @@ check "the reviewer sees the pending version" "$(lst "$FA")" '[fleet] under revi
 refute "others do not see the pending version" "$(lst "$FB")" 'under review'
 same "published versions are unique" "$(row "$PK" prec 1 active fc dup "" 2>&1 | grep -c UNIQUE)" "1"
 
+# Mail for an author with no pane keeps the reviewer's socket: a same-name agent on another socket never sees it.
+FV=$(newpane fv)
+row "$PK" pvmail 1 pending pvauthor "pane-less author" "$FV"
+call "$FV" tool_verdict '{"name":"pvmail","version":1,"verdict":"approve"}' >/dev/null
+pvid=$(sqx "$CNTCTR_DB" "SELECT post FROM mail WHERE name='pvauthor' ORDER BY post DESC LIMIT 1")
+same "pane-less mail has no pane and keeps the reviewer's socket" \
+    "$(sqx "$CNTCTR_DB" "SELECT quote(pane)||'|'||socket FROM mail WHERE post=$pvid")" "''|$(t display -p '#{socket_path}')"
+t2 new-session -d -s pvother -c "$PWD" cat
+pv_sock=$(t2 display -p '#{socket_path}')
+pv_other=$(t2 display -p '#{pane_id}')
+t2 set -p -t "$pv_other" @cntctr_name pvauthor
+same "same-name caller on another socket cannot list pane-less mail" "$(txt "$(TMUX="$pv_sock,0,0" call_raw "$pv_other" board '{"mode":"mail"}')")" "0 total mail"
+same "same-name caller on another socket cannot read pane-less mail" "$(txt "$(TMUX="$pv_sock,0,0" call_raw "$pv_other" board "{\"id\":$pvid}")")" "mail not found"
+same "other socket leaves pane-less mail pending" "$(mstate "$pvid")" "pending/0/0"
+t2 kill-server
+FW=$(newpane pvauthor)
+check "same-name caller on the original socket lists pane-less mail" "$(txt "$(call "$FW" board '{"mode":"mail"}')")" "id=$pvid"
+check "same-name caller on the original socket reads pane-less mail" "$(txt "$(call "$FW" board "{\"id\":$pvid}")")" "pvmail"
+same "original socket finishes pane-less mail" "$(sqx "$CNTCTR_DB" "SELECT delivered FROM mail WHERE post=$pvid")" "1"
+
 # one name, five competing rows: pending (reviewer) > own draft > newest project active > global
 FR=$(newpane fr)
 FU=$(newpane fu)
@@ -2744,12 +3695,27 @@ deft envt 'env'
 out=$(export FOO_TOKEN=s OPENAI_API_KEY=s MY_SECRET=s; txt "$(use envt)")
 check "env reaches the tool" "$out" "CNTCTR_FD=3"
 refute "no tokens" "$out" FOO_TOKEN; refute "no keys" "$out" API_KEY; refute "no secrets" "$out" MY_SECRET; refute "no TMUX" "$out" "TMUX="
-python3 -c "import socket,time;s=socket.socket();s.bind(('127.0.0.1',47124));s.listen();time.sleep(8)" & LP=$!
-sleep 0.5
-deft neto 'nc -z -w1 127.0.0.1 47124 && echo open'
+python3 - "$TMPD/net-port" <<'PYTHON' &
+import socket
+import sys
+import time
+
+with socket.socket() as server:
+    server.bind(("127.0.0.1", 0))
+    server.listen()
+    with open(sys.argv[1], "w") as port:
+        print(server.getsockname()[1], file=port)
+    time.sleep(30)
+PYTHON
+LP=$!
+for _ in $(seq 40); do [ -s "$TMPD/net-port" ] && break; sleep 0.05; done
+net_port=$(cat "$TMPD/net-port" 2>/dev/null)
+deft neto "nc -z -w1 127.0.0.1 $net_port && echo open"
 same "network denied by default" "$(iserr "$(use neto)")" true
-deft neta 'nc -z -w1 127.0.0.1 47124 && echo open' '{"net":true}'
-same "declared net works" "$(txt "$(use neta)")" open; kill $LP
+deft neta "nc -z -w1 127.0.0.1 $net_port && echo open" '{"net":true}'
+same "declared net works" "$(txt "$(use neta)")" open
+kill "$LP" 2>/dev/null
+wait "$LP" 2>/dev/null
 deft big 'yes | head -c 400000'
 big_out=$(txt "$(use big)")
 [ "${#big_out}" -lt 16384 ] && ok_ || bad "stdout cap returns a preview under 16 KB"
@@ -3122,7 +4088,8 @@ session "$KA" 3 "$INIT" "$LIST" | while read -r l; do echo "$l" >> "$TMPD/lc2"; 
 waitfor "the second listener registered" '[ "$(grep -c . "$TMPD/lc2")" = 2 ]'
 for n in lcb1 lcb2 lcb3; do publish "$FR" $n 'echo b' >/dev/null; done
 waitfor "the burst is approved" '[ "$(st lcb1)$(st lcb2)$(st lcb3)" = activeactiveactive ]'
-wait $lc2
+if [ "$(st lcb1)$(st lcb2)$(st lcb3)" = activeactiveactive ]; then wait "$lc2"
+else kill "$lc2" 2>/dev/null; wait "$lc2" 2>/dev/null; fi
 check "a burst notifies after the last commit" "$(cat "$TMPD/lc2")" "$LC"
 mkfifo "$TD/999999.fifo"
 call "$KR" tool_revoke '{"name":"lcb1","reason":"t"}' >/dev/null

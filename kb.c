@@ -113,12 +113,27 @@ static const struct { const char *table, *name, *def; } MIGRATIONS[] = {
     {"hook_sessions", "broken", "INTEGER NOT NULL DEFAULT 0"},
     {"hook_sessions", "server_start", "INTEGER NOT NULL DEFAULT 0"},
     {"task_gate", "answered", "INTEGER NOT NULL DEFAULT 0"},
+    {"mail", "shown", "INTEGER NOT NULL DEFAULT 0"},
+    {"mail", "staged_full", "INTEGER NOT NULL DEFAULT 0"},
+    {"hook_sessions", "generation", "TEXT NOT NULL DEFAULT ''"},
+    {"hook_sessions", "event_seq", "INTEGER NOT NULL DEFAULT 0"},
+    {"mail", "wake_attempts", "INTEGER NOT NULL DEFAULT 0"},
+    {"mail", "lease_until", "INTEGER NOT NULL DEFAULT 0"},
 };
 
 /* PRAGMA user_version of a database that has this file's SCHEMA and every column of MIGRATIONS: 1 for the 13 columns above, one
- * more for each column added later. A database stamped at or above it is opened as is and is never stamped down. A new table
+ * more for each column added later. A database stamped above it is refused. A new table
  * in SCHEMA has no entry in MIGRATIONS: lower the 12 below by one for it, or databases stamped before it never get the table. */
-#define KB_SCHEMA_VERSION ((int)(sizeof MIGRATIONS / sizeof *MIGRATIONS) - 12)
+/* Version 4 also backfills data, without adding a column. */
+#define KB_SCHEMA_VERSION ((int)(sizeof MIGRATIONS / sizeof *MIGRATIONS) - 11)
+
+static int schema_version(sqlite3 *db, int *version) {
+    sqlite3_stmt *st = prep(db, "PRAGMA user_version");
+    int rc = sqlite3_step(st);
+    if (rc == SQLITE_ROW) *version = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    return rc == SQLITE_ROW ? SQLITE_OK : rc;
+}
 
 sqlite3 *kb_open_timeout(const char *path, char **err, int timeout_ms) {
     sqlite3 *db = NULL;
@@ -128,22 +143,34 @@ sqlite3 *kb_open_timeout(const char *path, char **err, int timeout_ms) {
         return NULL;
     }
     sqlite3_busy_timeout(db, timeout_ms);
+    int version = 0, rc = schema_version(db, &version);
+    if (rc != SQLITE_OK || version > KB_SCHEMA_VERSION) goto fail;
+    if (version == KB_SCHEMA_VERSION) return db;
+
     sqlite3_exec(db, "PRAGMA journal_mode=WAL", NULL, NULL, NULL);
-    {   /* a database at the current schema needs no schema script, column checks or meta row: every hook event opens it */
-        sqlite3_stmt *v = NULL;
-        int current = sqlite3_prepare_v2(db, "PRAGMA user_version", -1, &v, NULL) == SQLITE_OK && sqlite3_step(v) == SQLITE_ROW
-                      && sqlite3_column_int(v, 0) >= KB_SCHEMA_VERSION;
-        sqlite3_finalize(v);
-        if (current) return db;
-    }
     char host[256] = "host";
     gethostname(host, sizeof host - 1);
     host[strcspn(host, ".")] = '\0';
     char *machine = sqlite3_mprintf("INSERT OR IGNORE INTO meta VALUES ('machine', '%08x-%q');", arc4random(), host);
-    int rc = sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
+    rc = sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
+    if (rc == SQLITE_OK) rc = schema_version(db, &version);
+    if (rc != SQLITE_OK || version >= KB_SCHEMA_VERSION) {
+        sqlite3_free(machine);
+        if (rc != SQLITE_OK || version > KB_SCHEMA_VERSION) goto fail;
+        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+        return db; /* another new writer finished the migration while we waited */
+    }
     if (rc == SQLITE_OK) rc = sqlite3_exec(db, SCHEMA, NULL, NULL, NULL);
     for (size_t i = 0; rc == SQLITE_OK && i < sizeof MIGRATIONS / sizeof *MIGRATIONS; i++)
         rc = ensure_column(db, MIGRATIONS[i].table, MIGRATIONS[i].name, MIGRATIONS[i].def);
+    /* Legacy staging tokens prove an attempt and give no evidence of a full payload. */
+    if (rc == SQLITE_OK)
+        rc = sqlite3_exec(db, "UPDATE mail SET shown=1, staged_full=0 WHERE shown=0 AND staged_turn IS NOT NULL",
+                          NULL, NULL, NULL);
+    if (rc == SQLITE_OK)
+        rc = sqlite3_exec(db, "UPDATE hook_sessions SET generation=lower(hex(randomblob(16)))"
+                             " WHERE generation='' AND session_id!=''", NULL, NULL, NULL);
+    if (rc == SQLITE_OK) rc = kb_mail_reconcile(db, time(NULL), 0);
     if (rc == SQLITE_OK) rc = sqlite3_exec(db, machine, NULL, NULL, NULL);
     if (rc == SQLITE_OK) {
         char stamp[48];
@@ -153,7 +180,8 @@ sqlite3 *kb_open_timeout(const char *path, char **err, int timeout_ms) {
     if (rc == SQLITE_OK) rc = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
     sqlite3_free(machine);
     if (rc == SQLITE_OK) return db;
-    *err = strdup(sqlite3_errmsg(db));
+fail:
+    *err = strdup(version > KB_SCHEMA_VERSION ? "newer schema, upgrade cntctr" : sqlite3_errmsg(db));
     sqlite3_close(db);
     return NULL;
 }
@@ -325,34 +353,161 @@ int kb_post(sqlite3 *db, const char *scope, const char *sender, const char *text
     return rc;
 }
 
+long long kb_mail_insert(sqlite3 *db, const char *scope, const char *pane, const char *name, const char *sender,
+                         const char *task, const char *body, int hooked, const char *from_pane,
+                         const char *from_scope, const char *socket) {
+    if (kb_post(db, scope, sender, body) != 0) return 0;
+    long long post = sqlite3_last_insert_rowid(db);
+    sqlite3_stmt *st = prep(db, "INSERT INTO mail(post,name,pane,task,hooked,from_pane,from_scope,socket)"
+                               " VALUES(?1,?2,?3,?4,?5,?6,?7,?8)");
+    sqlite3_bind_int64(st, 1, post);
+    sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, pane ? pane : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 4, task, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 5, hooked);
+    sqlite3_bind_text(st, 6, from_pane, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 7, from_scope, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 8, socket, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE ? post : 0;
+}
+
+int kb_mail_claim(sqlite3 *db, long long post, const char *socket, const char *pane, long long server_start,
+                  const char *token, int full, int presentations, time_t now, time_t until, int new_post) {
+    sqlite3_stmt *st = prep(db, "UPDATE mail SET shown=shown+1,state='staged',staged_turn=?2,staged_full=?3,"
+                               " presentations=presentations+?4,lease_until=?9,hooked=max(hooked,?2 IS NOT NULL)"
+                               " WHERE post=?1 AND delivered=0 AND shown<3"
+                               " AND (state='pending' OR (?2 IS NOT NULL AND state='staged' AND lease_until<?8))"
+                               " AND EXISTS (SELECT 1 FROM posts WHERE posts.rowid=mail.post AND "
+                               KB_MAIL_BOUND("mail", "?5", "?6", "?7")
+        " AND (posts.at>?7 OR (?10 AND posts.at=?7))) RETURNING shown");
+    sqlite3_bind_int64(st, 1, post);
+    sqlite3_bind_text(st, 2, token, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 3, full);
+    sqlite3_bind_int(st, 4, presentations);
+    sqlite3_bind_text(st, 5, socket, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 6, pane, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 7, server_start);
+    sqlite3_bind_int64(st, 8, now);
+    sqlite3_bind_int64(st, 9, until);
+    sqlite3_bind_int(st, 10, new_post);
+    int rc = sqlite3_step(st), attempt = 0;
+    if (rc == SQLITE_ROW) {
+        attempt = sqlite3_column_int(st, 0);
+        rc = sqlite3_step(st);
+    }
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE ? attempt : -1;
+}
+
+int kb_mail_finish(sqlite3 *db, long long post, enum kb_mail_finish outcome, int attempt, const char *token,
+                   time_t now) {
+    const char *read = "UPDATE mail SET delivered=1,state='delivered',lease_until=0 WHERE post=?1 AND delivered=0"
+                       " AND state IN ('pending','staged','stalled')";
+    const char *ack = "UPDATE mail SET delivered=1,state='delivered',lease_until=0 WHERE post=?1 AND delivered=0"
+                      " AND state='staged' AND shown=?2 AND staged_turn IS ?3 AND staged_full=1"
+                      " AND lease_until>?4";
+    sqlite3_stmt *st = prep(db, outcome == KB_MAIL_READ ? read : ack);
+    sqlite3_bind_int64(st, 1, post);
+    if (outcome != KB_MAIL_READ) {
+        sqlite3_bind_int(st, 2, attempt);
+        sqlite3_bind_text(st, 3, token, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 4, now);
+    }
+    int rc = sqlite3_step(st) == SQLITE_DONE ? sqlite3_changes(db) : -1;
+    sqlite3_finalize(st);
+    return rc;
+}
+
+int kb_mail_reconcile(sqlite3 *db, time_t now, int wake_sec) {
+    int own = sqlite3_get_autocommit(db);
+    int rc = own ? sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) : SQLITE_OK;
+    if (rc != SQLITE_OK) return rc;
+    sqlite3_stmt *st = prep(db, "UPDATE mail SET state='pending',lease_until=0"
+        " WHERE delivered=0 AND state='staged' AND shown<3 AND lease_until<?1");
+    sqlite3_bind_int64(st, 1, now);
+    rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc == SQLITE_DONE) rc = SQLITE_OK;
+
+    sqlite3_stmt *due = prep(db, "SELECT post,name,from_pane,from_scope,socket,posts.sender,posts.scope"
+        " FROM mail LEFT JOIN posts ON posts.rowid=mail.post WHERE post>?2 AND delivered=0 AND shown>=3"
+        " AND (state='pending' OR (state='staged' AND lease_until<?1)) ORDER BY post LIMIT 1");
+    sqlite3_stmt *stall = prep(db, "UPDATE mail SET state='stalled',lease_until=0 WHERE post=?1");
+    long long post = 0;
+    sqlite3_bind_int64(due, 1, now);
+    while (rc == SQLITE_OK) {
+        sqlite3_bind_int64(due, 2, post);
+        int step = sqlite3_step(due);
+        if (step != SQLITE_ROW) {
+            rc = step == SQLITE_DONE ? SQLITE_OK : step;
+            break;
+        }
+        post = sqlite3_column_int64(due, 0);
+        int save = sqlite3_exec(db, "SAVEPOINT stall_mail", NULL, NULL, NULL);
+        if (save != SQLITE_OK) { rc = save; break; }
+        sqlite3_bind_int64(stall, 1, post);
+        int ok = sqlite3_step(stall) == SQLITE_DONE && sqlite3_changes(db) == 1;
+        sqlite3_reset(stall);
+        if (ok && sqlite3_column_type(due, 5) != SQLITE_NULL) {
+            const char *to = col(due, 5), *pane = col(due, 2), *scope = col(due, 3);
+            char *body = sqlite3_mprintf("for %s: undelivered after 3 attempts: %lld to %s; recipient can call board id=%lld",
+                                        to, post, col(due, 1), post);
+            ok = body && kb_mail_insert(db, *scope ? scope : col(due, 6), pane, to, "cntctr", "",
+                                        body, 0, "", "", col(due, 4)) > 0;
+            sqlite3_free(body);
+        }
+        sqlite3_reset(due);
+        if (!ok) rc = sqlite3_exec(db, "ROLLBACK TO stall_mail", NULL, NULL, NULL);
+        if (rc == SQLITE_OK) rc = sqlite3_exec(db, "RELEASE stall_mail", NULL, NULL, NULL);
+        if (!ok && wake_sec == 0 && rc == SQLITE_OK) rc = SQLITE_ERROR;  /* Migration stays atomic. */
+    }
+    sqlite3_finalize(stall);
+    sqlite3_finalize(due);
+    if (rc == SQLITE_OK && wake_sec > 0) {
+        st = prep(db, "UPDATE hook_sessions SET wake_reserved=0,wake_at=NULL,broken=1"
+                      " WHERE wake_reserved=1 AND wake_at<=?1");
+        sqlite3_bind_int64(st, 1, now - wake_sec);
+        rc = sqlite3_step(st);
+        sqlite3_finalize(st);
+        if (rc == SQLITE_DONE) rc = SQLITE_OK;
+    }
+    if (own && rc == SQLITE_OK) rc = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+    if (own && rc != SQLITE_OK) sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    return rc;
+}
+
 char *kb_tool_projects(sqlite3 *db) {
     return lines(prep(db, "SELECT DISTINCT project FROM tools WHERE project <> 'global'"));
 }
 
-char *kb_board(sqlite3 *db, const char *scope, const char *me, const char *pane, long long server_start, int limit) {
+char *kb_board(sqlite3 *db, const char *scope, const char *me, const char *pane, const char *socket, long long server_start, int limit) {
     sqlite3_stmt *st = prep(db,
         "SELECT line FROM (SELECT rowid, datetime(at, 'unixepoch') || ' ' || sender || ': ' || text AS line FROM posts"
-        " WHERE scope = ?1 AND NOT EXISTS (SELECT 1 FROM mail WHERE mail.post = posts.rowid AND (mail.name != ?3 AND (mail.socket || char(10) || mail.pane != ?4 OR posts.at <= ?5 OR ?4 = ''))) ORDER BY rowid DESC LIMIT ?2) ORDER BY rowid");
+        " WHERE scope = ?1 AND NOT EXISTS (SELECT 1 FROM mail WHERE mail.post = posts.rowid AND NOT " KB_MAIL_FOR("mail", "?3", "?1", "?6", "?4", "?5") ") ORDER BY rowid DESC LIMIT ?2) ORDER BY rowid");
     sqlite3_bind_text(st, 1, scope, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(st, 2, limit);
     sqlite3_bind_text(st, 3, me, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st, 4, pane, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 5, server_start);
+    sqlite3_bind_text(st, 6, socket, -1, SQLITE_TRANSIENT);
     return lines(st);
 }
 
-/* Post ids ("3,7"), among the posts kb_board lists, of `me`'s undelivered mail that a hook presented: "" if none. */
-char *kb_board_mail(sqlite3 *db, const char *scope, const char *me, const char *pane, long long server_start, int limit) {
+/* Ids of undelivered mail whose full text is included in the board result. */
+char *kb_board_mail(sqlite3 *db, const char *scope, const char *me, const char *pane, const char *socket, long long server_start, int limit) {
     sqlite3_stmt *st = prep(db,
-        "SELECT group_concat(post) FROM mail JOIN posts ON posts.rowid = mail.post WHERE (mail.hooked = 1 OR mail.presentations > 0) AND mail.delivered = 0"
-        " AND (mail.name = ?3 OR (mail.socket || char(10) || mail.pane = ?4 AND posts.at > ?5 AND ?4 != ''))"
+        "SELECT group_concat(post) FROM mail JOIN posts ON posts.rowid = mail.post WHERE mail.delivered = 0"
+        " AND " KB_MAIL_FOR("mail", "?3", "?1", "?6", "?4", "?5") ""
         " AND mail.post IN (SELECT rowid FROM (SELECT rowid FROM posts WHERE scope = ?1 AND NOT EXISTS (SELECT 1 FROM mail m2 WHERE m2.post = posts.rowid"
-        " AND (m2.name != ?3 AND (m2.socket || char(10) || m2.pane != ?4 OR posts.at <= ?5 OR ?4 = ''))) ORDER BY rowid DESC LIMIT ?2))");
+        " AND NOT " KB_MAIL_FOR("m2", "?3", "?1", "?6", "?4", "?5") ") ORDER BY rowid DESC LIMIT ?2))");
     sqlite3_bind_text(st, 1, scope, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(st, 2, limit);
     sqlite3_bind_text(st, 3, me, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st, 4, pane, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 5, server_start);
+    sqlite3_bind_text(st, 6, socket, -1, SQLITE_TRANSIENT);
     char *ids = sqlite3_step(st) == SQLITE_ROW ? strdup(col(st, 0)) : strdup("");
     sqlite3_finalize(st);
     return ids;
@@ -791,15 +946,16 @@ int kb_tool_promote(sqlite3 *db, const char *project, const char *name, int *fro
     if (sqlite3_exec(db, rc == 0 ? "COMMIT" : "ROLLBACK", NULL, NULL, NULL) != SQLITE_OK) rc = -1;
     return rc;
 }
-char *kb_unread(sqlite3 *db, const char *scope, const char *me, const char *pane, long long server_start, long long after, long long *newest, int *count) {
+char *kb_unread(sqlite3 *db, const char *scope, const char *me, const char *pane, const char *socket, long long server_start, long long after, long long *newest, int *count) {
     sqlite3_stmt *st = prep(db, "SELECT rowid, sender, text FROM posts WHERE scope = ?1 AND rowid > ?2 "
-        "AND (EXISTS (SELECT 1 FROM mail WHERE mail.post = posts.rowid AND (mail.name = ?3 OR (mail.socket || char(10) || mail.pane = ?4 AND posts.at > ?5 AND ?4 != '')) AND mail.delivered = 0) "
+        "AND (EXISTS (SELECT 1 FROM mail WHERE mail.post = posts.rowid AND " KB_MAIL_FOR("mail", "?3", "?1", "?6", "?4", "?5") " AND mail.delivered = 0) "
         "OR (at >= strftime('%s', 'now') - 86400 AND NOT EXISTS (SELECT 1 FROM mail WHERE mail.post = posts.rowid))) ORDER BY rowid");
     sqlite3_bind_text(st, 1, scope, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 2, after);
     sqlite3_bind_text(st, 3, me, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st, 4, pane, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 5, server_start);
+    sqlite3_bind_text(st, 6, socket, -1, SQLITE_TRANSIENT);
     char *out = strdup("");
     *newest = after;
     *count = 0;
@@ -816,20 +972,24 @@ char *kb_unread(sqlite3 *db, const char *scope, const char *me, const char *pane
     return out;
 }
 
-int kb_omitted(sqlite3 *db, const char *scope, const char *me, const char *pane, long long server_start, long long after, int limit) {
+int kb_omitted(sqlite3 *db, const char *scope, const char *me, const char *pane, const char *socket, long long server_start, long long after, int limit, int *mail_omitted) {
     sqlite3_stmt *st = prep(db,
-        "SELECT count(*) FROM posts WHERE scope=?1 AND rowid>?2 AND sender!=?3 "
-        "AND (EXISTS (SELECT 1 FROM mail WHERE mail.post=posts.rowid AND (name=?3 OR (socket || char(10) || pane=?4 AND posts.at>?6 AND ?4 != '')) AND delivered=0) "
-        "OR (at >= strftime('%s','now') - 86400 AND NOT EXISTS (SELECT 1 FROM mail WHERE mail.post=posts.rowid))) "
-        "AND rowid NOT IN (SELECT rowid FROM posts WHERE scope=?1 AND NOT EXISTS "
-        "(SELECT 1 FROM mail WHERE mail.post=posts.rowid AND name!=?3 AND (socket || char(10) || pane!=?4 OR posts.at<=?6 OR ?4 = '')) ORDER BY rowid DESC LIMIT ?5)");
+        "SELECT sum(posts.rowid>?2 AND posts.sender!=?3), sum(mail.post IS NOT NULL)"
+        " FROM posts LEFT JOIN mail ON mail.post=posts.rowid WHERE posts.scope=?1 AND ("
+        " (mail.post IS NOT NULL AND mail.delivered=0 AND " KB_MAIL_FOR("mail", "?3", "?1", "?7", "?4", "?6") ")"
+        " OR (mail.post IS NULL AND posts.at >= strftime('%s','now') - 86400)) "
+        "AND posts.rowid NOT IN (SELECT rowid FROM posts WHERE scope=?1 AND NOT EXISTS "
+        "(SELECT 1 FROM mail WHERE mail.post=posts.rowid AND NOT " KB_MAIL_FOR("mail", "?3", "?1", "?7", "?4", "?6") ") ORDER BY rowid DESC LIMIT ?5)");
     sqlite3_bind_text(st, 1, scope, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 2, after);
     sqlite3_bind_text(st, 3, me, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st, 4, pane, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(st, 5, limit);
     sqlite3_bind_int64(st, 6, server_start);
-    int count = sqlite3_step(st) == SQLITE_ROW ? sqlite3_column_int(st, 0) : 0;
+    sqlite3_bind_text(st, 7, socket, -1, SQLITE_TRANSIENT);
+    int row = sqlite3_step(st) == SQLITE_ROW;
+    int count = row ? sqlite3_column_int(st, 0) : 0;
+    *mail_omitted = row ? sqlite3_column_int(st, 1) : 0;
     sqlite3_finalize(st);
     return count;
 }
