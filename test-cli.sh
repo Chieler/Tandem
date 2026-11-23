@@ -15,7 +15,10 @@ repo=$(cd "$d/repo.with_dot" && pwd -P)
 sqlite3 "$d/db" "create table projects(root text,key text); create table entries(layer text,scope text,title text,created integer); insert into projects values ('$repo','fixture-scope'); insert into entries values ('history','fixture-scope','task 12345678 caller→worker→name',4102444800),('history','fixture-scope','reply 12345678 worker→caller',4102445400),('history','fixture-scope','reply 12345678 worker→caller',4102446000),('history','fixture-scope','task 87654321 caller→worker→name',4102444800),('history','other','task 00000000 caller→other',4102444800),('history','fixture-scope','task 11111111 caller→old',1000);"
 out=$(cd "$repo" && CNTCTR_DB="$d/db" "$BIN" stats --since 1)
 printf '%s\n' "$out" | grep -Eq 'worker→name +2 +1 +1 +10.0 +10.0'
-! printf '%s\n' "$out" | grep -Eq '^other|^old'
+if printf '%s\n' "$out" | grep -Eq '^other|^old'; then
+    echo "FAIL: unexpected ^other|^old"
+    exit 1
+fi
 out=$(cd "$repo" && CNTCTR_DB="$d/db" "$BIN" stats --all)
 printf '%s\n' "$out" | grep -q 'other'
 python3 - "$d" "$repo" <<'PY'
@@ -50,11 +53,17 @@ printf '%s\n' "$out" | grep -Eq 'claude-main +15 +40 +60 +80'
 printf '%s\n' "$out" | grep -Eq 'claude-worktree +10 +20 +30 +40'
 printf '%s\n' "$out" | grep -q 'claude-external'
 printf '%s\n' "$out" | grep -q 'codex-external'
-! printf '%s\n' "$out" | grep -q 'claude-sibling'
+if printf '%s\n' "$out" | grep -q 'claude-sibling'; then
+    echo "FAIL: unexpected claude-sibling"
+    exit 1
+fi
 nongit_out=$(cd "$d/nongit" && HOME="$d/home" "$BIN" usage --since 1)
 printf '%s\n' "$nongit_out" | grep -q 'claude-nongit '
 printf '%s\n' "$nongit_out" | grep -q 'codex-nongit '
-! printf '%s\n' "$nongit_out" | grep -q 'nongit-sibling'
+if printf '%s\n' "$nongit_out" | grep -q 'nongit-sibling'; then
+    echo "FAIL: unexpected nongit-sibling"
+    exit 1
+fi
 printf '%s\n' "$out" | grep -Eq 'codex-window +90 +27 +0 +18 +30.0%'
 printf '%s\n' "$out" | grep -q 'agy: not counted'
 fixture=$(CNTCTR_USAGE_CLAUDE_DIR="$root/fixtures/usage/claude" CNTCTR_USAGE_CODEX_DIR="$root/fixtures/usage/codex" CNTCTR_USAGE_CWD=/fixture/project "$BIN" usage --since 500000)

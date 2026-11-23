@@ -26,6 +26,7 @@ static void project_paths(const char *cwd) {
     int fd[2]; pid_t pid=-1; int status=0;
     if (!pipe(fd)) {
         pid=fork();
+        if (pid<0) { close(fd[0]); close(fd[1]); goto fallback; }
         if (!pid) {
             close(fd[0]); dup2(fd[1],STDOUT_FILENO); close(fd[1]);
             int nullfd=open("/dev/null",O_WRONLY);
@@ -39,16 +40,21 @@ static void project_paths(const char *cwd) {
             char *line=NULL; size_t cap=0; ssize_t len;
             while ((len=getline(&line,&cap,f))>0) {
                 if (len && line[len-1]=='\n') line[--len]=0;
-                if (!strncmp(line,"worktree ",9) && line[9] && project_count<256)
-                    projects[project_count++]=strdup(line+9);
+                if (!strncmp(line,"worktree ",9) && line[9] && project_count<256) {
+                    char *path=strdup(line+9);
+                    if (path) projects[project_count++]=path;
+                }
             }
             free(line); fclose(f);
         } else close(fd[0]);
         if (pid>0) { while (waitpid(pid,&status,0)<0 && errno==EINTR) {} }
     }
+fallback:
     if (pid<=0 || !WIFEXITED(status) || WEXITSTATUS(status) || !project_count) {
         for (size_t i=0;i<project_count;i++) free(projects[i]);
-        project_count=0; projects[project_count++]=strdup(cwd);
+        project_count=0;
+        char *path=strdup(cwd);
+        if (path) projects[project_count++]=path;
     }
 }
 static int in_project(const char *cwd) {
