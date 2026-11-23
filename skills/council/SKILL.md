@@ -13,9 +13,9 @@ Get three independent reviews of a fixed change scope across different providers
 | --- | --- | --- | --- |
 | Claude | `claude` | `claude-opus-5-5` | `high` |
 | Codex | `codex` | router `hard` tier: the best Sol model | `high` (tier default) |
-| agy | `agy` | `gemini-3.8-flash-high` | `high` |
+| agy | `agy` | `gemini-4-hydrogen-high` | `high` |
 
-User overrides win. Pass model and effort explicitly to `spawn` in `gather` for the Claude and agy seats. Spawn the Codex seat with `tier="hard"` and no `model`, so it always gets the router's best Sol model; never name a Sol version here, and record the requested tier and any user overrides as the requested settings. The resolved Codex model and effort stay unverified unless runtime evidence exposes them: `gather` returns no launch summary, and the reviewer's own status line counts as evidence. Do not substitute another model. Describe the agy seat as Flash if that is what it runs; do not claim Gemini Pro or a flagship model without runtime proof. An unavailable or incompatible seat blocks approval. Record requested settings separately from actual settings verified by runtime evidence; otherwise mark actual model and effort unverified. Router configuration alone is not runtime evidence.
+User overrides win. Pass model and effort explicitly to `spawn` in `gather` for the Claude and agy seats. Spawn the Codex seat with `tier="hard"` and no `model`, so it always gets the router's best Sol model; never name a Sol version here, and record the requested tier and any user overrides as the requested settings. The resolved Codex model and effort stay unverified unless runtime evidence exposes them: `gather` returns no launch summary, and the reviewer's own status line counts as evidence. Do not substitute another model. Describe the agy seat by the model it actually runs (Hydrogen or Neon); do not claim a model without runtime proof. An unavailable or incompatible seat blocks approval. Record requested settings separately from actual settings verified by runtime evidence; otherwise mark actual model and effort unverified. Router configuration alone is not runtime evidence.
 
 ## Scope and budget
 

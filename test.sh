@@ -3671,8 +3671,8 @@ out=$(call "$L" spawn '{"harness":"claude","name":"m1","task":"x","model":"claud
 expect_screen "claude gets model and effort" "$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')" "flags:  --model claude-sonnet-5 --effort low"
 out=$(call "$L" spawn '{"harness":"codex","name":"m2","task":"x","model":"gpt-6-luna","effort":"high"}')
 expect_screen "codex gets model and effort" "$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')" "flags:  -m gpt-6-luna -c model_reasoning_effort=\"high\""
-out=$(call "$L" spawn '{"harness":"agy","name":"m3","task":"x","model":"gemini-3.8-flash-high","effort":"high"}')
-expect_screen "agy gets model and effort" "$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')" "flags:  --model gemini-3.8-flash-high --effort high --settings"
+out=$(call "$L" spawn '{"harness":"agy","name":"m3","task":"x","model":"gemini-4-neon-high","effort":"high"}')
+expect_screen "agy gets model and effort" "$(txt "$out" | sed 's/.* in \(%[0-9]*\) .*/\1/')" "flags:  --model gemini-4-neon-high --effort high --settings"
 # agy gets a session-only trustedWorkspaces for its cwd
 mkdir -p "$TMPD/agywork"
 call "$L" spawn "{\"harness\":\"agy\",\"name\":\"agyt\",\"task\":\"trust\",\"cwd\":\"$TMPD/agywork\"}" >/dev/null
@@ -3713,9 +3713,9 @@ long130=$(printf 'm%.0s' $(seq 1 130))
 out=$(CNTCTR_ROUTE_CODEX_HARD="$long130" call "$L" spawn '{"harness":"codex","name":"r5v","task":"x","tier":"hard"}')
 expect_screen "route env model over 127 bytes is ignored, not cut" "$(pane_of "$out")" "flags:  -m gpt-6.2-sol -c model_reasoning_effort=\"high\""
 out=$(call "$L" spawn '{"harness":"agy","name":"r6b","task":"rename foo to bar"}')
-expect_screen "agy light task stays on medium" "$(pane_of "$out")" "flags:  --model gemini-3.8-flash-medium --effort medium"
+expect_screen "agy light task stays on medium" "$(pane_of "$out")" "flags:  --model gemini-4-hydrogen-medium --effort medium"
 out=$(call "$L" spawn '{"harness":"agy","name":"r6","task":"Design the architecture for the new sync layer."}')
-expect_screen "agy always uses Gemini 3.8" "$(pane_of "$out")" "flags:  --model gemini-3.8-flash-high --effort high --settings"
+expect_screen "agy complex task uses Gemini 4 Neon" "$(pane_of "$out")" "flags:  --model gemini-4-neon-high --effort high --settings"
 out=$(call "$L" spawn '{"harness":"claude","name":"r7","task":"Design everything","tier":"light"}')
 expect_screen "tier overrides the router" "$(pane_of "$out")" "flags:  --model claude-haiku-5-5 --effort medium"
 out=$(call "$L" spawn '{"harness":"claude","name":"r8","task":"Design everything","effort":"low"}')
@@ -4378,7 +4378,7 @@ same "the fallback reviewer uses another model" "$(sq "$CNTCTR_DB" "select revie
 FM2=$(newpane known2); t set -p -t "$FM2" @cntctr_harness claude; t set -p -t "$FM2" @cntctr_model claude-sonnet-5-5
 same "a collision on one agy tier tries the other agy tiers first" "$(CNTCTR_ROUTE_AGY_REVIEW=claude-sonnet-5-5 publish "$FM2" fm2 'echo f')" "fm2 v1 pending"
 waitfor "fm2 approved" '[ "$(st fm2)" = active ]'
-same "the reviewer stays on agy with another model" "$(sq "$CNTCTR_DB" "select reviewer_model from tools where name='fm2'")" gemini-3.8-flash-high
+same "the reviewer stays on agy with another model" "$(sq "$CNTCTR_DB" "select reviewer_model from tools where name='fm2'")" gemini-4-neon-high
 [ -e "$TMPD/gl/realgit/evil" ] && bad "wrote into the symlinked git dir" || ok_
 call "$FG" tool_define '{"name":"gitok","description":"t","input_schema":{"type":"object"},"interpreter":"sh","script":"echo x > other.txt; echo fine"}' >/dev/null
 same "that root is otherwise writable" "$(txt "$(call "$FG" use '{"tool":"gitok"}')")" fine

@@ -1260,13 +1260,14 @@ static const struct { int tier; const char *words[12]; } RULES[] = {
 #define M_CLAUDE_HARD  "claude-opus-5-5"
 #define M_CODEX_LIGHT  "gpt-6.1-terra"
 #define M_CODEX_SOL    "gpt-6.2-sol"   /* best codex model: standard, review, hard */
-#define M_AGY_MID      "gemini-3.8-flash-medium"
-#define M_AGY_HIGH     "gemini-3.8-flash-high"
+#define M_AGY_STD      "gemini-4-hydrogen-medium"
+#define M_AGY_REV      "gemini-4-hydrogen-high"
+#define M_AGY_HARD     "gemini-4-neon-high"      /* complex work only */
 /* model, effort for each tier, per harness: claude, codex, agy */
 static const char *ROUTES[3][4][2] = {
     {{M_CLAUDE_LIGHT, "medium"}, {M_CLAUDE_STD, "medium"}, {M_CLAUDE_REV, "high"}, {M_CLAUDE_HARD, "high"}},
     {{M_CODEX_LIGHT, "low"}, {M_CODEX_SOL, "medium"}, {M_CODEX_SOL, "high"}, {M_CODEX_SOL, "high"}},
-    {{M_AGY_MID, "medium"}, {M_AGY_MID, "medium"}, {M_AGY_HIGH, "high"}, {M_AGY_HIGH, "high"}},
+    {{M_AGY_STD, "medium"}, {M_AGY_STD, "medium"}, {M_AGY_REV, "high"}, {M_AGY_HARD, "high"}},
 };
 
 static const char *const EFFORTS[] = {"low", "medium", "high", "xhigh", "max", NULL};
