@@ -3153,21 +3153,6 @@ b_race_rollback() {
         "$(b_race_mail "$due")/$(b_race_mail "$reject")" staged/2/0/0/staged/1/0/0
 }
 
-# ONLY=hook-race-port B_CASE=resume make test
-if [ "${ONLY:-}" = hook-race-port ]; then
-    case ${B_CASE:-} in
-        schema|migration|resume|retry|interleave|snapshot|rollback) ;;
-        *) echo "B_CASE must be schema, migration, resume, retry, interleave, snapshot or rollback" >&2; exit 2 ;;
-    esac
-    hk_boot
-    export CNTCTR_PASTE_WAIT_MS=100
-    "b_race_$B_CASE"
-    hk_stop
-    printf '%d passed, %d failed\n' "$pass" "$fail"
-    [ "$fail" -eq 0 ]
-    exit $?
-fi
-
 u5p6_run() {
     export CNTCTR_PASTE_WAIT_MS=100
     local f
@@ -3177,10 +3162,17 @@ u5p6_run() {
     unset CNTCTR_PASTE_WAIT_MS
 }
 
+u5p7_run() {   # stream B hook-race regressions on the lease code
+    export CNTCTR_PASTE_WAIT_MS=100
+    local c
+    for c in ${B_CASE:-schema migration resume retry interleave snapshot rollback}; do "b_race_$c"; done
+    unset CNTCTR_PASTE_WAIT_MS
+}
+
 u5_run() {   # U5PARTS="p3 p4" runs just those parts, in that order
     hk_boot
     local part
-    for part in ${U5PARTS:-p1 p2 p3 p4 p5 p6}; do "u5${part}_run"; done
+    for part in ${U5PARTS:-p1 p2 p3 p4 p5 p6 p7}; do "u5${part}_run"; done
     hk_stop
 }
 if [ "${ONLY:-}" = mail-lease ]; then
@@ -3191,7 +3183,7 @@ if [ "${ONLY:-}" = mail-lease ]; then
     [ "$fail" -eq 0 ]; exit $?
 fi
 
-if [ "${ONLY:-}" = u5 ] || [ "${ONLY:-}" = u5p1 ] || [ "${ONLY:-}" = u5p2 ] || [ "${ONLY:-}" = u5p3 ] || [ "${ONLY:-}" = u5p4 ] || [ "${ONLY:-}" = u5p5 ] || [ "${ONLY:-}" = u5p6 ]; then
+if [ "${ONLY:-}" = u5 ] || [ "${ONLY:-}" = u5p1 ] || [ "${ONLY:-}" = u5p2 ] || [ "${ONLY:-}" = u5p3 ] || [ "${ONLY:-}" = u5p4 ] || [ "${ONLY:-}" = u5p5 ] || [ "${ONLY:-}" = u5p6 ] || [ "${ONLY:-}" = u5p7 ]; then
     case $ONLY in
         u5) u5_run ;;
         u5p1) hk_boot; u5p1_run; hk_stop ;;
@@ -3200,6 +3192,7 @@ if [ "${ONLY:-}" = u5 ] || [ "${ONLY:-}" = u5p1 ] || [ "${ONLY:-}" = u5p2 ] || [
         u5p4) hk_boot; u5p4_run; hk_stop ;;
         u5p5) hk_boot; u5p5_run; hk_stop ;;
         u5p6) hk_boot; u5p6_run; hk_stop ;;
+        u5p7) hk_boot; u5p7_run; hk_stop ;;
     esac
     printf '%d passed, %d failed\n' "$pass" "$fail"
     [ "$fail" -eq 0 ]; exit $?
