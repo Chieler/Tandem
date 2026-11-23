@@ -9,6 +9,7 @@ Releases:
 - `0.5.1`: council and sol-loop review skills; versioned bundles for Claude, Codex, and agy.
 - `0.5.2`: pluggable model router (`M_*` defines, `CNTCTR_ROUTE_*` env overrides); sol-loop and council take the Sol seat from router tier `hard` (gpt-6.2-sol).
 - `0.5.3`: Sol-review hardening of route overrides (per-thread buffer, validated model and effort, reviewer harness avoids the author's model on every tier).
+- `0.5.4`: lease-based mail delivery (claim, `lease_until`, one reconcile scheduler, bounded idle watcher); retries no longer re-present full bodies; hook-race regressions run in the default suite.
 
 Source: orchestrator feedback, 2026-11-07, ranked by cost.
 

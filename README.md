@@ -45,8 +45,8 @@ There is no daemon: tmux carries every message, and SQLite holds the shared know
 
 ```sh
 make
-cp cntctr ~/.local/bin/cntctr-0.5.3
-claude mcp add -s user cntctr -- ~/.local/bin/cntctr-0.5.3
+cp cntctr ~/.local/bin/cntctr-0.5.4
+claude mcp add -s user cntctr -- ~/.local/bin/cntctr-0.5.4
 ```
 
 Start tmux, run `claude` inside it, and ask:
@@ -97,13 +97,13 @@ See [Requirements](#requirements) and [Install](#install) for Codex, agy and tim
 
 Copy the build to a versioned path, so rebuilding in the repo never swaps the binary under running agents:
 
-    cp cntctr ~/.local/bin/cntctr-0.5.3
+    cp cntctr ~/.local/bin/cntctr-0.5.4
 
 Register that path once for each harness:
 
-    claude mcp add -s user cntctr -- ~/.local/bin/cntctr-0.5.3
-    codex mcp add cntctr -- ~/.local/bin/cntctr-0.5.3
-    agy mcp add cntctr ~/.local/bin/cntctr-0.5.3
+    claude mcp add -s user cntctr -- ~/.local/bin/cntctr-0.5.4
+    codex mcp add cntctr -- ~/.local/bin/cntctr-0.5.4
+    agy mcp add cntctr ~/.local/bin/cntctr-0.5.4
 
 To upgrade or roll back, point the same entries at another version and restart the agents. Release tags (`v0.1.0`, ...) rebuild any old version.
 
@@ -133,7 +133,7 @@ never reuse a published bundle version, including for a skill-only release.
 Run from the checkout:
 
 ```sh
-version=0.5.3
+version=0.5.4
 base="$HOME/.local/share/cntctr/skills"
 mkdir -p "$base"
 mkdir "$base/$version" || { echo "Bundle exists or cannot be created" >&2; exit 1; }
@@ -151,7 +151,7 @@ change these destinations while the commands run.
 
 ```sh
 base="$HOME/.local/share/cntctr/skills"
-version=0.5.3
+version=0.5.4
 agy="$HOME/.gemini/antigravity-cli/skills"
 for name in council sol-loop; do
   test -f "$base/$version/$name/SKILL.md" || exit 1
@@ -191,8 +191,8 @@ the operation; inspect and resolve it manually. If interrupted, inspect and
 restore a consistent set manually before retrying.
 
 ```sh
-old=0.5.3
-version=0.5.4
+old=0.5.4
+version=0.5.5
 base="$HOME/.local/share/cntctr/skills"
 agy="$HOME/.gemini/antigravity-cli/skills"
 for name in council sol-loop; do
