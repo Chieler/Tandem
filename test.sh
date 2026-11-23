@@ -2554,7 +2554,6 @@ lease_start_second() {
     sqx "$CNTCTR_DB" "CREATE TRIGGER send_at_server_start AFTER INSERT ON posts
         WHEN NEW.text LIKE '%fresh same-second body%' BEGIN UPDATE posts SET at=$epoch WHERE rowid=NEW.rowid; END"
     out=$(txt "$(call "$S" send '{"to":"lease_start_second","text":"fresh same-second body"}')")
-    sqx "$CNTCTR_DB" "DROP TRIGGER send_at_server_start"
     id=$(mailid "${out#sent id=}")
     same "new send is stamped in the server start second" "$(sqx "$CNTCTR_DB" "SELECT at FROM posts WHERE rowid=$id")" "$epoch"
     same "direct send finishes the new row in the start second" "$(mstate "$id")" delivered/0/1
@@ -2564,6 +2563,17 @@ lease_start_second() {
     daemon_stop
     same "watcher leaves an ambiguous old same-second row pending" "$(mstate "$old")" pending/0/0
     refute "old same-second body stays off terminal" "$(screen "$P")" "old ambiguous same-second row"
+    P=$(hk_agent claude lease_hook_start_second)
+    out=$(txt "$(call "$S" send '{"to":"lease_hook_start_second","text":"fresh same-second body for hook"}')")
+    sqx "$CNTCTR_DB" "DROP TRIGGER send_at_server_start"
+    check "same-second send to a hook reports board fallback" "$out" " on board"
+    out=${out% on board}
+    id=$(mailid "${out#sent id=}")
+    same "board-only same-second row spends no automatic attempts" \
+        "$(sqx "$CNTCTR_DB" "SELECT shown||'/'||wake_attempts FROM mail WHERE post=$id")" 0/0
+    out=$(c_prompt "$P" "$(pointer "$id")")
+    emptyans "$out" && ok_ || bad "ambiguous same-second pointer stays off the hook"
+    check "hook recipient can recover the fresh body by ID" "$(txt "$(call "$P" board "{\"id\":$id}")")" "fresh same-second body for hook"
 }
 
 lease_failed_spill() {

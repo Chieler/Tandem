@@ -4427,7 +4427,7 @@ static int route_mail(const char *pane, const char *name, const char *scope, con
     }
     long long mail = store_mail(db, socket, pane, name, scope, task, text, mode > 0);
     if (mail > 0) {
-        if (mode > 0) result = wake_agent(db, socket, pane, name, mail, NULL) < 0;
+        if (mode > 0) result = mail_at_epoch(db, mail, epoch) || wake_agent(db, socket, pane, name, mail, NULL) < 0;
         else {
             int finished = epoch && mode == 0 ? terminal_mail(db, socket, pane, name, epoch, mail, text, 0, quiet, unserved, 1) : 0;
             result = !finished;
