@@ -249,6 +249,19 @@ session before relying on it. Other harness versions may behave differently.
 
 ## Use
 
+For human-facing activity summaries, run `cntctr stats [--since hours] [--all]`
+to show task counts and turnaround times by worker (all history for the current
+project by default). `cntctr usage [--since hours]` reads Claude and Codex
+transcripts for this working directory and reports token counts by model; its
+default window is 24 hours. agy is not counted. Costs are deliberately omitted
+because model prices change. Codex input includes cached input, while Claude
+reports uncached input separately.
+
+Set `CNTCTR_NOTIFY=1` in the cntctr server environment to request a tmux bell
+and a desktop notification for permission prompts and replies delivered to a
+pane. Permission transitions are detected when `list` checks an agent's state;
+there is no separate polling daemon. Notifications are best effort.
+
 Start a tmux session, run your leader agent in it, and ask in plain words:
 
 > Spawn a codex worker named tests in ./api and have it write tests for the parser. Wait for its answer.

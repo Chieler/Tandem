@@ -21,6 +21,8 @@
 #include <sys/stat.h>
 #ifndef __APPLE__
 #include <sys/syscall.h>
+#else
+#include <mach-o/dyld.h>
 #endif
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -836,6 +838,43 @@ static int lock_mail(const char *socket, long long id, int flags, char **err) {
     return lock_input(socket, key, flags, err);
 }
 
+static char notify_executable[PATH_MAX];
+static int notify_enabled(void) { const char *v = getenv("CNTCTR_NOTIFY"); return v && !strcmp(v, "1"); }
+
+/* Re-exec in a detached process: neither tmux nor desktop notification may
+ * hold the RPC caller, and the child never uses inherited thread locks. */
+static void notify_human(const char *kind, const char *name, const char *pane) {
+    if (!notify_enabled() || !*notify_executable || !pane || !*pane) return;
+    pthread_mutex_lock(&fork_mu);
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (fork() == 0) {
+            setsid();
+            int fd = open("/dev/null", O_RDWR);
+            if (fd >= 0) { dup2(fd, 0); dup2(fd, 1); dup2(fd, 2); if (fd > 2) close(fd); }
+            execl(notify_executable, notify_executable, "_notify", kind, name ? name : "?", pane, (char *)NULL);
+        }
+        _exit(0);
+    }
+    pthread_mutex_unlock(&fork_mu);
+    if (pid > 0) reap(pid);
+}
+
+static void notify_permission(const char *socket, const char *pane, const char *name, int permission) {
+    if (!notify_enabled()) return;
+    char key[96]; snprintf(key, sizeof key, "notify-%s", pane);
+    int lock = lock_input(socket, key, LOCK_NB, NULL);
+    if (lock < 0) return;
+    char *old = NULL;
+    TMUX(NULL, &old, "show", "-pqv", "-t", pane, "@cntctr_notify_permission");
+    int was = old && !strcmp(old, "1");
+    if (permission != was) {
+        free(TMUXE(NULL, "set", "-p", "-t", pane, "@cntctr_notify_permission", permission ? "1" : "0"));
+    }
+    free(old); close(lock);
+    if (permission && !was) notify_human("permission", name, pane);
+}
+
 static char *inject_locked(const char *pane, const char *text, int with_end) {
     char *body;
     if (with_end) {
@@ -1511,6 +1550,7 @@ static int tool_list(json_object *args, char **res) {
             st = pane_state_screen(tail, &resets);
             free(tail);
         }
+        notify_permission(sock, pane, name, st == P_PERMISSION);
         for (const char *l = opts; *l; l += strcspn(l, "\n") + (l[strcspn(l, "\n")] == '\n')) {
             char id[9], val[32];
             if (sscanf(l, "@cntctr_to_%8[0-9a-f] %31s", id, val) != 2) continue;
@@ -3505,7 +3545,10 @@ static int terminal_mail(sqlite3 *db, const char *socket, const char *pane, cons
                         if (attempt == shown + 1 && sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK) {
                             committed = 1;
                             err = inject_locked(pane, body, row.complete);
-                            if (!err) finished = kb_mail_finish(db, id, KB_MAIL_TERMINAL, attempt, NULL, time(NULL)) == 1;
+                        if (!err) {
+                            finished = kb_mail_finish(db, id, KB_MAIL_TERMINAL, attempt, NULL, time(NULL)) == 1;
+                            if (finished && shown == 0 && !strncmp(text, "[cntctr reply from=", 19)) notify_human("reply", name, pane);
+                        }
                         } else sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
                     }
                 }
@@ -4401,6 +4444,14 @@ static int wake_agent(sqlite3 *db, const char *socket, const char *pane, const c
         sqlite3_step(st_count);
     }
     sqlite3_finalize(st_count);
+    if (!err && notify_enabled()) {
+        sqlite3_stmt *notice = NULL;
+        if (sqlite3_prepare_v2(db, "SELECT 1 FROM mail JOIN posts ON posts.rowid=mail.post WHERE mail.post=?1 AND presentations=1 AND instr(posts.text,char(10)||'[cntctr reply from=')>0", -1, &notice, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(notice, 1, mail);
+            if (sqlite3_step(notice) == SQLITE_ROW) notify_human("reply", name, pane);
+        }
+        sqlite3_finalize(notice);
+    }
     int rc = err ? -1 : 1;
     if (why) *why = err; else free(err);
     return rc;
@@ -5103,14 +5154,92 @@ static int hook_cmd(int argc, char **argv) {
     return 0;
 }
 
+/* Human-facing task turnaround. This command must never migrate the store. */
+static int stats_cmd(int argc, char **argv) {
+    long long since = 0;
+    int all = 0;
+    for (int i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "--all")) all = 1;
+        else if (!strcmp(argv[i], "--since") && i + 1 < argc) {
+            char *end; long hours = strtol(argv[++i], &end, 10);
+            if (!*argv[i] || *end || hours < 0 || hours > INT_MAX / 3600) goto usage;
+            since = (long long)time(NULL) - hours * 3600LL;
+        } else goto usage;
+    }
+    char path[4096]; sqlite3 *db = NULL;
+    if (sqlite3_open_v2(kb_path(path, sizeof path), &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        fprintf(stderr, "stats: cannot open knowledge store: %s\n", sqlite3_errmsg(db));
+        sqlite3_close(db); return 1;
+    }
+    struct project p; resolve_project(db, NULL, &p);
+    const char *sql =
+        "WITH tasks AS (SELECT scope,substr(title,6,8) id,substr(title,instr(title,'→')+1) worker,created "
+        "FROM entries WHERE layer='history' AND title LIKE 'task ________ %→%' AND created>=?1 AND (?2 OR scope=?3)), "
+        "answers AS (SELECT scope,substr(title,7,8) id,min(created) answered FROM entries "
+        "WHERE layer='history' AND title LIKE 'reply ________ %→%' GROUP BY scope,id), "
+        "rows AS (SELECT worker,t.created,a.answered FROM tasks t LEFT JOIN answers a ON a.scope=t.scope AND a.id=t.id), "
+        "groups AS (SELECT worker,count(*) n,count(answered) answered,avg((answered-created)/60.0) avgmin, "
+        "max((answered-created)/60.0) maxmin FROM rows GROUP BY worker UNION ALL "
+        "SELECT 'TOTAL',count(*),count(answered),avg((answered-created)/60.0),max((answered-created)/60.0) FROM rows) "
+        "SELECT worker,n,answered,n-answered,coalesce(avgmin,0),coalesce(maxmin,0) FROM groups";
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
+        fprintf(stderr, "stats: %s\n", sqlite3_errmsg(db)); sqlite3_close(db); return 1;
+    }
+    sqlite3_bind_int64(st, 1, since); sqlite3_bind_int(st, 2, all);
+    sqlite3_bind_text(st, 3, p.key, -1, SQLITE_TRANSIENT);
+    printf("%-24s %8s %8s %10s %10s %10s\n", "worker", "tasks", "answered", "unanswered", "avg min", "max min");
+    int rc;
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW)
+        printf("%-24s %8d %8d %10d %10.1f %10.1f\n", sqlite3_column_text(st, 0), sqlite3_column_int(st, 1),
+               sqlite3_column_int(st, 2), sqlite3_column_int(st, 3), sqlite3_column_double(st, 4), sqlite3_column_double(st, 5));
+    if (rc != SQLITE_DONE) fprintf(stderr, "stats: %s\n", sqlite3_errmsg(db));
+    sqlite3_finalize(st); sqlite3_close(db); return rc == SQLITE_DONE ? 0 : 1;
+usage:
+    fprintf(stderr, "usage: cntctr stats [--since hours] [--all]\n"); return 2;
+}
+
+int usage_cmd(int argc, char **argv, const char *cwd);
+
+static int notify_cmd(const char *kind, const char *name, const char *pane) {
+    const char *override = getenv("CNTCTR_NOTIFY_COMMAND");
+    if (override && *override) {
+        execlp(override, override, kind, name, pane, (char *)NULL);
+        return 1;
+    }
+    char *tty = NULL;
+    if (TMUX(NULL, &tty, "display", "-p", "-t", pane, "#{pane_tty}") == 0 && tty && *tty) {
+        int fd = open(tty, O_WRONLY | O_NONBLOCK | O_NOCTTY);
+        if (fd >= 0) { (void)write(fd, "\a", 1); close(fd); }
+    }
+    free(tty);
+    const char *event = !strcmp(kind, "permission") ? "awaiting permission" : "replied";
+#ifdef __APPLE__
+    execlp("osascript", "osascript", "-e", "on run argv\n display notification ((item 1 of argv) & \" \" & (item 2 of argv)) with title \"cntctr\"\n end run", name, event, (char *)NULL);
+#else
+    char *message = fmt("%s %s", name, event);
+    execlp("notify-send", "notify-send", "cntctr", message, (char *)NULL);
+    free(message);
+#endif
+    return 1;
+}
+
 int main(int argc, char **argv) {
+#ifdef __APPLE__
+    uint32_t executable_size = sizeof notify_executable;
+    if (_NSGetExecutablePath(notify_executable, &executable_size) != 0) notify_executable[0] = '\0';
+#else
+    ssize_t executable_size = readlink("/proc/self/exe", notify_executable, sizeof notify_executable - 1);
+    if (executable_size > 0) notify_executable[executable_size] = '\0';
+    else if (!realpath(argv[0], notify_executable)) notify_executable[0] = '\0';
+#endif
     if (argc > 1 && strcmp(argv[1], "--version") == 0) {
         printf("cntctr %s\n", CNTCTR_VERSION);
         return 0;
     }
     if (argc > 1 && strcmp(argv[1], "call") == 0) {
         if (argc == 4) return call_cmd(argv[2], argv[3]);
-        fprintf(stderr, "usage: cntctr call <tool> '<json args>'\n");
+        fprintf(stderr, "usage: cntctr call <tool> '<json args>' | stats [--since hours] [--all] | usage [--since hours]\n");
         return 2;
     }
     signal(SIGPIPE, SIG_IGN);
@@ -5119,6 +5248,22 @@ int main(int argc, char **argv) {
         char *tmux = fmt("%s,0,0", socket);
         setenv("TMUX", tmux, 1);
         free(tmux);
+    }
+    if (argc == 5 && !strcmp(argv[1], "_notify")) return notify_cmd(argv[2], argv[3], argv[4]);
+#ifdef CNTCTR_TEST_HOOKS
+    if (argc == 2 && !strcmp(argv[1], "_test-notify")) {
+        notify_permission("test-socket", "%42", "test-agent", 1);
+        notify_permission("test-socket", "%42", "test-agent", 1);
+        notify_permission("test-socket", "%42", "test-agent", 0);
+        notify_permission("test-socket", "%42", "test-agent", 1);
+        return 0;
+    }
+#endif
+    if (argc > 1 && !strcmp(argv[1], "stats")) return stats_cmd(argc, argv);
+    if (argc > 1 && !strcmp(argv[1], "usage")) {
+        char cwd[PATH_MAX];
+        if (!getcwd(cwd, sizeof cwd)) { perror("usage: getcwd"); return 1; }
+        return usage_cmd(argc, argv, cwd);
     }
     if (argc > 1 && !strcmp(argv[1], "hook")) return hook_cmd(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "hooks")) return hooks_admin(argc, argv, hook_seen);

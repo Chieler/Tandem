@@ -2,6 +2,7 @@
 # End-to-end tests for cntctr. Runs against a private tmux server, never yours.
 set -u
 BIN=$(cd "$(dirname "${BIN:-./cntctr}")" && pwd)/$(basename "${BIN:-./cntctr}")
+if [ "${ONLY:-}" = cli ]; then BIN="$BIN" exec bash "$(dirname "$0")/test-cli.sh"; fi
 TMPD=$(mktemp -d)
 INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"test"}}}'
 mkdir "$TMPD/bin" "$TMPD/home"
@@ -5379,5 +5380,13 @@ check "T51 addressee board lists mail" "$(txt "$(call "$M3_A51" board '{}')")" "
 # U6 to U21 run last: their agents, posts and history stay behind and would change what the older checks count
 [ "${ONLY:-}" = m3 ] || u5_run
 
+sq "$CNTCTR_DB" "INSERT INTO entries(id,layer,scope,title,summary,visibility,created) VALUES
+ ('stats-task-1','history','stats-fixture','task 12345678 caller→worker→name','','private',1000),
+ ('stats-reply-1','history','stats-fixture','reply 12345678 worker→caller','','private',1600),
+ ('stats-task-2','history','stats-fixture','task 87654321 caller→worker→name','','private',2000);"
+stats_out=$(cd "$TMPD" && "$BIN" stats --all)
+check 'stats groups unicode worker and counts' "$stats_out" 'worker→name'
+check 'stats reports answered and unanswered' "$stats_out" '2        1          1'
+if BIN="$BIN" bash "$(dirname "$0")/test-cli.sh"; then ok_; else bad 'standalone CLI checks'; fi
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
