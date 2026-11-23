@@ -2706,7 +2706,9 @@ lease_idle_watcher() {
     log="$TMPD/idle-tmux.log"
     CNTCTR_WAKE_SEC=1 CNTCTR_TEST_IDLE_LOG="$log" daemon_start "$P"
     daemon_hello
-    sleep 1
+    # count from after the hello reply: answering it makes the last startup tmux call
+    # (the unread count's @cntctr_seen_ lookup), which a fixed sleep misses on a busy machine
+    for _ in $(seq 300); do jq -e 'select(.id == 2)' "$DOUT" >/dev/null 2>&1 && break; sleep 0.1; done
     before=$(wc -l < "$log")
     sleep 6   # the idle poll is capped at 4 intervals (4 s here); wait past one capped wake
     same "idle watcher makes no tmux calls across a capped idle wake" "$(wc -l < "$log")" "$before"
