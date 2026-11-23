@@ -5260,16 +5260,9 @@ int main(int argc, char **argv) {
 #endif
     if (argc > 1 && !strcmp(argv[1], "stats")) return stats_cmd(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "usage")) {
-        char cwd[PATH_MAX], common[PATH_MAX]; char *gitdir = NULL;
+        char cwd[PATH_MAX];
         if (!getcwd(cwd, sizeof cwd)) { perror("usage: getcwd"); return 1; }
-        if (run(NULL, &gitdir, (const char *[]){"git", "rev-parse", "--path-format=absolute", "--git-common-dir", NULL}) == 0 &&
-            gitdir && realpath(gitdir, common)) {
-            char *slash = strrchr(common, '/');
-            if (slash && slash != common) *slash = '\0';
-            else if (slash) slash[1] = '\0';
-        } else snprintf(common, sizeof common, "%s", cwd);
-        free(gitdir);
-        return usage_cmd(argc, argv, common);
+        return usage_cmd(argc, argv, cwd);
     }
     if (argc > 1 && !strcmp(argv[1], "hook")) return hook_cmd(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "hooks")) return hooks_admin(argc, argv, hook_seen);

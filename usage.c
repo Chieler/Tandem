@@ -1,11 +1,14 @@
 #define _GNU_SOURCE
 #include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <ctype.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #include <json-c/json.h>
@@ -16,7 +19,45 @@ struct seen { char *id, *model; struct counts c; struct seen *next; };
 static struct model *models;
 static struct seen *seen;
 static time_t cutoff;
-static const char *project;
+/* ponytail: at most 256 worktrees are included. */
+static char *projects[256];
+static size_t project_count;
+static void project_paths(const char *cwd) {
+    int fd[2]; pid_t pid=-1; int status=0;
+    if (!pipe(fd)) {
+        pid=fork();
+        if (!pid) {
+            close(fd[0]); dup2(fd[1],STDOUT_FILENO); close(fd[1]);
+            int nullfd=open("/dev/null",O_WRONLY);
+            if (nullfd>=0) { dup2(nullfd,STDERR_FILENO); close(nullfd); }
+            execlp("git","git","-C",cwd,"worktree","list","--porcelain",(char *)NULL);
+            _exit(127);
+        }
+        close(fd[1]);
+        FILE *f=fdopen(fd[0],"r");
+        if (f) {
+            char *line=NULL; size_t cap=0; ssize_t len;
+            while ((len=getline(&line,&cap,f))>0) {
+                if (len && line[len-1]=='\n') line[--len]=0;
+                if (!strncmp(line,"worktree ",9) && line[9] && project_count<256)
+                    projects[project_count++]=strdup(line+9);
+            }
+            free(line); fclose(f);
+        } else close(fd[0]);
+        if (pid>0) { while (waitpid(pid,&status,0)<0 && errno==EINTR) {} }
+    }
+    if (pid<=0 || !WIFEXITED(status) || WEXITSTATUS(status) || !project_count) {
+        for (size_t i=0;i<project_count;i++) free(projects[i]);
+        project_count=0; projects[project_count++]=strdup(cwd);
+    }
+}
+static int in_project(const char *cwd) {
+    for (size_t i=0;i<project_count;i++) {
+        size_t n=strlen(projects[i]);
+        if (!strncmp(cwd,projects[i],n) && (!cwd[n] || cwd[n]=='/' || (n==1 && projects[i][0]=='/'))) return 1;
+    }
+    return 0;
+}
 static json_object *field(json_object *o, const char *k) { json_object *v = NULL; if (o) json_object_object_get_ex(o,k,&v); return v; }
 static const char *str(json_object *o, const char *k) { json_object *v=field(o,k); return v && json_object_is_type(v,json_type_string) ? json_object_get_string(v) : ""; }
 static long long num(json_object *o, const char *k) { json_object *v=field(o,k); return v ? json_object_get_int64(v) : 0; }
@@ -68,8 +109,7 @@ static void codex(const char *path) {
         }
         json_object_put(o);
     }
-    size_t n=strlen(project);
-    if (got && !strncmp(cwd,project,n) && (!cwd[n] || cwd[n]=='/')) {
+    if (got && in_project(cwd)) {
         c.in-=baseline.in; c.read-=baseline.read; c.write-=baseline.write; c.out-=baseline.out; c.denominator-=baseline.denominator;
         add(model,c,1);
     }
@@ -97,22 +137,20 @@ int usage_cmd(int argc, char **argv, const char *cwd) {
     if (argc>2) { char *end; if (argc!=4 || strcmp(argv[2],"--since")) goto bad; hours=strtol(argv[3],&end,10); if (!*argv[3] || *end || hours<0 || hours>INT_MAX/3600) goto bad; }
     cutoff=time(NULL)-hours*3600LL;
     const char *home=getenv("HOME"); if (!home) home=".";
-    project=getenv("CNTCTR_USAGE_CWD"); if (!project || !*project) project=cwd;
+    const char *project=getenv("CNTCTR_USAGE_CWD"); if (!project || !*project) project=cwd;
+    project_paths(project);
     const char *cd=getenv("CNTCTR_USAGE_CLAUDE_DIR"), *xd=getenv("CNTCTR_USAGE_CODEX_DIR");
     char *cp=NULL,*xp=NULL;
     if (!cd || !*cd) {
-        char *encoded=strdup(project);
-        for (char *p=encoded;*p;p++) if (!isalnum((unsigned char)*p)) *p='-';
         if (asprintf(&cp,"%s/.claude/projects",home)<0) cp=NULL;
-        DIR *projects=cp ? opendir(cp) : NULL; struct dirent *entry;
-        while (projects && (entry=readdir(projects))) {
-            size_t n=strlen(encoded);
-            if (strncmp(entry->d_name,encoded,n) || (entry->d_name[n] && entry->d_name[n]!='-')) continue;
+        for (size_t i=0;cp && i<project_count;i++) {
+            char *encoded=strdup(projects[i]);
+            if (!encoded) continue;
+            for (char *p=encoded;*p;p++) if (!isalnum((unsigned char)*p)) *p='-';
             char *path=NULL;
-            if (asprintf(&path,"%s/%s",cp,entry->d_name)>=0) { walk(path,0,2); free(path); }
+            if (asprintf(&path,"%s/%s",cp,encoded)>=0) { walk(path,0,2); free(path); }
+            free(encoded);
         }
-        if (projects) closedir(projects);
-        free(encoded);
     }
     if (!xd || !*xd) { if (asprintf(&xp,"%s/.codex/sessions",home)<0) xp=NULL; xd=xp; }
     if (cd && *cd) walk(cd,0,2); if (xd) walk(xd,1,3);
@@ -122,6 +160,8 @@ int usage_cmd(int argc, char **argv, const char *cwd) {
         /* Codex input already includes cached tokens. */
         printf("%-28s %12lld %12lld %12lld %12lld %8.1f%%\n",m->name,m->c.in,m->c.read,m->c.write,m->c.out,denom ? 100.0*m->c.read/denom : 0.0);
     }
-    puts("agy: not counted"); free(cp); free(xp); return 0;
+    puts("agy: not counted"); free(cp); free(xp);
+    for (size_t i=0;i<project_count;i++) free(projects[i]);
+    return 0;
  bad: fprintf(stderr,"usage: cntctr usage [--since hours]\n"); return 2;
 }
