@@ -456,7 +456,7 @@ int kb_mail_reconcile(sqlite3 *db, time_t now, int wake_sec, int *notices) {
             char *body = sqlite3_mprintf("for %s: undelivered after 3 attempts: %lld to %s; recipient can call board id=%lld",
                                         to, post, col(due, 1), post);
             ok = body && kb_mail_insert(db, *scope ? scope : col(due, 6), pane, to, "cntctr", "",
-                                        body, 0, col(due, 1), col(due, 6), col(due, 4)) > 0;
+                                        body, 0, "", "", col(due, 4)) > 0;
             sqlite3_free(body);
             created |= ok;
         }

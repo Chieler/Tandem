@@ -2699,6 +2699,7 @@ lease_stall_notice_wakes() {
     same "hook stalls exhausted mail" "$(mstate "$id")" stalled/1/0
     expect_screen "hook stall wakes an idle sender without another event" "$S" "undelivered after 3 attempts: $id"
     same "hook created one notice for the sleeping sender" "$(notices "$id")" 1
+    same "stall notice carries no return route" "$(sqx "$CNTCTR_DB" "SELECT '['||from_pane||'/'||from_scope||']' FROM mail JOIN posts ON posts.rowid=mail.post WHERE text LIKE '%undelivered after 3 attempts: $id to %'")" "[/]"
     daemon_stop
 }
 
