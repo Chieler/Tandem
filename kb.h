@@ -49,7 +49,7 @@ int kb_mail_claim(sqlite3 *db, long long post, const char *socket, const char *p
 enum kb_mail_finish { KB_MAIL_READ, KB_MAIL_STOP, KB_MAIL_TERMINAL };
 int kb_mail_finish(sqlite3 *db, long long post, enum kb_mail_finish outcome, int attempt, const char *token,
                    time_t now); /* 1 finished, 0 unmatched, -1 error */
-int kb_mail_reconcile(sqlite3 *db, time_t now, int wake_sec, int *notices); /* SQLite result code */
+int kb_mail_reconcile(sqlite3 *db, time_t now, int wake_sec); /* SQLite result code */
 char *kb_board_mail(sqlite3 *db, const char *scope, const char *me, const char *pane, const char *socket, long long server_start, int limit);
 char *kb_board(sqlite3 *db, const char *scope, const char *me, const char *pane, const char *socket, long long server_start, int limit);   /* "<UTC time> <sender>: <text>" lines, oldest first */
 

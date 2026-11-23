@@ -2688,7 +2688,7 @@ lease_idle_watcher() {
 lease_stall_notice_wakes() {
     local S P id
     S=$(newpane lease_stall_sender); P=$(hk_agent claude lease_stall_worker)
-    daemon_start "$S"
+    CNTCTR_WAKE_SEC=1 daemon_start "$S"
     daemon_hello
     # Ensure the sender has scanned its empty queue before giving the hook any work.
     sleep 1
