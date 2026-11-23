@@ -2800,20 +2800,37 @@ b_race_schema() {
 }
 
 b_race_migration() {
-    local stamped="$TMPD/b_race_stamped.db" sockpath
+    local stamped="$TMPD/b_race_stamped.db" sockpath bindings before claims
     sockpath=$(t display -p '#{socket_path}')
     sqlite3 "$stamped" < tests/schema_stamp1.sql
     sq "$stamped" "INSERT INTO hook_sessions(socket,pane,harness,session_id,harness_pid,last_event,at,turn)
         VALUES('socket-a','%0','claude','S1',1,'UserPromptSubmit',0,3);
-        INSERT INTO mail(post,name,pane,socket,state,staged_turn)
-        VALUES(1,'worker','%0','socket-a','staged','S1:3'),
-              (2,'worker','%0','socket-b','staged','S1:3'),
-              (3,'worker','%1','socket-a','staged','S1:3')"
+        INSERT INTO posts(rowid,scope,sender,text,at)
+        VALUES(1,'project','sender','active turn body',1),
+              (2,'project','sender','another socket body',1),
+              (3,'project','sender','another pane body',1);
+        INSERT INTO mail(post,name,pane,socket,state,staged_turn,presentations)
+        VALUES(1,'worker','%0','socket-a','staged','S1:3',1),
+              (2,'worker','%0','socket-b','staged','S1:3',2),
+              (3,'worker','%1','socket-a','staged','S1:3',3)"
+    bindings="SELECT post,name,pane,socket,staged_turn,presentations,scope,sender,text,at
+        FROM mail JOIN posts ON posts.rowid=mail.post ORDER BY post"
+    before=$(sq "$stamped" "$bindings")
+
     CNTCTR_DB=$stamped TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
-    # A's equivalent turn token is the session generation plus the turn.
-    same "B F8.4 migration keeps the active turn's staged mail" "$(sq "$stamped" "SELECT state||'/'||(generation!='' AND staged_turn=generation||':'||turn) FROM mail,hook_sessions WHERE post=1")" staged/1
-    same "B F8.4 migration leaves other sockets and panes alone" "$(sq "$stamped" "SELECT count(*) FROM mail WHERE post IN (2,3) AND staged_turn='S1:3'")" 2
-    same "B F8.4 migration seeds the active session's generation" "$(sq "$stamped" "SELECT count(*) FROM hook_sessions WHERE socket='socket-a' AND pane='%0' AND generation!=''")" 1
+    # Legacy tokens account for one attempt but provide no live lease or proof of a full body.
+    claims="SELECT state||'/'||shown||'/'||wake_attempts||'/'||delivered||'/'||staged_full||'/'||lease_until FROM mail"
+    same "B F8.4 migration requeues active turn mail with its legacy attempt" \
+        "$(sq "$stamped" "$claims WHERE post=1")" pending/1/0/0/0/0
+    same "B F8.4 migration requeues another socket's legacy claim" \
+        "$(sq "$stamped" "$claims WHERE post=2")" pending/1/0/0/0/0
+    same "B F8.4 migration requeues another pane's legacy claim" \
+        "$(sq "$stamped" "$claims WHERE post=3")" pending/1/0/0/0/0
+    same "B F8.4 migration preserves post bodies, bindings and legacy token history" \
+        "$(sq "$stamped" "$bindings")" "$before"
+    same "B F8.4 migration seeds generation and preserves active session identity" \
+        "$(sq "$stamped" "SELECT session_id||'/'||harness_pid||'/'||turn||'/'||(generation!='')
+          FROM hook_sessions WHERE socket='socket-a' AND pane='%0'")" S1/1/3/1
 }
 
 b_race_mail() {
