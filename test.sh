@@ -2703,6 +2703,25 @@ lease_stall_notice_wakes() {
     daemon_stop
 }
 
+lease_attach_idle_watcher() {
+    local S P id i
+    S=$(newpane lease_attach_sender); P=$(hk_agent claude lease_attach_worker)
+    CNTCTR_WAKE_SEC=1 daemon_start "$S"
+    daemon_hello
+    sleep 1   # the sender's watcher has scanned an empty queue and sleeps
+    id=$(mailput "$P" l0000084 "$(mail_text l0000084 'third body for idle sender')" 1)
+    sqx "$CNTCTR_DB" "UPDATE posts SET sender='lease_attach_sender' WHERE rowid=$id;
+        UPDATE mail SET shown=2,from_pane='$S' WHERE post=$id"
+    c_prompt "$P" "$(pointer "$id")" >/dev/null
+    same "pointer attach stages the third body" "$(sqx "$CNTCTR_DB" "SELECT state||'/'||shown FROM mail WHERE post=$id")" staged/3
+    expire_mail "$id"   # no hook event or FIFO byte follows
+    for i in $(seq 100); do [ "$(mstate "$id")" = stalled/1/0 ] && break; sleep 0.1; done
+    same "idle watcher stalls the attached lease on its own" "$(mstate "$id")" stalled/1/0
+    for i in $(seq 50); do [ "$(notices "$id")" = 1 ] && break; sleep 0.1; done
+    same "idle watcher creates the notice on its own" "$(notices "$id")" 1
+    daemon_stop
+}
+
 lease_deadlines() {
     local S P id fifo start i out
     S=$(newpane lease_deadline_watcher); P=$(hk_agent claude lease_deadline_target)
@@ -2744,6 +2763,7 @@ lease_deadlines() {
 f8_6() {
     lease_idle_watcher
     lease_stall_notice_wakes
+    lease_attach_idle_watcher
     lease_early_prompt
     lease_ordinary_prompt
     lease_failed_pointer_claim

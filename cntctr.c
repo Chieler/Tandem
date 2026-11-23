@@ -3618,7 +3618,10 @@ static int redeliver_mail(void) {
             seconds = deadline <= scanned ? 0 : deadline - scanned > INT_MAX ? INT_MAX : (int)(deadline - scanned);
         sqlite3_close(db);
     } else seconds = interval;
-    return seconds > INT_MAX / 1000 ? INT_MAX : seconds < 0 ? -1 : seconds * 1000;
+    /* A deadline created while we sleep (a pointer attach stages a lease) sends no signal; this read-only recheck finds it. */
+    int cap = interval > INT_MAX / 4 ? INT_MAX : 4 * interval;
+    if (seconds < 0 || seconds > cap) seconds = cap;
+    return seconds > INT_MAX / 1000 ? INT_MAX : seconds * 1000;
 }
 
 static void learn_mail_identity(const char *pane, const char *name) {
