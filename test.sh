@@ -3015,30 +3015,60 @@ b_race_interleave() {
 }
 
 b_race_snapshot() {
-    local p m next sock pid driver i barrier
+    local p old renewed next pending sock pid driver i barrier out claims attached hook_row event
     b_race_driver || return
     p=$(hk_agent claude race_snapshot)
     sock=$(t display -p '#{socket_path}')
     pid=$(sqx "$CNTCTR_DB" "SELECT harness_pid FROM hook_sessions WHERE pane='$p'")
-    m=$(mailput "$p" race0006 "$(mail_text race0006 'old turn mail')" 1)
-    c_prompt "$p" "$(pointer "$m")" >/dev/null
-    same "race prompt stages mail before the waiting Stop" "$(mstate "$m")" "staged/1/0"
-    # A prompt can commit while the older Stop is waiting on tmux.
+    old=$(mailput "$p" race0006 "$(mail_text race0006 'live mail before snapshot')" 1)
+    renewed=$(mailput "$p" race0007 "$(mail_text race0007 'expired mail before snapshot')" 0)
+    c_prompt "$p" "$(pointer "$old")" >/dev/null
+    same "race snapshot starts with two staged body attempts" \
+        "$(b_race_mail "$old")/$(b_race_mail "$renewed")" staged/1/0/0/staged/1/0/0
+    expire_mail "$renewed"
+
     barrier="$TMPD/race_gate"
-    next=$(mailput "$p" race0007 "$(mail_text race0007 'mail while Stop waits for tmux')" 1)
-    HOOK_GATE_BARRIER="$barrier" "$TMPD/race_driver" "$sock" "$p" "$pid" &
+    HOOK_GATE_BARRIER="$barrier" "$TMPD/race_driver" "$sock" "$p" "$pid" > "$TMPD/race_answer" &
     driver=$!
-    for i in $(seq 1 100); do [ -e "$barrier.ready" ] && break; sleep 0.02; done
-    if [ -e "$barrier.ready" ] && sqlite3 "$CNTCTR_DB" "BEGIN IMMEDIATE; ROLLBACK" 2>/dev/null; then
-        c_prompt "$p" "$(pointer "$next")" >/dev/null
-        same "race prompt stages mail while Stop waits for tmux" "$(mstate "$next")" "staged/1/0"
-    else
-        bad "race Stop snapshot does not hold the database writer"
+    for i in $(seq 1 100); do
+        [ -e "$barrier.ready" ] && break
+        sleep 0.02
+    done
+    if [ ! -e "$barrier.ready" ] || ! sqlite3 "$CNTCTR_DB" "BEGIN IMMEDIATE; ROLLBACK" 2>/dev/null; then
+        : > "$barrier.go"
+        wait "$driver"
+        bad "race Stop did not yield the writer while waiting for tmux"
+        return
     fi
+
+    hook_row="SELECT generation,event_seq,turn,last_event FROM hook_sessions WHERE pane='$p'"
+    same "race Stop has recorded before waiting for tmux" \
+        "$(sqx "$CNTCTR_DB" "SELECT last_event FROM hook_sessions WHERE pane='$p'")" Stop
+    same "race Stop acknowledges live mail before waiting for tmux" "$(b_race_mail "$old")" delivered/1/0/1
+    same "race Stop releases expired mail without acknowledging it" "$(b_race_mail "$renewed")" pending/1/0/0
+    next=$(mailput "$p" race0008 "$(mail_text race0008 'new mail during snapshot')" 1)
+    out=$(c_prompt "$p" "$(pointer "$next")")
+    check "race prompt attaches new mail while Stop waits for tmux" "$(ctx_c "$out")" "new mail during snapshot"
+    check "race prompt reattaches expired mail while Stop waits for tmux" "$(ctx_c "$out")" "expired mail before snapshot"
+    same "race both prompt claims commit while Stop waits for tmux" \
+        "$(b_race_mail "$next")/$(b_race_mail "$renewed")" staged/1/0/0/staged/2/0/0
+    # Give the old Stop eligible mail so its gate would have work if it retained ownership.
+    pending=$(mailput "$p" race0009 "$(mail_text race0009 'mail after the newer prompt')")
+    claims="SELECT post,shown,staged_turn,staged_full,lease_until FROM mail WHERE post IN ($next,$renewed) ORDER BY post"
+    attached=$(sqx "$CNTCTR_DB" "$claims")
+    event=$(sqx "$CNTCTR_DB" "$hook_row")
+
     : > "$barrier.go"
     wait "$driver" || bad "race Stop snapshot driver failed"
-    same "race Stop after tmux leaves newer mail staged" "$(mstate "$next")" "staged/1/0"
-    same "race superseded Stop leaves the reattached old mail staged" "$(mstate "$m")" "staged/2/0"
+    same "race Stop after tmux cannot emit a displaced decision" "$(cat "$TMPD/race_answer")" '{}'
+    same "race Stop after tmux preserves the newer prompt record" "$(sqx "$CNTCTR_DB" "$hook_row")" "$event"
+    same "race Stop after tmux leaves both newer claims staged" \
+        "$(b_race_mail "$next")/$(b_race_mail "$renewed")" staged/1/0/0/staged/2/0/0
+    same "race Stop after tmux leaves both newer claims unchanged" "$(sqx "$CNTCTR_DB" "$claims")" "$attached"
+    same "race Stop after tmux cannot claim mail arriving after the prompt" "$(b_race_mail "$pending")" pending/0/0/0
+    c_stop "$p" true >/dev/null
+    same "race current Stop acknowledges both newer claims" \
+        "$(b_race_mail "$next")/$(b_race_mail "$renewed")" delivered/1/0/1/delivered/2/0/1
 }
 
 b_race_rollback() {
