@@ -2680,8 +2680,8 @@ lease_idle_watcher() {
     daemon_hello
     sleep 1
     before=$(wc -l < "$log")
-    sleep 2
-    same "idle watcher makes no tmux calls across two retry intervals" "$(wc -l < "$log")" "$before"
+    sleep 6   # the idle poll is capped at 4 intervals (4 s here); wait past one capped wake
+    same "idle watcher makes no tmux calls across a capped idle wake" "$(wc -l < "$log")" "$before"
     daemon_stop
 }
 
