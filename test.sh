@@ -2523,6 +2523,29 @@ lease_ordinary_prompt() {
     daemon_stop
 }
 
+lease_failed_pointer_claim() {
+    local S P id out now
+    S=$(newpane lease_claim_sender); P=$(hk_agent claude lease_claim_live)
+    out=$(txt "$(call "$S" send '{"to":"lease_claim_live","text":"wake with rejected claim"}')")
+    id=$(mailid "${out#sent id=}")
+    now=$(date +%s)
+    sqx "$CNTCTR_DB" "UPDATE hook_sessions SET wake_at=$((now-2)) WHERE pane='$P';
+        CREATE TRIGGER reject_pointer_claim BEFORE UPDATE OF state ON mail
+        WHEN NEW.post=$id AND NEW.state='staged' BEGIN SELECT RAISE(ABORT,'rejected pointer claim'); END"
+    same "wake is reserved before a failed pointer claim" "$(sqx "$CNTCTR_DB" "SELECT wake_reserved FROM hook_sessions WHERE pane='$P'")" 1
+    out=$(c_prompt "$P" "$(pointer "$id")")
+    emptyans "$out" && ok_ || bad "failed pointer claim returns no mail"
+    sleep 2
+    CNTCTR_WAKE_SEC=3 daemon_start "$P"
+    daemon_hello
+    same "failed pointer claim leaves the responsive hook healthy" \
+        "$(sqx "$CNTCTR_DB" "SELECT wake_reserved||'/'||broken||(case when wake_at is null then '/empty' else '/set' end) FROM hook_sessions WHERE pane='$P'")" 0/0/empty
+    same "rejected body claim remains pending" "$(mstate "$id")" pending/1/0
+    refute "failed pointer does not submit a terminal body" "$(screen "$P")" "wake with rejected claim"
+    daemon_stop
+    sqx "$CNTCTR_DB" "DROP TRIGGER reject_pointer_claim"
+}
+
 lease_start_second() {
     local P S old id epoch out
     P=$(newpane lease_start_second); S=$(newpane lease_start_second_sender)
@@ -2712,6 +2735,7 @@ f8_6() {
     lease_stall_notice_wakes
     lease_early_prompt
     lease_ordinary_prompt
+    lease_failed_pointer_claim
     lease_start_second
     lease_failed_spill
     lease_late_terminal
