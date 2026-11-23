@@ -3432,6 +3432,7 @@ static void notify_fifo(char event) {
 
 static void notify_all(void) { notify_fifo('x'); }
 static void notify_mail(void) { notify_fifo('m'); }
+static int hook_notify;   /* a hook committed something watchers must see; hook_cmd signals after the answer is written */
 
 static void wake_pending(sqlite3 *db, const char *socket, const char *pane, const char *name, const char *scope);
 static char *tmux_socket(void);
@@ -4246,7 +4247,7 @@ static int record_hook(sqlite3 *db, const char *socket, const char *pane, const 
         ok = acked >= 0;
     }
     if (ok && sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK) {
-        if (notices) notify_mail();
+        if (notices) hook_notify = 1;
         if (hook_trace && acked) json_object_object_add(hook_trace, "delivered", json_object_new_int(acked));
         return current;
     }
@@ -4887,7 +4888,7 @@ static json_object *hook_stop(sqlite3 *db, const char *socket, const char *pane,
         }
         if (begun && !staged) sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
         begun = staged && hook_commit(db, taken || named);
-        if (begun && taken) notify_mail();
+        if (begun && taken) hook_notify = 1;
         if (begun && (taken || named)) {
             answer = candidate;
             candidate = NULL;
@@ -5103,10 +5104,11 @@ static int hook_cmd(int argc, char **argv) {
         free(trace_log);
     }
     free(socket);
-    if (decided) { json_object_put(decided); return 0; }
+    if (decided) { json_object_put(decided); if (hook_notify) notify_mail(); return 0; }
     json_object *answer = hook_answer(argc > 2 ? argv[2] : "", argc > 3 ? argv[3] : "", HOOK_NEUTRAL, NULL);
     if (answer) { puts(json_object_to_json_string_ext(answer, JSON_C_TO_STRING_PLAIN)); json_object_put(answer); }
     else puts("{}");
+    if (hook_notify) { fflush(stdout); notify_mail(); }
     return 0;
 }
 
