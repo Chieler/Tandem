@@ -2789,14 +2789,25 @@ f8_6() {
 }
 
 b_race_schema() {
-    local fresh="$TMPD/b_race_schema.db" sockpath version
+    local fresh="$TMPD/b_race_schema.db" sockpath version generation session
     sockpath=$(t display -p '#{socket_path}')
     CNTCTR_DB=$fresh TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
     version=$(sq "$fresh" 'PRAGMA user_version')
-    sq "$fresh" "ALTER TABLE hook_sessions DROP COLUMN generation; PRAGMA user_version=0"
+    sq "$fresh" "ALTER TABLE hook_sessions DROP COLUMN generation; PRAGMA user_version=0;
+        INSERT INTO hook_sessions(socket,pane,harness,session_id,harness_pid,last_event,at,turn)
+        VALUES('legacy','%0','claude','S1',1,'UserPromptSubmit',0,3)"
     CNTCTR_DB=$fresh TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
-    same "B F9 older database gets the generation column" "$(sq "$fresh" "SELECT count(*) FROM pragma_table_info('hook_sessions') WHERE name='generation'")" 1
-    same "B F9 re-opened database gets the current schema stamp" "$(sq "$fresh" 'PRAGMA user_version')" "$version"
+    same "B F9 older database gets generation column" \
+        "$(sq "$fresh" "SELECT count(*) FROM pragma_table_info('hook_sessions') WHERE name='generation'")" 1
+    same "B F9 re-opened database gets current schema stamp" "$(sq "$fresh" 'PRAGMA user_version')" "$version"
+    session="SELECT session_id||'/'||turn||'/'||generation FROM hook_sessions WHERE socket='legacy' AND pane='%0'"
+    generation=$(sq "$fresh" "$session")
+    case "$generation" in
+        S1/3/?*) ok_ ;;
+        *) bad "B F9 schema preserves the older session and backfills its generation" " got: $generation" ;;
+    esac
+    CNTCTR_DB=$fresh TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
+    same "B F9 another open keeps the migrated session generation" "$(sq "$fresh" "$session")" "$generation"
 }
 
 b_race_migration() {
