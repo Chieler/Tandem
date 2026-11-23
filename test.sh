@@ -2816,22 +2816,46 @@ b_race_migration() {
     same "B F8.4 migration seeds the active session's generation" "$(sq "$stamped" "SELECT count(*) FROM hook_sessions WHERE socket='socket-a' AND pane='%0' AND generation!=''")" 1
 }
 
+b_race_mail() {
+    sqx "$CNTCTR_DB" "SELECT state||'/'||shown||'/'||wake_attempts||'/'||delivered FROM mail WHERE post=$1"
+}
+
 b_race_resume() {
-    local p m change
+    local p m change body generation prior claim out
     for change in SessionStart PID; do
         p=$(hk_agent claude "race_resume_$change")
-        c_start "$p" >/dev/null
-        m=$(mailput "$p" race0001 "$(mail_text race0001 'old turn mail')" 1)
+        body=$(mail_text race0001 "old turn mail before $change")
+        m=$(mailput "$p" race0001 "$body" 1)
         c_prompt "$p" "$(pointer "$m")" >/dev/null
-        same "race $change initially stages mail" "$(mstate "$m")" "staged/1/0"
+        same "race $change initially stages one body attempt" "$(b_race_mail "$m")" staged/1/0/0
+        generation=$(sqx "$CNTCTR_DB" "SELECT generation FROM hook_sessions WHERE pane='$p'")
+        claim="SELECT staged_turn||'/'||staged_full||'/'||lease_until FROM mail WHERE post=$m"
+        prior=$(sqx "$CNTCTR_DB" "$claim")
+        check "race $change old claim belongs to old generation" "$prior" "$generation:"
         if [ "$change" = SessionStart ]; then
             c_start "$p" >/dev/null
         else
             sq "$CNTCTR_DB" "UPDATE hook_sessions SET harness_pid=harness_pid+1 WHERE pane='$p'"
         fi
         c_prompt "$p" "unrelated new turn" >/dev/null
+        same "race $change changes generation" \
+            "$(sqx "$CNTCTR_DB" "SELECT length(generation)>0 AND generation!='$generation' FROM hook_sessions WHERE pane='$p'")" 1
         c_stop "$p" true >/dev/null
-        same "race $change re-pends mail from the old turn" "$(mstate "$m")" "pending/1/0"
+        same "race $change cannot acknowledge an unexpired old claim" "$(b_race_mail "$m")" staged/1/0/0
+        same "race $change preserves old claim and deadline" "$(sqx "$CNTCTR_DB" "$claim")" "$prior"
+
+        expire_mail "$m"
+        c_prompt "$p" "after the old claim expires" >/dev/null
+        same "race $change expiry makes the old row eligible again" "$(b_race_mail "$m")" pending/1/0/0
+        out=$(c_prompt "$p" "$(pointer "$m")")
+        check "race $change reattaches the original envelope" "$(ctx_c "$out")" "$body"
+        same "race $change reattachment charges a second body attempt" "$(b_race_mail "$m")" staged/2/0/0
+        same "race $change reattachment uses the new generation and a live lease" \
+            "$(sqx "$CNTCTR_DB" "SELECT count(*) FROM mail m JOIN hook_sessions h USING(socket,pane)
+              WHERE m.post=$m AND m.staged_turn=h.generation||':'||h.turn||':'||h.event_seq
+              AND m.staged_full=1 AND m.lease_until>strftime('%s','now')")" 1
+        c_stop "$p" >/dev/null
+        same "race $change current Stop acknowledges the reattached claim" "$(b_race_mail "$m")" delivered/2/0/1
     done
 }
 
