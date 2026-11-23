@@ -170,7 +170,7 @@ sqlite3 *kb_open_timeout(const char *path, char **err, int timeout_ms) {
     if (rc == SQLITE_OK)
         rc = sqlite3_exec(db, "UPDATE hook_sessions SET generation=lower(hex(randomblob(16)))"
                              " WHERE generation='' AND session_id!=''", NULL, NULL, NULL);
-    if (rc == SQLITE_OK) rc = kb_mail_reconcile(db, time(NULL), 0);
+    if (rc == SQLITE_OK) rc = kb_mail_reconcile(db, time(NULL), 0, NULL);
     if (rc == SQLITE_OK) rc = sqlite3_exec(db, machine, NULL, NULL, NULL);
     if (rc == SQLITE_OK) {
         char stamp[48];
@@ -420,7 +420,8 @@ int kb_mail_finish(sqlite3 *db, long long post, enum kb_mail_finish outcome, int
     return rc;
 }
 
-int kb_mail_reconcile(sqlite3 *db, time_t now, int wake_sec) {
+int kb_mail_reconcile(sqlite3 *db, time_t now, int wake_sec, int *notices) {
+    int created = 0;
     int own = sqlite3_get_autocommit(db);
     int rc = own ? sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) : SQLITE_OK;
     if (rc != SQLITE_OK) return rc;
@@ -457,6 +458,7 @@ int kb_mail_reconcile(sqlite3 *db, time_t now, int wake_sec) {
             ok = body && kb_mail_insert(db, *scope ? scope : col(due, 6), pane, to, "cntctr", "",
                                         body, 0, col(due, 1), col(due, 6), col(due, 4)) > 0;
             sqlite3_free(body);
+            created |= ok;
         }
         sqlite3_reset(due);
         if (!ok) rc = sqlite3_exec(db, "ROLLBACK TO stall_mail", NULL, NULL, NULL);
@@ -475,6 +477,7 @@ int kb_mail_reconcile(sqlite3 *db, time_t now, int wake_sec) {
     }
     if (own && rc == SQLITE_OK) rc = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
     if (own && rc != SQLITE_OK) sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    if (notices) *notices = rc == SQLITE_OK && created;
     return rc;
 }
 

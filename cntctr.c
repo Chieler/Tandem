@@ -3410,7 +3410,7 @@ static int fifo_dir(char dir[4096]) {
 }
 
 /* Wake every cntctr of ours: one byte into each FIFO; the ones nobody reads any more are removed. */
-static void notify_all(void) {
+static void notify_fifo(char event) {
     char dir[4096];
     DIR *d = fifo_dir(dir) == 0 ? opendir(dir) : NULL;
     for (struct dirent *e; d && (e = readdir(d));) {
@@ -3421,7 +3421,7 @@ static void notify_all(void) {
         int fd = open(path, O_WRONLY | O_NONBLOCK), gone = fd < 0 && errno == ENXIO;
         if (fd >= 0) {
             ssize_t w;
-            while ((w = write(fd, "x", 1)) < 0 && errno == EINTR) {}
+            while ((w = write(fd, &event, 1)) < 0 && errno == EINTR) {}
             gone = w < 0 && errno == EPIPE;   /* EAGAIN: a wake is already pending */
             close(fd);
         }
@@ -3429,6 +3429,9 @@ static void notify_all(void) {
     }
     if (d) closedir(d);
 }
+
+static void notify_all(void) { notify_fifo('x'); }
+static void notify_mail(void) { notify_fifo('m'); }
 
 static void wake_pending(sqlite3 *db, const char *socket, const char *pane, const char *name, const char *scope);
 static char *tmux_socket(void);
@@ -3601,7 +3604,8 @@ static int redeliver_mail(void) {
         time_t now = time(NULL);
         sqlite3_int64 deadline = mail_deadline(db, interval);
         int due = deadline > 0 && deadline <= now, waiting = 0;
-        if (due) kb_mail_reconcile(db, now, interval);
+        int notices = 0;
+        if (due && kb_mail_reconcile(db, now, interval, &notices) == SQLITE_OK && notices) notify_mail();
         pthread_mutex_lock(&mail_mu);
         struct mail_identity *identities = mail_identities;
         pthread_mutex_unlock(&mail_mu);
@@ -4207,7 +4211,8 @@ static int record_hook(sqlite3 *db, const char *socket, const char *pane, const 
     sqlite3_stmt *st = NULL;
     if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) return 0;
     time_t now = time(NULL);
-    if (kb_mail_reconcile(db, now, wake_sec()) != SQLITE_OK ||
+    int notices = 0;
+    if (kb_mail_reconcile(db, now, wake_sec(), &notices) != SQLITE_OK ||
         sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
         sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
         return 0;
@@ -4239,6 +4244,7 @@ static int record_hook(sqlite3 *db, const char *socket, const char *pane, const 
         ok = acked >= 0;
     }
     if (ok && sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK) {
+        if (notices) notify_mail();
         if (hook_trace && acked) json_object_object_add(hook_trace, "delivered", json_object_new_int(acked));
         return current;
     }
@@ -4672,7 +4678,8 @@ static json_object *hook_attach(sqlite3 *db, const char *harness, const char *ev
         if (!ok || !stage_rows(db, socket, pane, record, rows, taken, own)) {
             sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
             taken = 0;
-        } else if (!hook_commit(db, 1)) taken = 0;
+        } else if (!hook_commit(db, taken != 0)) taken = 0;
+        else if (taken) notify_mail();
         if (hook_trace) json_object_object_add(hook_trace, "attached", json_object_new_int(taken));
     } else taken = 0;
     if (!taken && answer) {
@@ -4888,6 +4895,7 @@ static json_object *hook_stop(sqlite3 *db, const char *socket, const char *pane,
         }
         if (begun && !staged) sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
         begun = staged && hook_commit(db, taken || named);
+        if (begun && taken) notify_mail();
         if (begun && (taken || named)) {
             answer = candidate;
             candidate = NULL;

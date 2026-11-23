@@ -2652,6 +2652,23 @@ lease_idle_watcher() {
     daemon_stop
 }
 
+lease_stall_notice_wakes() {
+    local S P id
+    S=$(newpane lease_stall_sender); P=$(hk_agent claude lease_stall_worker)
+    daemon_start "$S"
+    daemon_hello
+    # Ensure the sender has scanned its empty queue before giving the hook any work.
+    sleep 1
+    id=$(mailput "$P" l0000083 "$(mail_text l0000083 'stall for idle sender')" 1)
+    sqx "$CNTCTR_DB" "UPDATE posts SET sender='lease_stall_sender' WHERE rowid=$id;
+        UPDATE mail SET state='staged',shown=3,lease_until=1,from_pane='$S' WHERE post=$id"
+    c_prompt "$P" 'ordinary prompt after lease expiry' >/dev/null
+    same "hook stalls exhausted mail" "$(mstate "$id")" stalled/1/0
+    expect_screen "hook stall wakes an idle sender without another event" "$S" "undelivered after 3 attempts: $id"
+    same "hook created one notice for the sleeping sender" "$(notices "$id")" 1
+    daemon_stop
+}
+
 lease_deadlines() {
     local S P id fifo start i out
     S=$(newpane lease_deadline_watcher); P=$(hk_agent claude lease_deadline_target)
@@ -2692,6 +2709,7 @@ lease_deadlines() {
 
 f8_6() {
     lease_idle_watcher
+    lease_stall_notice_wakes
     lease_early_prompt
     lease_ordinary_prompt
     lease_start_second
