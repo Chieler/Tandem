@@ -2859,8 +2859,18 @@ b_race_resume() {
     done
 }
 
+b_race_wait_mail() {
+    local label=$1 post=$2 expected=$3 i actual
+    for i in $(seq 80); do
+        actual=$(b_race_mail "$post")
+        [ "$actual" = "$expected" ] && break
+        sleep 0.1
+    done
+    same "$label" "$actual" "$expected"
+}
+
 b_race_retry() {
-    local sender p q m foreign own
+    local sender p q m foreign own other_claims other_rows wake
     sender=$(newpane race_sender)
     p=$(hk_agent claude race_owner)
     q=$(hk_agent claude race_other)
@@ -2870,24 +2880,37 @@ b_race_retry() {
     c_prompt "$q" "$(pointer "$m")" >/dev/null
     sq "$CNTCTR_DB" "UPDATE mail SET name='race_owner' WHERE post IN ($m,$foreign);
         UPDATE mail SET socket=socket||'-other',pane='$p' WHERE post=$foreign"
-    same "race other pane initially stages mail" "$(mstate "$m")" "staged/1/0"
-    same "race other socket initially has staged mail" "$(mstate "$foreign")" "staged/1/0"
+    same "race other pane initially has an active body claim" "$(b_race_mail "$m")" staged/1/0/0
+    same "race other socket initially has an active body claim" "$(b_race_mail "$foreign")" staged/1/0/0
+    other_rows="SELECT post,state,shown,wake_attempts,delivered,staged_turn,staged_full,lease_until
+        FROM mail WHERE post IN ($m,$foreign) ORDER BY post"
+    other_claims=$(sqx "$CNTCTR_DB" "$other_rows")
+
     own=$(mailput "$p" race0004 "$(mail_text race0004 'own pane mail')" 1)
     c_prompt "$p" "$(pointer "$own")" >/dev/null
-    sq "$CNTCTR_DB" "UPDATE hook_sessions SET at=strftime('%s','now')-130 WHERE pane='$p'"
-    export CNTCTR_WAKE_SEC=2
+    sq "$CNTCTR_DB" "UPDATE mail SET wake_attempts=1 WHERE post=$own;
+        UPDATE hook_sessions SET at=strftime('%s','now')-130 WHERE pane='$p'"
+    same "race owner starts with one body attempt and one prior wake" "$(b_race_mail "$own")" staged/1/1/0
+    expire_mail "$own"
+
+    wake="SELECT broken||'/'||wake_reserved||'/'||(wake_at IS NOT NULL) FROM hook_sessions WHERE pane='$p'"
+    export CNTCTR_WAKE_SEC=20
     daemon_start "$p"
     daemon_hello
-    wait_mstate "race retry releases and wakes the owner's mail" "$own" "pending/2/0"
-    same "race retry does not release another pane's mail" "$(mstate "$m")" "staged/1/0"
-    same "race retry does not release another socket's mail" "$(mstate "$foreign")" "staged/1/0"
+    b_race_wait_mail "race expired claim releases owner mail and charges a wake only" "$own" pending/1/2/0
+    same "race retry records a new wake reservation" "$(sqx "$CNTCTR_DB" "$wake")" 0/1/1
+    same "race retry preserves both foreign claims" "$(sqx "$CNTCTR_DB" "$other_rows")" "$other_claims"
     daemon_stop
-    sq "$CNTCTR_DB" "UPDATE hook_sessions SET broken=1,wake_reserved=0 WHERE pane='$p'"
+    check "race retry types the owner's pointer" "$(screen "$p")" "$(pointer "$own")"
+    refute "race retry has not sent the body" "$(screen "$p")" "own pane mail"
+
+    sq "$CNTCTR_DB" "UPDATE hook_sessions SET wake_at=1 WHERE pane='$p' AND wake_reserved=1"
     daemon_start "$p"
     daemon_hello
-    wait_mstate "race full-envelope fallback delivers the owner's mail" "$own" "delivered/2/1"
-    same "race full-envelope fallback leaves another pane's staged mail" "$(mstate "$m")" "staged/1/0"
-    same "race full-envelope fallback leaves another socket's staged mail" "$(mstate "$foreign")" "staged/1/0"
+    b_race_wait_mail "race expired wake triggers a terminal body attempt" "$own" delivered/2/2/1
+    same "race terminal fallback clears the expired reservation and marks the hook broken" "$(sqx "$CNTCTR_DB" "$wake")" 1/0/0
+    same "race terminal fallback preserves both foreign claims" "$(sqx "$CNTCTR_DB" "$other_rows")" "$other_claims"
+    check "race terminal fallback types the owner's full envelope" "$(screen "$p")" "[cntctr end id=race0004]"
     daemon_stop
     unset CNTCTR_WAKE_SEC
 }
