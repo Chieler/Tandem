@@ -42,6 +42,18 @@ fi
 if [ -n "\${CNTCTR_TEST_IDLE_LOG:-}" ]; then
     printf '%s\n' "\$*" >> "\$CNTCTR_TEST_IDLE_LOG"
 fi
+if [ -n "\$HOOK_GATE_BARRIER" ]; then
+    for a in "\$@"; do
+        if [ "\$a" = "list-panes" ]; then
+            : > "\$HOOK_GATE_BARRIER.ready"
+            for i in \$(seq 1 500); do
+                [ -e "\$HOOK_GATE_BARRIER.go" ] && break
+                sleep 0.01
+            done
+            break
+        fi
+    done
+fi
 exec "$REAL_TMUX" "\$@"
 EOF
 chmod +x "$TMPD/bin/tmux"
@@ -2775,6 +2787,219 @@ f8_6() {
     lease_legacy_stage
     lease_deadlines
 }
+
+b_race_schema() {
+    local fresh="$TMPD/b_race_schema.db" sockpath version
+    sockpath=$(t display -p '#{socket_path}')
+    CNTCTR_DB=$fresh TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
+    version=$(sq "$fresh" 'PRAGMA user_version')
+    sq "$fresh" "ALTER TABLE hook_sessions DROP COLUMN generation; PRAGMA user_version=0"
+    CNTCTR_DB=$fresh TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
+    same "B F9 older database gets the generation column" "$(sq "$fresh" "SELECT count(*) FROM pragma_table_info('hook_sessions') WHERE name='generation'")" 1
+    same "B F9 re-opened database gets the current schema stamp" "$(sq "$fresh" 'PRAGMA user_version')" "$version"
+}
+
+b_race_migration() {
+    local stamped="$TMPD/b_race_stamped.db" sockpath
+    sockpath=$(t display -p '#{socket_path}')
+    sqlite3 "$stamped" < tests/schema_stamp1.sql
+    sq "$stamped" "INSERT INTO hook_sessions(socket,pane,harness,session_id,harness_pid,last_event,at,turn)
+        VALUES('socket-a','%0','claude','S1',1,'UserPromptSubmit',0,3);
+        INSERT INTO mail(post,name,pane,socket,state,staged_turn)
+        VALUES(1,'worker','%0','socket-a','staged','S1:3'),
+              (2,'worker','%0','socket-b','staged','S1:3'),
+              (3,'worker','%1','socket-a','staged','S1:3')"
+    CNTCTR_DB=$stamped TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
+    # A's equivalent turn token is the session generation plus the turn.
+    same "B F8.4 migration keeps the active turn's staged mail" "$(sq "$stamped" "SELECT state||'/'||(generation!='' AND staged_turn=generation||':'||turn) FROM mail,hook_sessions WHERE post=1")" staged/1
+    same "B F8.4 migration leaves other sockets and panes alone" "$(sq "$stamped" "SELECT count(*) FROM mail WHERE post IN (2,3) AND staged_turn='S1:3'")" 2
+    same "B F8.4 migration seeds the active session's generation" "$(sq "$stamped" "SELECT count(*) FROM hook_sessions WHERE socket='socket-a' AND pane='%0' AND generation!=''")" 1
+}
+
+b_race_resume() {
+    local p m change
+    for change in SessionStart PID; do
+        p=$(hk_agent claude "race_resume_$change")
+        c_start "$p" >/dev/null
+        m=$(mailput "$p" race0001 "$(mail_text race0001 'old turn mail')" 1)
+        c_prompt "$p" "$(pointer "$m")" >/dev/null
+        same "race $change initially stages mail" "$(mstate "$m")" "staged/1/0"
+        if [ "$change" = SessionStart ]; then
+            c_start "$p" >/dev/null
+        else
+            sq "$CNTCTR_DB" "UPDATE hook_sessions SET harness_pid=harness_pid+1 WHERE pane='$p'"
+        fi
+        c_prompt "$p" "unrelated new turn" >/dev/null
+        c_stop "$p" true >/dev/null
+        same "race $change re-pends mail from the old turn" "$(mstate "$m")" "pending/1/0"
+    done
+}
+
+b_race_retry() {
+    local sender p q m foreign own
+    sender=$(newpane race_sender)
+    p=$(hk_agent claude race_owner)
+    q=$(hk_agent claude race_other)
+    t set -p -t "$p" @cntctr_parent "$sender"
+    m=$(mailput "$q" race0002 "$(mail_text race0002 'other pane mail')" 1)
+    foreign=$(mailput "$q" race0003 "$(mail_text race0003 'other socket mail')" 0)
+    c_prompt "$q" "$(pointer "$m")" >/dev/null
+    sq "$CNTCTR_DB" "UPDATE mail SET name='race_owner' WHERE post IN ($m,$foreign);
+        UPDATE mail SET socket=socket||'-other',pane='$p' WHERE post=$foreign"
+    same "race other pane initially stages mail" "$(mstate "$m")" "staged/1/0"
+    same "race other socket initially has staged mail" "$(mstate "$foreign")" "staged/1/0"
+    own=$(mailput "$p" race0004 "$(mail_text race0004 'own pane mail')" 1)
+    c_prompt "$p" "$(pointer "$own")" >/dev/null
+    sq "$CNTCTR_DB" "UPDATE hook_sessions SET at=strftime('%s','now')-130 WHERE pane='$p'"
+    export CNTCTR_WAKE_SEC=2
+    daemon_start "$p"
+    daemon_hello
+    wait_mstate "race retry releases and wakes the owner's mail" "$own" "pending/2/0"
+    same "race retry does not release another pane's mail" "$(mstate "$m")" "staged/1/0"
+    same "race retry does not release another socket's mail" "$(mstate "$foreign")" "staged/1/0"
+    daemon_stop
+    sq "$CNTCTR_DB" "UPDATE hook_sessions SET broken=1,wake_reserved=0 WHERE pane='$p'"
+    daemon_start "$p"
+    daemon_hello
+    wait_mstate "race full-envelope fallback delivers the owner's mail" "$own" "delivered/2/1"
+    same "race full-envelope fallback leaves another pane's staged mail" "$(mstate "$m")" "staged/1/0"
+    same "race full-envelope fallback leaves another socket's staged mail" "$(mstate "$foreign")" "staged/1/0"
+    daemon_stop
+    unset CNTCTR_WAKE_SEC
+}
+
+b_race_driver() {
+    cat > "$TMPD/race_driver.c" <<'EOF'
+#define main cntctr_original_main
+#include "cntctr.c"
+#undef main
+/* A commits its event record first, then hands a bound token to hook_decide.
+ * Pause at that boundary, where B's trace tested the writer lock. */
+static int pause_before_decision(const char *ready_path, const char *go_path) {
+    FILE *ready = fopen(ready_path, "w");
+    if (!ready || fclose(ready)) return 0;
+    for (int i = 0; i < 500 && access(go_path, F_OK); i++) usleep(10000);
+    return access(go_path, F_OK) == 0;
+}
+int main(int argc, char **argv) {
+    char *err = NULL;
+    sqlite3 *db = kb_timed(&err, 1000);
+    free(err);
+    if (!db) return 1;
+    struct hook_event event = {.session="S1", .kind="Stop", .prompt="", .reason="", .loop=1};
+    struct recorded_hook record = {0};
+    if (!record_hook(db, argv[1], argv[2], "claude", atol(argv[3]), &event, 0, &record)) {
+        sqlite3_close(db);
+        return 2;
+    }
+    if (argc == 6 && !pause_before_decision(argv[4], argv[5])) {
+        sqlite3_close(db);
+        return 3;
+    }
+    json_object *out = hook_decide(db, argv[1], argv[2], "claude", &event, &record);
+    if (out) json_object_put(out);
+    sqlite3_close(db);
+    return 0;
+}
+EOF
+    local jsonc
+    jsonc=$(brew --prefix json-c 2>/dev/null || echo /usr/local)
+    if ! "${CC:-cc}" -std=c11 -O1 -pthread -I. -I"$jsonc/include" -o "$TMPD/race_driver" "$TMPD/race_driver.c" kb.c fleet.c hooks.c -L"$jsonc/lib" -ljson-c -lsqlite3; then
+        bad "race could not build the Stop driver"
+        return 1
+    fi
+}
+
+b_race_interleave() {
+    local p old m sock pid driver i ran_prompt=0
+    b_race_driver || return
+    p=$(hk_agent claude race_interleave)
+    sock=$(t display -p '#{socket_path}')
+    pid=$(sqx "$CNTCTR_DB" "SELECT harness_pid FROM hook_sessions WHERE pane='$p'")
+    old=$(mailput "$p" race0005 "$(mail_text race0005 'old turn mail')" 1)
+    c_prompt "$p" "$(pointer "$old")" >/dev/null
+    same "race old prompt stages its mail" "$(mstate "$old")" "staged/1/0"
+    m=$(mailput "$p" race0006 "$(mail_text race0006 'new turn mail')" 1)
+    "$TMPD/race_driver" "$sock" "$p" "$pid" "$TMPD/race_ready" "$TMPD/race_go" &
+    driver=$!
+    for i in $(seq 1 100); do [ -e "$TMPD/race_ready" ] && break; sleep 0.02; done
+    if [ ! -e "$TMPD/race_ready" ]; then
+        : > "$TMPD/race_go"
+        wait "$driver"
+        bad "race Stop did not reach the decision barrier"
+        return
+    fi
+    # If Stop left the writer unlocked between recording and reading the token,
+    # force the new prompt to finish in that gap.
+    if sqlite3 "$CNTCTR_DB" "BEGIN IMMEDIATE; ROLLBACK" 2>/dev/null; then
+        c_prompt "$p" "$(pointer "$m")" >/dev/null
+        ran_prompt=1
+    fi
+    : > "$TMPD/race_go"
+    wait "$driver" || bad "race Stop driver failed"
+    [ "$ran_prompt" -eq 1 ] || c_prompt "$p" "$(pointer "$m")" >/dev/null
+    same "race old Stop delivers its own mail" "$(mstate "$old")" "delivered/1/1"
+    same "race old Stop leaves new prompt's mail staged" "$(mstate "$m")" "staged/1/0"
+}
+
+b_race_snapshot() {
+    local p m next sock pid driver i barrier
+    b_race_driver || return
+    p=$(hk_agent claude race_snapshot)
+    sock=$(t display -p '#{socket_path}')
+    pid=$(sqx "$CNTCTR_DB" "SELECT harness_pid FROM hook_sessions WHERE pane='$p'")
+    m=$(mailput "$p" race0006 "$(mail_text race0006 'old turn mail')" 1)
+    c_prompt "$p" "$(pointer "$m")" >/dev/null
+    same "race prompt stages mail before the waiting Stop" "$(mstate "$m")" "staged/1/0"
+    # A prompt can commit while the older Stop is waiting on tmux.
+    barrier="$TMPD/race_gate"
+    next=$(mailput "$p" race0007 "$(mail_text race0007 'mail while Stop waits for tmux')" 1)
+    HOOK_GATE_BARRIER="$barrier" "$TMPD/race_driver" "$sock" "$p" "$pid" &
+    driver=$!
+    for i in $(seq 1 100); do [ -e "$barrier.ready" ] && break; sleep 0.02; done
+    if [ -e "$barrier.ready" ] && sqlite3 "$CNTCTR_DB" "BEGIN IMMEDIATE; ROLLBACK" 2>/dev/null; then
+        c_prompt "$p" "$(pointer "$next")" >/dev/null
+        same "race prompt stages mail while Stop waits for tmux" "$(mstate "$next")" "staged/1/0"
+    else
+        bad "race Stop snapshot does not hold the database writer"
+    fi
+    : > "$barrier.go"
+    wait "$driver" || bad "race Stop snapshot driver failed"
+    same "race Stop after tmux leaves newer mail staged" "$(mstate "$next")" "staged/1/0"
+    same "race superseded Stop leaves the reattached old mail staged" "$(mstate "$m")" "staged/2/0"
+}
+
+b_race_rollback() {
+    local p next sock token
+    p=$(hk_agent claude race_rollback)
+    sock=$(t display -p '#{socket_path}')
+    next=$(mailput "$p" race0007 "$(mail_text race0007 'mail before failed transition')" 1)
+    c_prompt "$p" "$(pointer "$next")" >/dev/null
+    same "race prompt stages mail before the failed decision" "$(mstate "$next")" "staged/1/0"
+    token=$(sq "$CNTCTR_DB" "SELECT generation||'/'||turn FROM hook_sessions WHERE socket='$sock' AND pane='$p'")
+    sq "$CNTCTR_DB" "CREATE TRIGGER race_reject_transition BEFORE UPDATE ON mail
+        WHEN new.post=$next BEGIN SELECT RAISE(ABORT,'test hook rollback'); END"
+    c_prompt "$p" "prompt whose mail transition fails" >/dev/null
+    sq "$CNTCTR_DB" "DROP TRIGGER race_reject_transition"
+    same "race failed decision rolls back the recorded turn" "$(sq "$CNTCTR_DB" "SELECT generation||'/'||turn FROM hook_sessions WHERE socket='$sock' AND pane='$p'")" "$token"
+    same "race failed decision leaves the original mail staged" "$(mstate "$next")" "staged/1/0"
+}
+
+# B's comparison cases include expected failures, so run them on request.
+# ONLY=hook-race-port B_CASE=resume make test
+if [ "${ONLY:-}" = hook-race-port ]; then
+    case ${B_CASE:-} in
+        schema|migration|resume|retry|interleave|snapshot|rollback) ;;
+        *) echo "B_CASE must be schema, migration, resume, retry, interleave, snapshot or rollback" >&2; exit 2 ;;
+    esac
+    hk_boot
+    export CNTCTR_PASTE_WAIT_MS=100
+    "b_race_$B_CASE"
+    hk_stop
+    printf '%d passed, %d failed\n' "$pass" "$fail"
+    [ "$fail" -eq 0 ]
+    exit $?
+fi
 
 u5p6_run() {
     export CNTCTR_PASTE_WAIT_MS=100
