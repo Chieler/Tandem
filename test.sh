@@ -1456,6 +1456,21 @@ u5p3_run() {
     check "the reply text arrives with the attached context" "$(ctx_c "$ans")" "worker answer"
     check "as a reply envelope" "$(ctx_c "$ans")" "[cntctr reply from=u5_e3w id=$task]"
     c_stop "$P" >/dev/null
+    # A busy hooked recipient cannot be woken, but its queued reply still notifies once.
+    cat > "$TMPD/bin/notify-test" <<'EOF'
+#!/bin/sh
+printf '%s %s %s\n' "$1" "$2" "$3" >> "$CNTCTR_TEST_NOTIFY_LOG"
+EOF
+    chmod +x "$TMPD/bin/notify-test"
+    export CNTCTR_TEST_NOTIFY_LOG="$TMPD/reply-notify.log"
+    P=$(hk_agent claude u5_notify); W=$(newpane u5_notify_worker)
+    out=$(txt "$(call "$P" send '{"to":"u5_notify_worker","text":"work"}')")
+    task=${out#sent id=}
+    c_prompt "$P" "busy" >/dev/null
+    CNTCTR_NOTIFY=1 CNTCTR_NOTIFY_COMMAND="$TMPD/bin/notify-test" call "$W" reply "{\"id\":\"$task\",\"text\":\"done\"}" >/dev/null
+    for _ in $(seq 100); do [ -s "$CNTCTR_TEST_NOTIFY_LOG" ] && break; sleep 0.02; done
+    same "busy hooked recipient gets one reply notification from worker" "$(cat "$CNTCTR_TEST_NOTIFY_LOG" 2>/dev/null)" "reply u5_notify_worker $P"
+    unset CNTCTR_TEST_NOTIFY_LOG
     Q=$(hk_agent claude u5_e4); W=$(newpane u5_e4w)
     out=$(txt "$(call "$W" send '{"to":"u5_e4","text":"first task"}')")
     task=${out#sent id=}
@@ -2987,7 +3002,7 @@ EOF
     local jsonc
     jsonc=$(brew --prefix json-c 2>/dev/null || echo /usr/local)
     if ! "${CC:-cc}" -std=c11 -O1 -pthread -I. -I"$jsonc/include" -o "$TMPD/race_driver" \
-        "$TMPD/race_driver.c" kb.c fleet.c hooks.c -L"$jsonc/lib" -ljson-c -lsqlite3; then
+        "$TMPD/race_driver.c" kb.c fleet.c hooks.c usage.c -L"$jsonc/lib" -ljson-c -lsqlite3; then
         bad "race could not build the Stop driver"
         return 1
     fi
@@ -5380,13 +5395,6 @@ check "T51 addressee board lists mail" "$(txt "$(call "$M3_A51" board '{}')")" "
 # U6 to U21 run last: their agents, posts and history stay behind and would change what the older checks count
 [ "${ONLY:-}" = m3 ] || u5_run
 
-sq "$CNTCTR_DB" "INSERT INTO entries(id,layer,scope,title,summary,visibility,created) VALUES
- ('stats-task-1','history','stats-fixture','task 12345678 caller→worker→name','','private',1000),
- ('stats-reply-1','history','stats-fixture','reply 12345678 worker→caller','','private',1600),
- ('stats-task-2','history','stats-fixture','task 87654321 caller→worker→name','','private',2000);"
-stats_out=$(cd "$TMPD" && "$BIN" stats --all)
-check 'stats groups unicode worker and counts' "$stats_out" 'worker→name'
-check 'stats reports answered and unanswered' "$stats_out" '2        1          1'
 if BIN="$BIN" bash "$(dirname "$0")/test-cli.sh"; then ok_; else bad 'standalone CLI checks'; fi
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

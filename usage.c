@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <dirent.h>
+#include <ctype.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -39,6 +40,7 @@ static void claude(const char *path) {
         if (!strcmp(str(o,"type"),"assistant") && *id && *name && u && recent(o)) {
             struct counts c={num(u,"input_tokens"),num(u,"cache_read_input_tokens"),num(u,"cache_creation_input_tokens"),num(u,"output_tokens"),0};
             c.denominator=c.in+c.read+c.write;
+            /* ponytail: linear lookup is quadratic on very large transcript sets. */
             struct seen *s; for (s=seen;s && strcmp(s->id,id);s=s->next) {}
             if (!s) { s=calloc(1,sizeof *s); s->id=strdup(id); s->next=seen; seen=s; }
             else { add(s->model,s->c,-1); free(s->model); }
@@ -50,21 +52,27 @@ static void claude(const char *path) {
 }
 static void codex(const char *path) {
     FILE *f=fopen(path,"r"); if (!f) return;
-    char *line=NULL; size_t cap=0; char cwd[PATH_MAX]="", model[256]=""; struct counts c={0}; int got=0;
+    char *line=NULL; size_t cap=0; char cwd[PATH_MAX]="", model[256]=""; struct counts c={0}, baseline={0}; int got=0;
     while (getline(&line,&cap,f)>0) {
         json_object *o=json_tokener_parse(line); if (!o) continue;
         const char *type=str(o,"type"); json_object *p=field(o,"payload");
         if (!strcmp(type,"session_meta") || !strcmp(type,"turn_context")) {
             if (*str(p,"cwd")) snprintf(cwd,sizeof cwd,"%s",str(p,"cwd"));
             if (*str(p,"model")) snprintf(model,sizeof model,"%s",str(p,"model"));
-        } else if (!strcmp(type,"event_msg") && !strcmp(str(p,"type"),"token_count") && recent(o)) {
+        } else if (!strcmp(type,"event_msg") && !strcmp(str(p,"type"),"token_count")) {
             json_object *u=field(field(p,"info"),"total_token_usage");
-            if (u) { c=(struct counts){num(u,"input_tokens"),num(u,"cached_input_tokens"),num(u,"cache_write_input_tokens"),num(u,"output_tokens"),num(u,"input_tokens")}; got=1; }
+            if (u) {
+                struct counts value={num(u,"input_tokens"),num(u,"cached_input_tokens"),num(u,"cache_write_input_tokens"),num(u,"output_tokens"),num(u,"input_tokens")};
+                if (recent(o)) { c=value; got=1; } else baseline=value;
+            }
         }
         json_object_put(o);
     }
     size_t n=strlen(project);
-    if (got && !strncmp(cwd,project,n) && (!cwd[n] || cwd[n]=='/')) add(model,c,1);
+    if (got && !strncmp(cwd,project,n) && (!cwd[n] || cwd[n]=='/')) {
+        c.in-=baseline.in; c.read-=baseline.read; c.write-=baseline.write; c.out-=baseline.out; c.denominator-=baseline.denominator;
+        add(model,c,1);
+    }
     free(line); fclose(f);
 }
 static void walk(const char *path, int is_codex, int depth) {
@@ -92,9 +100,22 @@ int usage_cmd(int argc, char **argv, const char *cwd) {
     project=getenv("CNTCTR_USAGE_CWD"); if (!project || !*project) project=cwd;
     const char *cd=getenv("CNTCTR_USAGE_CLAUDE_DIR"), *xd=getenv("CNTCTR_USAGE_CODEX_DIR");
     char *cp=NULL,*xp=NULL;
-    if (!cd || !*cd) { char *encoded=strdup(project); for (char *p=encoded;*p;p++) if (*p=='/') *p='-'; if (asprintf(&cp,"%s/.claude/projects/%s",home,encoded)<0) cp=NULL; free(encoded); cd=cp; }
+    if (!cd || !*cd) {
+        char *encoded=strdup(project);
+        for (char *p=encoded;*p;p++) if (!isalnum((unsigned char)*p)) *p='-';
+        if (asprintf(&cp,"%s/.claude/projects",home)<0) cp=NULL;
+        DIR *projects=cp ? opendir(cp) : NULL; struct dirent *entry;
+        while (projects && (entry=readdir(projects))) {
+            size_t n=strlen(encoded);
+            if (strncmp(entry->d_name,encoded,n) || (entry->d_name[n] && entry->d_name[n]!='-')) continue;
+            char *path=NULL;
+            if (asprintf(&path,"%s/%s",cp,entry->d_name)>=0) { walk(path,0,2); free(path); }
+        }
+        if (projects) closedir(projects);
+        free(encoded);
+    }
     if (!xd || !*xd) { if (asprintf(&xp,"%s/.codex/sessions",home)<0) xp=NULL; xd=xp; }
-    if (cd) walk(cd,0,0); if (xd) walk(xd,1,3);
+    if (cd && *cd) walk(cd,0,2); if (xd) walk(xd,1,3);
     printf("%-28s %12s %12s %12s %12s %9s\n","model","input","cache read","cache write","output","hit %");
     for (struct model *m=models;m;m=m->next) {
         long long denom=m->c.denominator;

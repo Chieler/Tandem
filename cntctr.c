@@ -875,6 +875,10 @@ static void notify_permission(const char *socket, const char *pane, const char *
     if (permission && !was) notify_human("permission", name, pane);
 }
 
+static void notify_reply(const char *agent, const char *pane) {
+    if (notify_enabled() && pane && *pane && pane_alive(pane)) notify_human("reply", agent, pane);
+}
+
 static char *inject_locked(const char *pane, const char *text, int with_end) {
     char *body;
     if (with_end) {
@@ -1077,6 +1081,7 @@ static int deliver_buffer(const char *buf, const char *id, const char *agent) {
         char *env = fmt("[cntctr reply from=%s id=%s]\n%s", agent, id, text);
         rc = deliver(pane, name ? name : "?", scope, id, env);
         if (rc >= 0) {
+            notify_reply(agent, pane);
             free(TMUXE(NULL, "delete-buffer", "-b", buf));
             untrack(id);
         }
@@ -3545,10 +3550,7 @@ static int terminal_mail(sqlite3 *db, const char *socket, const char *pane, cons
                         if (attempt == shown + 1 && sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK) {
                             committed = 1;
                             err = inject_locked(pane, body, row.complete);
-                        if (!err) {
-                            finished = kb_mail_finish(db, id, KB_MAIL_TERMINAL, attempt, NULL, time(NULL)) == 1;
-                            if (finished && shown == 0 && !strncmp(text, "[cntctr reply from=", 19)) notify_human("reply", name, pane);
-                        }
+                            if (!err) finished = kb_mail_finish(db, id, KB_MAIL_TERMINAL, attempt, NULL, time(NULL)) == 1;
                         } else sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
                     }
                 }
@@ -4444,14 +4446,6 @@ static int wake_agent(sqlite3 *db, const char *socket, const char *pane, const c
         sqlite3_step(st_count);
     }
     sqlite3_finalize(st_count);
-    if (!err && notify_enabled()) {
-        sqlite3_stmt *notice = NULL;
-        if (sqlite3_prepare_v2(db, "SELECT 1 FROM mail JOIN posts ON posts.rowid=mail.post WHERE mail.post=?1 AND presentations=1 AND instr(posts.text,char(10)||'[cntctr reply from=')>0", -1, &notice, NULL) == SQLITE_OK) {
-            sqlite3_bind_int64(notice, 1, mail);
-            if (sqlite3_step(notice) == SQLITE_ROW) notify_human("reply", name, pane);
-        }
-        sqlite3_finalize(notice);
-    }
     int rc = err ? -1 : 1;
     if (why) *why = err; else free(err);
     return rc;
@@ -5233,6 +5227,10 @@ int main(int argc, char **argv) {
     if (executable_size > 0) notify_executable[executable_size] = '\0';
     else if (!realpath(argv[0], notify_executable)) notify_executable[0] = '\0';
 #endif
+    if (argc > 1 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
+        puts("usage: cntctr [call <tool> '<json args>' | stats [--since hours] [--all] | usage [--since hours] | hooks | tools]");
+        return 0;
+    }
     if (argc > 1 && strcmp(argv[1], "--version") == 0) {
         printf("cntctr %s\n", CNTCTR_VERSION);
         return 0;
@@ -5256,14 +5254,22 @@ int main(int argc, char **argv) {
         notify_permission("test-socket", "%42", "test-agent", 1);
         notify_permission("test-socket", "%42", "test-agent", 0);
         notify_permission("test-socket", "%42", "test-agent", 1);
+        notify_reply("test-worker", "%42");
         return 0;
     }
 #endif
     if (argc > 1 && !strcmp(argv[1], "stats")) return stats_cmd(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "usage")) {
-        char cwd[PATH_MAX];
+        char cwd[PATH_MAX], common[PATH_MAX]; char *gitdir = NULL;
         if (!getcwd(cwd, sizeof cwd)) { perror("usage: getcwd"); return 1; }
-        return usage_cmd(argc, argv, cwd);
+        if (run(NULL, &gitdir, (const char *[]){"git", "rev-parse", "--path-format=absolute", "--git-common-dir", NULL}) == 0 &&
+            gitdir && realpath(gitdir, common)) {
+            char *slash = strrchr(common, '/');
+            if (slash && slash != common) *slash = '\0';
+            else if (slash) slash[1] = '\0';
+        } else snprintf(common, sizeof common, "%s", cwd);
+        free(gitdir);
+        return usage_cmd(argc, argv, common);
     }
     if (argc > 1 && !strcmp(argv[1], "hook")) return hook_cmd(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "hooks")) return hooks_admin(argc, argv, hook_seen);
