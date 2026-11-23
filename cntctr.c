@@ -34,7 +34,7 @@
 #include "fleet.h"
 #include "hooks.h"
 
-#define CNTCTR_VERSION "0.5.4"
+#define CNTCTR_VERSION "0.5.5"
 
 static pthread_mutex_t out_mu = PTHREAD_MUTEX_INITIALIZER;   /* one JSON line at a time on stdout */
 static pthread_mutex_t live_mu = PTHREAD_MUTEX_INITIALIZER;
