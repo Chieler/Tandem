@@ -4678,7 +4678,6 @@ static json_object *hook_attach(sqlite3 *db, const char *harness, const char *ev
             sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
             taken = 0;
         } else if (!hook_commit(db, taken != 0)) taken = 0;
-        else if (taken) notify_mail();
         if (hook_trace) json_object_object_add(hook_trace, "attached", json_object_new_int(taken));
     } else taken = 0;
     if (!taken && answer) {
