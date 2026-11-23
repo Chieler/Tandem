@@ -3608,6 +3608,26 @@ check "the reviewer sees the pending version" "$(lst "$FA")" '[fleet] under revi
 refute "others do not see the pending version" "$(lst "$FB")" 'under review'
 same "published versions are unique" "$(row "$PK" prec 1 active fc dup "" 2>&1 | grep -c UNIQUE)" "1"
 
+# Mail for an author with no pane keeps the reviewer's socket: a same-name agent on another socket never sees it.
+FV=$(newpane fv)
+row "$PK" pvmail 1 pending pvauthor "pane-less author" "$FV"
+call "$FV" tool_verdict '{"name":"pvmail","version":1,"verdict":"approve"}' >/dev/null
+pvid=$(sqx "$CNTCTR_DB" "SELECT post FROM mail WHERE name='pvauthor' ORDER BY post DESC LIMIT 1")
+same "pane-less mail has no pane and keeps the reviewer's socket" \
+    "$(sqx "$CNTCTR_DB" "SELECT quote(pane)||'|'||socket FROM mail WHERE post=$pvid")" "''|$(t display -p '#{socket_path}')"
+t2 new-session -d -s pvother -c "$PWD" cat
+pv_sock=$(t2 display -p '#{socket_path}')
+pv_other=$(t2 display -p '#{pane_id}')
+t2 set -p -t "$pv_other" @cntctr_name pvauthor
+same "same-name caller on another socket cannot list pane-less mail" "$(txt "$(TMUX="$pv_sock,0,0" call_raw "$pv_other" board '{"mode":"mail"}')")" "0 total mail"
+same "same-name caller on another socket cannot read pane-less mail" "$(txt "$(TMUX="$pv_sock,0,0" call_raw "$pv_other" board "{\"id\":$pvid}")")" "mail not found"
+same "other socket leaves pane-less mail pending" "$(mstate "$pvid")" "pending/0/0"
+t2 kill-server
+FW=$(newpane pvauthor)
+check "same-name caller on the original socket lists pane-less mail" "$(txt "$(call "$FW" board '{"mode":"mail"}')")" "id=$pvid"
+check "same-name caller on the original socket reads pane-less mail" "$(txt "$(call "$FW" board "{\"id\":$pvid}")")" "pvmail"
+same "original socket finishes pane-less mail" "$(sqx "$CNTCTR_DB" "SELECT delivered FROM mail WHERE post=$pvid")" "1"
+
 # one name, five competing rows: pending (reviewer) > own draft > newest project active > global
 FR=$(newpane fr)
 FU=$(newpane fu)
