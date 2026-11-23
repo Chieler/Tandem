@@ -2920,73 +2920,98 @@ b_race_driver() {
 #define main cntctr_original_main
 #include "cntctr.c"
 #undef main
-/* A commits its event record first, then hands a bound token to hook_decide.
- * Pause at that boundary, where B's trace tested the writer lock. */
-static int pause_before_decision(const char *ready_path, const char *go_path) {
+
+/* Hold Stop after capturing its entry turn and before recording/acking it. */
+static int pause_before_record(const char *ready_path, const char *go_path) {
     FILE *ready = fopen(ready_path, "w");
     if (!ready || fclose(ready)) return 0;
     for (int i = 0; i < 500 && access(go_path, F_OK); i++) usleep(10000);
     return access(go_path, F_OK) == 0;
 }
+
 int main(int argc, char **argv) {
+    if (argc != 4 && argc != 6) return 2;
+    const char *socket = argv[1], *pane = argv[2], *harness = "claude";
+    long pid = atol(argv[3]);
     char *err = NULL;
     sqlite3 *db = kb_timed(&err, 1000);
     free(err);
     if (!db) return 1;
-    struct hook_event event = {.session="S1", .kind="Stop", .prompt="", .reason="", .loop=1};
-    struct recorded_hook record = {0};
-    if (!record_hook(db, argv[1], argv[2], "claude", atol(argv[3]), &event, 0, &record)) {
+
+    struct hook_event event = {.session="S1", .kind="Stop", .prompt="", .reason=""};
+    struct recorded_hook entry, record;
+    if (capture_stop(db, socket, pane, harness, pid, event.session, &entry) != SQLITE_ROW ||
+        (argc == 6 && !pause_before_record(argv[4], argv[5]))) {
         sqlite3_close(db);
         return 2;
     }
-    if (argc == 6 && !pause_before_decision(argv[4], argv[5])) {
-        sqlite3_close(db);
-        return 3;
-    }
-    json_object *out = hook_decide(db, argv[1], argv[2], "claude", &event, &record);
-    if (out) json_object_put(out);
+
+    json_object *answer = NULL;
+    if (record_hook(db, socket, pane, harness, pid, &event, 0, &entry, &record))
+        answer = hook_stop(db, socket, pane, harness, &event, &record);
+    puts(answer ? json_object_to_json_string_ext(answer, JSON_C_TO_STRING_PLAIN) : "{}");
+    if (answer) json_object_put(answer);
     sqlite3_close(db);
     return 0;
 }
 EOF
     local jsonc
     jsonc=$(brew --prefix json-c 2>/dev/null || echo /usr/local)
-    if ! "${CC:-cc}" -std=c11 -O1 -pthread -I. -I"$jsonc/include" -o "$TMPD/race_driver" "$TMPD/race_driver.c" kb.c fleet.c hooks.c -L"$jsonc/lib" -ljson-c -lsqlite3; then
+    if ! "${CC:-cc}" -std=c11 -O1 -pthread -I. -I"$jsonc/include" -o "$TMPD/race_driver" \
+        "$TMPD/race_driver.c" kb.c fleet.c hooks.c -L"$jsonc/lib" -ljson-c -lsqlite3; then
         bad "race could not build the Stop driver"
         return 1
     fi
 }
 
 b_race_interleave() {
-    local p old m sock pid driver i ran_prompt=0
+    local p old renewed next sock pid driver i out old_claim new_claim claims event hook_row
     b_race_driver || return
     p=$(hk_agent claude race_interleave)
     sock=$(t display -p '#{socket_path}')
     pid=$(sqx "$CNTCTR_DB" "SELECT harness_pid FROM hook_sessions WHERE pane='$p'")
-    old=$(mailput "$p" race0005 "$(mail_text race0005 'old turn mail')" 1)
+    old=$(mailput "$p" race0005 "$(mail_text race0005 'live old turn mail')" 1)
+    renewed=$(mailput "$p" race0006 "$(mail_text race0006 'old turn mail to reclaim')" 0)
     c_prompt "$p" "$(pointer "$old")" >/dev/null
-    same "race old prompt stages its mail" "$(mstate "$old")" "staged/1/0"
-    m=$(mailput "$p" race0006 "$(mail_text race0006 'new turn mail')" 1)
-    "$TMPD/race_driver" "$sock" "$p" "$pid" "$TMPD/race_ready" "$TMPD/race_go" &
+    same "race live old mail starts as a first attempt" "$(b_race_mail "$old")" staged/1/0/0
+    same "race reclaimable old mail starts as a first attempt" "$(b_race_mail "$renewed")" staged/1/0/0
+    old_claim=$(sqx "$CNTCTR_DB" "SELECT staged_turn FROM mail WHERE post=$old")
+    next=$(mailput "$p" race0007 "$(mail_text race0007 'new turn mail')" 1)
+
+    "$TMPD/race_driver" "$sock" "$p" "$pid" "$TMPD/race_ready" "$TMPD/race_go" > "$TMPD/race_answer" &
     driver=$!
-    for i in $(seq 1 100); do [ -e "$TMPD/race_ready" ] && break; sleep 0.02; done
-    if [ ! -e "$TMPD/race_ready" ]; then
+    for i in $(seq 1 100); do
+        [ -e "$TMPD/race_ready" ] && break
+        sleep 0.02
+    done
+    if [ ! -e "$TMPD/race_ready" ] || ! sqlite3 "$CNTCTR_DB" "BEGIN IMMEDIATE; ROLLBACK" 2>/dev/null; then
         : > "$TMPD/race_go"
         wait "$driver"
-        bad "race Stop did not reach the decision barrier"
+        bad "race captured Stop did not yield the writer to the newer prompt"
         return
     fi
-    # If Stop left the writer unlocked between recording and reading the token,
-    # force the new prompt to finish in that gap.
-    if sqlite3 "$CNTCTR_DB" "BEGIN IMMEDIATE; ROLLBACK" 2>/dev/null; then
-        c_prompt "$p" "$(pointer "$m")" >/dev/null
-        ran_prompt=1
-    fi
+
+    expire_mail "$renewed"
+    out=$(c_prompt "$p" "$(pointer "$next")")
+    check "race newer prompt attaches its own envelope" "$(ctx_c "$out")" "new turn mail"
+    check "race newer prompt reclaims the expired old envelope" "$(ctx_c "$out")" "old turn mail to reclaim"
+    same "race newer prompt has a first body attempt" "$(b_race_mail "$next")" staged/1/0/0
+    same "race newer prompt charges another attempt on the same row" "$(b_race_mail "$renewed")" staged/2/0/0
+    claims="SELECT post,shown,staged_turn,staged_full,lease_until FROM mail WHERE post IN ($next,$renewed) ORDER BY post"
+    new_claim=$(sqx "$CNTCTR_DB" "$claims")
+    hook_row="SELECT generation,event_seq,turn,last_event FROM hook_sessions WHERE pane='$p'"
+    event=$(sqx "$CNTCTR_DB" "$hook_row")
+
     : > "$TMPD/race_go"
     wait "$driver" || bad "race Stop driver failed"
-    [ "$ran_prompt" -eq 1 ] || c_prompt "$p" "$(pointer "$m")" >/dev/null
-    same "race old Stop delivers its own mail" "$(mstate "$old")" "delivered/1/1"
-    same "race old Stop leaves new prompt's mail staged" "$(mstate "$m")" "staged/1/0"
+    same "race displaced Stop answers without a new decision" "$(cat "$TMPD/race_answer")" '{}'
+    same "race displaced Stop preserves the newer prompt record" "$(sqx "$CNTCTR_DB" "$hook_row")" "$event"
+    same "race displaced Stop acknowledges its own live lease" "$(b_race_mail "$old")" delivered/1/0/1
+    same "race displaced Stop acknowledges the captured token" \
+        "$(sqx "$CNTCTR_DB" "SELECT staged_turn FROM mail WHERE post=$old")" "$old_claim"
+    same "race displaced Stop leaves the newer mail staged" "$(b_race_mail "$next")" staged/1/0/0
+    same "race displaced Stop leaves the reattached old mail staged" "$(b_race_mail "$renewed")" staged/2/0/0
+    same "race displaced Stop leaves both newer claims unchanged" "$(sqx "$CNTCTR_DB" "$claims")" "$new_claim"
 }
 
 b_race_snapshot() {
