@@ -293,10 +293,10 @@ It returns JSON with `complete` and one `results` entry per task, in input order
 
 | Tier | Task words | claude | codex | agy |
 |---|---|---|---|---|
-| light | smoke test, rename, typo, format, lookup, list, summarize, count | claude-haiku-5-5 medium | gpt-6.1-terra low | gemini-3.8-flash-medium |
-| standard | anything else | claude-sonnet-5-5 medium | gpt-6.2-sol medium | gemini-3.8-flash-medium |
-| review | review, audit, verify, merge, critique | claude-opus-4-7 high | gpt-6.2-sol high | gemini-3.8-flash-high |
-| hard | architecture, design, race condition, concurrency, root cause, security, migration, rewrite | claude-opus-5-5 high | gpt-6.2-sol high | gemini-3.8-flash-high |
+| light | smoke test, rename, typo, format, lookup, list, summarize, count | claude-haiku-5-5 medium | gpt-6.1-terra low | gemini-4-hydrogen-medium |
+| standard | anything else | claude-sonnet-5-5 medium | gpt-6.2-sol medium | gemini-4-hydrogen-medium |
+| review | review, audit, verify, merge, critique | claude-opus-4-7 high | gpt-6.2-sol high | gemini-4-hydrogen-high |
+| hard | architecture, design, race condition, concurrency, root cause, security, migration, rewrite | claude-opus-5-5 high | gpt-6.2-sol high | gemini-4-neon-high |
 
 Rules are checked in the order hard, review, light; tasks over 6000 characters count as review. Pass `tier`, `model` or `effort` to override.
 
