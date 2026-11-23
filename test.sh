@@ -3072,22 +3072,59 @@ b_race_snapshot() {
 }
 
 b_race_rollback() {
-    local p next sock token
+    local p old due reject sock hook_query event next_event mail_query rows out
     p=$(hk_agent claude race_rollback)
     sock=$(t display -p '#{socket_path}')
-    next=$(mailput "$p" race0007 "$(mail_text race0007 'mail before failed transition')" 1)
-    c_prompt "$p" "$(pointer "$next")" >/dev/null
-    same "race prompt stages mail before the failed decision" "$(mstate "$next")" "staged/1/0"
-    token=$(sq "$CNTCTR_DB" "SELECT generation||'/'||turn FROM hook_sessions WHERE socket='$sock' AND pane='$p'")
-    sq "$CNTCTR_DB" "CREATE TRIGGER race_reject_transition BEFORE UPDATE ON mail
-        WHEN new.post=$next BEGIN SELECT RAISE(ABORT,'test hook rollback'); END"
-    c_prompt "$p" "prompt whose mail transition fails" >/dev/null
-    sq "$CNTCTR_DB" "DROP TRIGGER race_reject_transition"
-    same "race failed decision rolls back the recorded turn" "$(sq "$CNTCTR_DB" "SELECT generation||'/'||turn FROM hook_sessions WHERE socket='$sock' AND pane='$p'")" "$token"
-    same "race failed decision leaves the original mail staged" "$(mstate "$next")" "staged/1/0"
+    old=$(mailput "$p" race0010 "$(mail_text race0010 'live mail before failed reconcile')" 1)
+    due=$(mailput "$p" race0011 "$(mail_text race0011 'expired mail before failed reconcile')")
+    c_prompt "$p" "$(pointer "$old")" >/dev/null
+    same "race rollback starts with two staged claims" \
+        "$(b_race_mail "$old")/$(b_race_mail "$due")" staged/1/0/0/staged/1/0/0
+    expire_mail "$due"
+    hook_query="SELECT generation,turn,event_seq,last_event,harness_pid,at,wake_reserved,wake_at,broken
+        FROM hook_sessions WHERE socket='$sock' AND pane='$p'"
+    event=$(sqx "$CNTCTR_DB" "$hook_query")
+    mail_query="SELECT post,state,shown,wake_attempts,delivered,staged_turn,staged_full,lease_until
+        FROM mail WHERE pane='$p' AND socket='$sock' ORDER BY post"
+    rows=$(sqx "$CNTCTR_DB" "$mail_query")
+    sq "$CNTCTR_DB" "CREATE TRIGGER race_reject_reconcile BEFORE UPDATE OF state ON mail
+        WHEN NEW.post=$due AND NEW.state='pending'
+        BEGIN SELECT RAISE(ABORT,'test reconcile rollback'); END"
+
+    out=$(c_prompt "$p" "prompt with a rejected expiry transition")
+    same "race rejected reconcile returns a neutral hook result" "$out" '{}'
+    same "race rejected reconcile rolls back the event record" "$(sqx "$CNTCTR_DB" "$hook_query")" "$event"
+    same "race rejected reconcile preserves live and expired claims" "$(sqx "$CNTCTR_DB" "$mail_query")" "$rows"
+    sq "$CNTCTR_DB" "DROP TRIGGER race_reject_reconcile"
+    c_prompt "$p" "retry the expiry transition" >/dev/null
+    same "race successful reconcile releases only the expired row" \
+        "$(b_race_mail "$old")/$(b_race_mail "$due")" staged/1/0/0/pending/1/0/0
+
+    # Once the prompt is accepted, its liveness update survives a later body claim failure (L2-2).
+    reject=$(mailput "$p" race0012 "$(mail_text race0012 'body claim rejected after accepted prompt')")
+    sq "$CNTCTR_DB" "UPDATE hook_sessions SET wake_reserved=1,wake_at=strftime('%s','now') WHERE pane='$p';
+        CREATE TRIGGER race_reject_claim BEFORE UPDATE OF state ON mail
+        WHEN NEW.post=$reject AND NEW.state='staged'
+        BEGIN SELECT RAISE(ABORT,'test body claim rollback'); END"
+    next_event=$(sqx "$CNTCTR_DB" "SELECT generation||'/'||(turn+1)||'/'||(event_seq+1)
+        FROM hook_sessions WHERE pane='$p'")
+    rows=$(sqx "$CNTCTR_DB" "$mail_query")
+
+    out=$(c_prompt "$p" "$(pointer "$due")")
+    same "race rejected claim emits no mail decision" "$out" '{}'
+    same "race rejected claim leaves the accepted prompt recorded" \
+        "$(sqx "$CNTCTR_DB" "SELECT generation||'/'||turn||'/'||event_seq FROM hook_sessions WHERE pane='$p'")" "$next_event"
+    same "race accepted prompt clears the wake reservation despite rejected claim" \
+        "$(sqx "$CNTCTR_DB" "SELECT wake_reserved||'/'||(wake_at IS NULL)||'/'||broken FROM hook_sessions WHERE pane='$p'")" 0/1/0
+    same "race rejected claim rolls back all body charges and tokens" "$(sqx "$CNTCTR_DB" "$mail_query")" "$rows"
+
+    sq "$CNTCTR_DB" "DROP TRIGGER race_reject_claim"
+    out=$(c_prompt "$p" "$(pointer "$due")")
+    check "race retry emits the previously rejected envelope" "$(ctx_c "$out")" "body claim rejected after accepted prompt"
+    same "race retry commits both body claims once" \
+        "$(b_race_mail "$due")/$(b_race_mail "$reject")" staged/2/0/0/staged/1/0/0
 }
 
-# B's comparison cases include expected failures, so run them on request.
 # ONLY=hook-race-port B_CASE=resume make test
 if [ "${ONLY:-}" = hook-race-port ]; then
     case ${B_CASE:-} in
