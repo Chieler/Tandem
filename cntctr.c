@@ -4665,16 +4665,7 @@ static json_object *hook_attach(sqlite3 *db, const char *harness, const char *ev
     char *text = n ? fit_mail(harness, event, HOOK_ATTACH, rows, n, NULL, &taken, &spill) : NULL;
     json_object *answer = text ? hook_answer(harness, event, HOOK_ATTACH, text) : NULL;
     if (begin_hook_event(db, socket, pane, record)) {
-        sqlite3_stmt *st = NULL;
-        int ok = sqlite3_prepare_v2(db, "UPDATE hook_sessions SET wake_reserved=0,wake_at=NULL WHERE socket=?1 AND pane=?2",
-                                    -1, &st, NULL) == SQLITE_OK;
-        if (ok) {
-            sqlite3_bind_text(st, 1, socket, -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(st, 2, pane, -1, SQLITE_TRANSIENT);
-            ok = sqlite3_step(st) == SQLITE_DONE;
-        }
-        sqlite3_finalize(st);
-        if (!ok || !stage_rows(db, socket, pane, record, rows, taken, own)) {
+        if (!stage_rows(db, socket, pane, record, rows, taken, own)) {
             sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
             taken = 0;
         } else if (!hook_commit(db, taken != 0)) taken = 0;
