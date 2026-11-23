@@ -4310,7 +4310,7 @@ static long long store_mail(sqlite3 *db, const char *socket, const char *pane, c
     long long id = 0;
     if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK) {
         id = kb_mail_insert(db, scope ? scope : p.key, pane, name, caller_name, task, body, hooked, caller_pane,
-                            from.key, pane && *pane ? socket : "");
+                            from.key, socket ? socket : "");
         if (!id || sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) != SQLITE_OK) {
             sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
             id = 0;
