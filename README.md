@@ -22,6 +22,7 @@
   <a href="#use">Use</a> ·
   <a href="#knowledge">Knowledge</a> ·
   <a href="#fleet-tools">Fleet tools</a> ·
+  <a href="#code-mode">Code mode</a> ·
   <a href="#watch-it-work">Watch it work</a>
 </p>
 
@@ -30,7 +31,8 @@ gets the answers back in its own session. Every agent shares one knowledge store
 one live project board.
 
 The server is `cntctr`, a small C11 MCP stdio server. Every agent runs its own copy.
-There is no daemon: tmux carries every message, and SQLite holds the shared knowledge.
+There is no daemon for messaging: tmux carries every message, and SQLite holds the shared knowledge.
+The one exception is [code mode](#code-mode), which is off by default and starts a small per-user daemon only when you register a tool server.
 
 ## Features
 
@@ -38,8 +40,9 @@ There is no daemon: tmux carries every message, and SQLite holds the shared know
 - **Watchable workers.** Each worker gets its own tmux window, so you can follow it and approve its prompts.
 - **Shared memory.** Insights, skills and docs live in SQLite + FTS5 and reach every agent at startup and with every message.
 - **Fleet tools.** An agent can turn a script into a sandboxed MCP tool that, after cross-harness review, every agent in the project can call.
+- **Code mode.** An agent searches the tools of your other MCP servers and calls many of them from one short JavaScript script, with a per-project permission for every tool. Off until you register a server.
 - **Automatic model routing.** Each task picks a model and effort tier from its wording.
-- **No daemon, no shell.** tmux is called with an argv array. Message text reaches it only through a pipe.
+- **No messaging daemon, no shell.** tmux is called with an argv array. Message text reaches it only through a pipe.
 
 ## Quick start
 
@@ -403,13 +406,66 @@ cntctr tools promote <name>         # copy the live version to every project
 
 </details>
 
+## Code mode
+
+Code mode lets an agent use the tools of other MCP servers (GitHub, a browser, a database) without loading every tool definition into its context. The agent calls `code_find` to search tool signatures, then `code_run` to run one JavaScript script that calls the tools it found as `tools.<server>.<tool>(args)`. Only the script's capped result comes back; the full output stays one `code_expand` call away.
+
+It is off until you register a server, and nothing changes for agents in projects that don't use it.
+
+```sh
+cntctr code server add gh --cmd gh-mcp --arg stdio    # register a tool server (your own terminal)
+cntctr code grant gh.list_* read                      # allow its read tools in this project
+cntctr code status --verbose                          # daemon, servers, memory, last use
+```
+
+In an agent session, `code_find` then `code_run` do the rest. `code_run` has no network, filesystem or `require`: a script can reach only the tool bridge, and every call through it is checked like a direct call.
+
+### Permissions
+
+- **Default deny.** A tool is callable only when a grant covers it. A denied call throws an error that names the tool and prints the exact grant command.
+- **Classes.** Each tool is `read`, `write` or `destructive`, from its MCP annotations (unannotated tools are `write`; `--trust none` treats a whole server as `write`). `allow` covers any class, `read` covers only tools of class `read`. Among access rules the most specific pattern wins; any matching `deny` denies, whatever the specificity.
+- **Per project.** A grant belongs to one project and one registered server. Replacing or removing the server drops its grants. If a granted tool's class later rises (for example `read` to `destructive`), the grant stops covering it.
+- **All projects.** `cntctr code grant --all-projects <server>.<pattern> read|deny` sets one user-wide rule for a user-scoped server, so a new project (or a Codex session that has no pane) needs no per-project grant. Only `read` and `deny` can be set this way; `allow` and class rules stay per project and per tool. Only you can create or remove it, from your own terminal: the MCP tools `code_grant` and `code_revoke` cannot create, change or remove it. Remove it with `cntctr code revoke --all-projects <server>.<pattern>`.
+- **Precedence.** A `deny` from either scope denies, so a project cannot undo your user-wide `deny`. Otherwise a project's own rule beats the all-projects rule. A project-local server with the same name as a user-scoped one shadows it, and the all-projects rule does not apply to it. Rules read from the database fail closed: an error means denied.
+- **Who may grant.** The project's orchestrator (the agent that is not a worker or reviewer, running in the pane that started the project) may create per-project `read` and `write` grants and register servers, with `destructive` grants escalated to you by default (`cntctr code policy destructive-orchestrator`). Spawned workers and reviewers never may. You can always grant from the CLI.
+- **Visible rules.** `cntctr code status`, `cntctr code grants` and the `code_status` tool list every rule that applies, with all-projects rules marked `[all-projects]`.
+
+### Which tools an agent sees
+
+The code tools show only where they work, so a project that doesn't use code mode pays no context for them:
+
+- `code_find`, `code_run`, `code_expand` and `code_status` are listed when the project has at least one server with a non-deny rule that applies (per project or all-projects). The built-in `cntctr` server alone doesn't count.
+- `code_server`, `code_grant` and `code_revoke` are listed only to an orchestrator.
+- Hidden is not disabled: calling a hidden tool still returns a normal, clear error.
+- Every server add or remove and every grant or revoke (CLI or MCP, including all-projects) sends `tools/list_changed`, so a live Claude Code or agy session updates its list. **Codex ignores `list_changed`**: its tool list is fixed for the session, so restart a Codex session to see newly enabled code tools.
+
+### Codex
+
+- **In a tmux pane** a Codex agent is found like any other. cntctr walks up the process tree from its MCP server to the pane's root process, so this works even when Codex hides `TMUX_PANE` from the server. A Codex orchestrator started in a pane lists and may use `code_server`, `code_grant` and `code_revoke`; a Codex worker spawned by an orchestrator (`@cntctr_parent` set) never does. Checked with a real Codex 0.171 session: an orchestrator added a server, granted `read` and ran `code_run`, and a worker saw only the four agent tools.
+- **Outside tmux** (the desktop app, `~/.codex/worktrees`, cloud) there is no pane. The admin tools are not listed, and calling one is refused ("no agent pane of its own"); `from=` never authorizes them. The agent tools need no pane or `from=`: the project is the MCP process's working directory, so set an `--all-projects` read policy from your terminal for the servers you want there.
+- **Codex ignores `tools/list_changed`**, so its tool list is fixed when the session starts. Set up servers and grants first, then start (or restart) Codex.
+- **Recommendation:** use Claude Code or agy as the orchestrator. Codex works well as a worker or reviewer: it gets a fresh tool list when spawned and never needs the admin tools.
+
+### Rollout
+
+Code mode adds tables to `kb.db` and moves the schema version from 8 to 9. The first cntctr that opens the database after you install the new build migrates it, and older builds then refuse the newer schema. **After installing, restart all running sessions** (Claude Code, Codex, agy) so every cntctr process is the new build. Test binaries refuse to open your real database: run any hand-built binary with `CNTCTR_DB=<tmp>/kb.db`.
+
+### Threat model
+
+- Grants guard against mistakes and prompt injection. They are **not** a boundary against the same user: anything you can run in a terminal, you can grant.
+- An orchestrator that has been prompt-injected could grant itself `read` or `write` access to a registered server. The mitigations are the `destructive` escalation default, the recorded `granted_by` and reason on every grant, `class_at_grant`, and `deny` rules (per project or all-projects) that you set by hand and no agent can remove.
+- Scripts have no authority of their own. They run in an embedded QuickJS with CPU, wall-clock, memory and stack limits, and every call is validated against the tool's schema and the project's grants before it reaches the server.
+- Tool servers run as your user with the environment you gave them. Register only servers you trust; environment values are never shown in `code status`.
+
+The `skills/code-mode` skill gives agents the short version. The full design is in [docs/superpowers/specs/2026-11-20-code-mode-design.md](docs/superpowers/specs/2026-11-20-code-mode-design.md).
+
 ## Watch it work
 
 ```sh
 ./watch.sh    # in a spare tmux pane; refreshes every 2 s ($CNTCTR_WATCH_SECS)
 ```
 
-It shows live agents, the board, the newest knowledge entries (`*` = copied to claude-mem, `x` = retired), private history, and when the librarian last ran.
+It shows live agents, the board, fleet tools, code mode (`cntctr code status --verbose`; `code: off` when the daemon is stopped, and it never starts it), the newest knowledge entries (`*` = copied to claude-mem, `x` = retired), private history, and when the librarian last ran.
 
 <details>
 <summary><b>Five-step feature check with real agents</b></summary>
@@ -438,6 +494,8 @@ Tests run against a private tmux server (`tmux -L cntctr-test`) and need `jq`.
 |---|---|
 | `cntctr.c` | MCP server: JSON-RPC loop, tools, tmux helpers, pane locking, model router |
 | `kb.c`, `kb.h` | Knowledge store: entries, FTS5 search, history, board |
+| `code_daemon.c`, `code_js.c`, `code_mcp.c`, `code_schema.c` | Code mode: per-user daemon, QuickJS script runner, tool-server client, argument validation |
+| `skills/` | Review skills (`council`, `sol-loop`) and the `code-mode` agent guide |
 | `watch.sh` | Live dashboard |
 | `test.sh` | End-to-end tests with fake harnesses |
 | `docs/superpowers/` | Design specs and implementation plans |

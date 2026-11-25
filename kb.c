@@ -2,12 +2,14 @@
 #define _DARWIN_C_SOURCE
 #include "kb.h"
 #include <ctype.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#include <json-c/json.h>
 
 static const char SCHEMA[] =
     "CREATE TABLE IF NOT EXISTS entries("
@@ -51,6 +53,33 @@ static const char SCHEMA[] =
     " PRIMARY KEY(project, name, version, author));"   /* author: drafts are version 0, one per author */
     "CREATE UNIQUE INDEX IF NOT EXISTS tools_version ON tools(project, name, version) WHERE version > 0;"
     "CREATE INDEX IF NOT EXISTS tools_name ON tools(project, name, status);"
+    "CREATE TABLE IF NOT EXISTS code_servers("
+    " scope_project TEXT NOT NULL DEFAULT '', name TEXT NOT NULL,"
+    " reg_id TEXT NOT NULL UNIQUE,"
+    " command TEXT NOT NULL, args_json TEXT NOT NULL DEFAULT '[]',"
+    " env_json TEXT NOT NULL DEFAULT '{}', isolated INTEGER NOT NULL DEFAULT 0,"
+    " trust TEXT NOT NULL DEFAULT 'none',"
+    " created_by TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL,"
+    " PRIMARY KEY(scope_project, name));"
+    "CREATE TABLE IF NOT EXISTS code_catalogs("
+    " reg_id TEXT NOT NULL, owner_project TEXT NOT NULL DEFAULT '',"
+    " tools_json TEXT NOT NULL DEFAULT '', meta_gen INTEGER NOT NULL DEFAULT 0,"
+    " updated_at INTEGER NOT NULL,"
+    " PRIMARY KEY(reg_id, owner_project));"
+    "CREATE TABLE IF NOT EXISTS code_grants("
+    " project TEXT NOT NULL, reg_id TEXT NOT NULL, server TEXT NOT NULL,"
+    " tool_pattern TEXT NOT NULL, kind TEXT NOT NULL,"
+    " level TEXT NOT NULL, class_at_grant TEXT NOT NULL DEFAULT '',"
+    " granted_by TEXT NOT NULL, granted_at INTEGER NOT NULL,"
+    " reason TEXT NOT NULL DEFAULT '',"
+    " PRIMARY KEY(project, reg_id, tool_pattern, kind));"
+    "CREATE INDEX IF NOT EXISTS code_grants_proj ON code_grants(project, reg_id);"
+    "CREATE TABLE IF NOT EXISTS code_runs("
+    " id TEXT PRIMARY KEY, project TEXT NOT NULL, caller TEXT NOT NULL,"
+    " script_hash TEXT NOT NULL, result TEXT, logs TEXT, calls TEXT, denied TEXT,"
+    " retained_capped INTEGER NOT NULL DEFAULT 0,"
+    " created INTEGER NOT NULL, expires INTEGER NOT NULL, expired INTEGER NOT NULL DEFAULT 0);"
+    "CREATE INDEX IF NOT EXISTS code_runs_exp ON code_runs(expires) WHERE expired = 0;"
     "INSERT OR IGNORE INTO meta VALUES ('schema', '1');";
 
 static const char *col(sqlite3_stmt *st, int i) {
@@ -123,9 +152,9 @@ static const struct { const char *table, *name, *def; } MIGRATIONS[] = {
 
 /* PRAGMA user_version of a database that has this file's SCHEMA and every column of MIGRATIONS: 1 for the 13 columns above, one
  * more for each column added later. A database stamped above it is refused. A new table
- * in SCHEMA has no entry in MIGRATIONS: lower the 12 below by one for it, or databases stamped before it never get the table. */
+ * in SCHEMA has no entry in MIGRATIONS: lower the 10 below by one for it, or databases stamped before it never get the table. */
 /* Version 4 also backfills data, without adding a column. */
-#define KB_SCHEMA_VERSION ((int)(sizeof MIGRATIONS / sizeof *MIGRATIONS) - 11)
+#define KB_SCHEMA_VERSION ((int)(sizeof MIGRATIONS / sizeof *MIGRATIONS) - 10)
 
 static int schema_version(sqlite3 *db, int *version) {
     sqlite3_stmt *st = prep(db, "PRAGMA user_version");
@@ -135,7 +164,30 @@ static int schema_version(sqlite3 *db, int *version) {
     return rc == SQLITE_ROW ? SQLITE_OK : rc;
 }
 
+#ifdef CNTCTR_TEST_HOOKS
+#include <pwd.h>
+#include <sys/stat.h>
+void kb_test_guard(const char *path) {
+    const char *env = getenv("CNTCTR_DB");
+    if (!env || !*env) {
+        fprintf(stderr, "cntctr-test: refusing to open a knowledge DB (%s) with CNTCTR_DB unset (pid %d); a test must isolate its DB\n", path, (int)getpid());
+        abort();
+    }
+    struct passwd *pw = getpwuid(getuid());
+    char real[4096];
+    struct stat a, b;
+    if (pw && pw->pw_dir) {
+        snprintf(real, sizeof real, "%s/.local/share/cntctr/kb.db", pw->pw_dir);
+        if (stat(real, &a) == 0 && stat(path, &b) == 0 && a.st_dev == b.st_dev && a.st_ino == b.st_ino) {
+            fprintf(stderr, "cntctr-test: refusing to open the real knowledge DB %s (pid %d)\n", real, (int)getpid());
+            abort();
+        }
+    }
+}
+#endif
+
 sqlite3 *kb_open_timeout(const char *path, char **err, int timeout_ms) {
+    kb_test_guard(path);
     sqlite3 *db = NULL;
     if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, NULL) != SQLITE_OK) {
         *err = strdup(db ? sqlite3_errmsg(db) : "out of memory");
@@ -992,4 +1044,1167 @@ int kb_omitted(sqlite3 *db, const char *scope, const char *me, const char *pane,
     *mail_omitted = row ? sqlite3_column_int(st, 1) : 0;
     sqlite3_finalize(st);
     return count;
+}
+
+/* ---- code mode ---- */
+
+static void code_gen_reg_id(char out[64]) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    long long ms = (long long)tv.tv_sec * 1000LL + tv.tv_usec / 1000;
+    snprintf(out, 64, "reg-%llx-%08x%08x", ms, arc4random(), arc4random());
+}
+
+void kb_code_server_free(struct code_server_row *s) {
+    if (!s) return;
+    free(s->command);
+    free(s->args_json);
+    free(s->env_json);
+    s->command = s->args_json = s->env_json = NULL;
+}
+
+/* 1 if any human grant exists for reg_id, 0 if none, -1 on DB error. */
+static int code_reg_has_human_grants(sqlite3 *db, const char *reg_id) {
+    if (!reg_id || !*reg_id) return 0;
+    sqlite3_stmt *st = prep(db, "SELECT 1 FROM code_grants WHERE reg_id = ?1 AND granted_by = 'human' LIMIT 1");
+    if (!st) return -1;
+    if (sqlite3_bind_text(st, 1, reg_id, -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return -1;
+    }
+    int step_rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (step_rc == SQLITE_ROW) return 1;
+    if (step_rc == SQLITE_DONE) return 0;
+    return -1;
+}
+
+int kb_code_server_inspect(sqlite3 *db, const char *scope_project, const char *name,
+                           char reg_id_out[64], int *has_human_grants) {
+    if (reg_id_out) reg_id_out[0] = '\0';
+    if (has_human_grants) *has_human_grants = 0;
+    if (!db || !name) return -2;
+    const char *scope = scope_project ? scope_project : "";
+    sqlite3_stmt *st = prep(db, "SELECT reg_id FROM code_servers WHERE scope_project = ?1 AND name = ?2");
+    if (!st) return -2;
+    if (sqlite3_bind_text(st, 1, scope, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return -2;
+    }
+    int step_rc = sqlite3_step(st);
+    char reg[64] = "";
+    if (step_rc == SQLITE_ROW) snprintf(reg, sizeof reg, "%s", col(st, 0));
+    sqlite3_finalize(st);
+    if (step_rc == SQLITE_DONE) return -1;
+    if (step_rc != SQLITE_ROW) return -2;
+    if (has_human_grants) {
+        int hh = code_reg_has_human_grants(db, reg);
+        if (hh < 0) return -2;
+        *has_human_grants = hh;
+    }
+    if (reg_id_out) snprintf(reg_id_out, 64, "%s", reg);
+    return 0;
+}
+
+int kb_code_server_has_human_grants(sqlite3 *db, const char *scope_project, const char *name) {
+    int has_human = 0;
+    int rc = kb_code_server_inspect(db, scope_project, name, NULL, &has_human);
+    if (rc == -2) return -1;
+    return rc == 0 ? has_human : 0;
+}
+
+int kb_code_server_put_checked(sqlite3 *db, const struct code_server_row *s, int from_mcp,
+                               const char *expected_reg_id, int human_approved, char reg_id_out[64],
+                               int *dropped_grants, int *dropped_projects) {
+    if (dropped_grants) *dropped_grants = 0;
+    if (dropped_projects) *dropped_projects = 0;
+    if (reg_id_out) reg_id_out[0] = '\0';
+    if (!db || !s || !s->name[0] || !s->command || !s->command[0]) return -1;
+    const char *scope = s->scope_project;
+    const char *args_json = (s->args_json && s->args_json[0]) ? s->args_json : "[]";
+    const char *env_json = (s->env_json && s->env_json[0]) ? s->env_json : "{}";
+    const char *trust = s->trust[0] ? s->trust : "none";
+    long long created_at = s->created_at > 0 ? s->created_at : (long long)time(NULL);
+
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) return -1;
+
+    if (from_mcp && scope[0] != '\0') {
+        sqlite3_stmt *st = prep(db, "SELECT 1 FROM code_servers WHERE scope_project = '' AND name = ?1 LIMIT 1");
+        if (!st) { sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL); return -1; }
+        if (sqlite3_bind_text(st, 1, s->name, -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+            sqlite3_finalize(st);
+            sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+            return -1;
+        }
+        int step_rc = sqlite3_step(st);
+        sqlite3_finalize(st);
+        if (step_rc == SQLITE_ROW) {
+            sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+            return -2;
+        }
+        if (step_rc != SQLITE_DONE) {
+            sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+            return -1;
+        }
+    }
+
+    char old_reg[64] = "";
+    sqlite3_stmt *st = prep(db, "SELECT reg_id FROM code_servers WHERE scope_project = ?1 AND name = ?2");
+    if (!st) { sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL); return -1; }
+    if (sqlite3_bind_text(st, 1, scope, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(st, 2, s->name, -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+        return -1;
+    }
+    int step_rc = sqlite3_step(st);
+    if (step_rc == SQLITE_ROW) snprintf(old_reg, sizeof old_reg, "%s", col(st, 0));
+    sqlite3_finalize(st);
+    if (step_rc != SQLITE_ROW && step_rc != SQLITE_DONE) {
+        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+        return -1;
+    }
+
+    int has_human = old_reg[0] ? code_reg_has_human_grants(db, old_reg) : 0;
+    if (has_human < 0) {
+        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+        return -1;
+    }
+    if (from_mcp && has_human) {
+        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+        return -2;
+    }
+    if (expected_reg_id != NULL) {
+        if (strcmp(old_reg, expected_reg_id) != 0 || (has_human && !human_approved)) {
+            sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+            return -3;
+        }
+    }
+
+    int dg = 0, dp = 0, rc = 0;
+    if (old_reg[0]) {
+        st = prep(db, "SELECT COUNT(*), COUNT(DISTINCT project) FROM code_grants WHERE reg_id = ?1");
+        if (!st) { rc = -1; goto done; }
+        if (sqlite3_bind_text(st, 1, old_reg, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+            sqlite3_step(st) != SQLITE_ROW) {
+            rc = -1;
+        } else {
+            dg = sqlite3_column_int(st, 0);
+            dp = sqlite3_column_int(st, 1);
+        }
+        sqlite3_finalize(st);
+        if (rc != 0) goto done;
+
+        st = prep(db, "DELETE FROM code_grants WHERE reg_id = ?1");
+        if (!st) { rc = -1; goto done; }
+        if (sqlite3_bind_text(st, 1, old_reg, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+            sqlite3_step(st) != SQLITE_DONE) rc = -1;
+        sqlite3_finalize(st);
+        if (rc != 0) goto done;
+
+        st = prep(db, "DELETE FROM code_catalogs WHERE reg_id = ?1");
+        if (!st) { rc = -1; goto done; }
+        if (sqlite3_bind_text(st, 1, old_reg, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+            sqlite3_step(st) != SQLITE_DONE) rc = -1;
+        sqlite3_finalize(st);
+        if (rc != 0) goto done;
+
+        st = prep(db, "DELETE FROM code_servers WHERE scope_project = ?1 AND name = ?2");
+        if (!st) { rc = -1; goto done; }
+        if (sqlite3_bind_text(st, 1, scope, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+            sqlite3_bind_text(st, 2, s->name, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+            sqlite3_step(st) != SQLITE_DONE) rc = -1;
+        sqlite3_finalize(st);
+        if (rc != 0) goto done;
+    }
+
+    char new_reg[64];
+    code_gen_reg_id(new_reg);
+    st = prep(db, "INSERT INTO code_servers(scope_project, name, reg_id, command, args_json, env_json, isolated, trust, created_by, created_at)"
+                  " VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)");
+    if (!st) { rc = -1; goto done; }
+    if (sqlite3_bind_text(st, 1, scope, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(st, 2, s->name, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(st, 3, new_reg, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(st, 4, s->command, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(st, 5, args_json, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(st, 6, env_json, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_int(st, 7, s->isolated ? 1 : 0) != SQLITE_OK ||
+        sqlite3_bind_text(st, 8, trust, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(st, 9, s->created_by, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_int64(st, 10, created_at) != SQLITE_OK ||
+        sqlite3_step(st) != SQLITE_DONE) rc = -1;
+    sqlite3_finalize(st);
+
+done:
+    if (sqlite3_exec(db, rc == 0 ? "COMMIT" : "ROLLBACK", NULL, NULL, NULL) != SQLITE_OK) rc = -1;
+    if (rc == 0) {
+        if (reg_id_out) snprintf(reg_id_out, 64, "%s", new_reg);
+        if (dropped_grants) *dropped_grants = dg;
+        if (dropped_projects) *dropped_projects = dp;
+    }
+    return rc;
+}
+
+int kb_code_server_put(sqlite3 *db, const struct code_server_row *s, int from_mcp, char reg_id_out[64],
+                       int *dropped_grants, int *dropped_projects) {
+    return kb_code_server_put_checked(db, s, from_mcp, NULL, from_mcp ? 0 : 1, reg_id_out, dropped_grants, dropped_projects);
+}
+
+int kb_code_server_get(sqlite3 *db, const char *project, const char *name, struct code_server_row *out) {
+    if (!out) return -1;
+    memset(out, 0, sizeof *out);
+    if (!db || !name || !*name) return -1;
+    const char *proj = project ? project : "";
+    sqlite3_stmt *st = prep(db,
+        "SELECT scope_project, name, reg_id, command, args_json, env_json, isolated, trust, created_by, created_at"
+        " FROM code_servers WHERE name = ?1 AND (scope_project = ?2 OR scope_project = '')"
+        " ORDER BY CASE WHEN scope_project = ?2 AND ?2 != '' THEN 0 ELSE 1 END LIMIT 1");
+    if (!st) return -1;
+    if (sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(st, 2, proj, -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return -1;
+    }
+    int found = sqlite3_step(st) == SQLITE_ROW;
+    if (found) {
+        const char *sp = col(st, 0);
+        if (strlen(sp) >= sizeof out->scope_project) {
+            sqlite3_finalize(st);
+            return -1;
+        }
+        snprintf(out->scope_project, sizeof out->scope_project, "%s", sp);
+        snprintf(out->name, sizeof out->name, "%s", col(st, 1));
+        snprintf(out->reg_id, sizeof out->reg_id, "%s", col(st, 2));
+        out->command = strdup(col(st, 3));
+        out->args_json = strdup(col(st, 4));
+        out->env_json = strdup(col(st, 5));
+        out->isolated = sqlite3_column_int(st, 6);
+        snprintf(out->trust, sizeof out->trust, "%s", col(st, 7));
+        snprintf(out->created_by, sizeof out->created_by, "%s", col(st, 8));
+        out->created_at = sqlite3_column_int64(st, 9);
+    }
+    sqlite3_finalize(st);
+    return found ? 0 : -1;
+}
+
+int kb_code_server_del_checked(sqlite3 *db, const char *scope_project, const char *name, int from_mcp,
+                               const char *expected_reg_id, int human_approved,
+                               int *dropped_grants, int *dropped_projects) {
+    if (dropped_grants) *dropped_grants = 0;
+    if (dropped_projects) *dropped_projects = 0;
+    if (!db || !name || !*name) return -1;
+    const char *scope = scope_project ? scope_project : "";
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) return -1;
+
+    char old_reg[64] = "";
+    sqlite3_stmt *st = prep(db, "SELECT reg_id FROM code_servers WHERE scope_project = ?1 AND name = ?2");
+    if (!st) { sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL); return -1; }
+    if (sqlite3_bind_text(st, 1, scope, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+        return -1;
+    }
+    int step_rc = sqlite3_step(st);
+    if (step_rc == SQLITE_ROW) snprintf(old_reg, sizeof old_reg, "%s", col(st, 0));
+    sqlite3_finalize(st);
+    if (step_rc != SQLITE_ROW && step_rc != SQLITE_DONE) {
+        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+        return -1;
+    }
+
+    int has_human = old_reg[0] ? code_reg_has_human_grants(db, old_reg) : 0;
+    if (has_human < 0) {
+        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+        return -1;
+    }
+    if (expected_reg_id != NULL) {
+        if (strcmp(old_reg, expected_reg_id) != 0 || (has_human && !human_approved)) {
+            sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+            return -3;
+        }
+    }
+    if (!old_reg[0]) {
+        sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+        return 0;
+    }
+    if (from_mcp && has_human) {
+        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+        return -2;
+    }
+
+    int dg = 0, dp = 0, changed = 0, rc = 0;
+    st = prep(db, "SELECT COUNT(*), COUNT(DISTINCT project) FROM code_grants WHERE reg_id = ?1");
+    if (!st) { rc = -1; goto done; }
+    if (sqlite3_bind_text(st, 1, old_reg, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_step(st) != SQLITE_ROW) {
+        rc = -1;
+    } else {
+        dg = sqlite3_column_int(st, 0);
+        dp = sqlite3_column_int(st, 1);
+    }
+    sqlite3_finalize(st);
+    if (rc != 0) goto done;
+
+    st = prep(db, "DELETE FROM code_grants WHERE reg_id = ?1");
+    if (!st) { rc = -1; goto done; }
+    if (sqlite3_bind_text(st, 1, old_reg, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_step(st) != SQLITE_DONE) rc = -1;
+    sqlite3_finalize(st);
+    if (rc != 0) goto done;
+
+    st = prep(db, "DELETE FROM code_catalogs WHERE reg_id = ?1");
+    if (!st) { rc = -1; goto done; }
+    if (sqlite3_bind_text(st, 1, old_reg, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_step(st) != SQLITE_DONE) rc = -1;
+    sqlite3_finalize(st);
+    if (rc != 0) goto done;
+
+    st = prep(db, "DELETE FROM code_servers WHERE scope_project = ?1 AND name = ?2");
+    if (!st) { rc = -1; goto done; }
+    if (sqlite3_bind_text(st, 1, scope, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(st, 2, name, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_step(st) != SQLITE_DONE) rc = -1;
+    else changed = sqlite3_changes(db);
+    sqlite3_finalize(st);
+
+done:
+    if (sqlite3_exec(db, rc == 0 ? "COMMIT" : "ROLLBACK", NULL, NULL, NULL) != SQLITE_OK) rc = -1;
+    if (rc != 0) return -1;
+    if (dropped_grants) *dropped_grants = dg;
+    if (dropped_projects) *dropped_projects = dp;
+    return changed;
+}
+
+int kb_code_server_del(sqlite3 *db, const char *scope_project, const char *name, int from_mcp,
+                       int *dropped_grants, int *dropped_projects) {
+    return kb_code_server_del_checked(db, scope_project, name, from_mcp, NULL, from_mcp ? 0 : 1, dropped_grants, dropped_projects);
+}
+
+char *kb_code_server_list_json(sqlite3 *db, const char *project) {
+    const char *proj = project ? project : "";
+    json_object *arr = json_object_new_array();
+    sqlite3_stmt *st = prep(db,
+        "SELECT s.scope_project, s.name, s.reg_id, s.command, s.args_json, s.env_json,"
+        " s.isolated, s.trust, s.created_by, s.created_at"
+        " FROM code_servers s"
+        " WHERE (?1 != '' AND s.scope_project = ?1)"
+        "    OR (s.scope_project = '' AND (?1 = '' OR NOT EXISTS ("
+        "        SELECT 1 FROM code_servers p WHERE p.scope_project = ?1 AND p.name = s.name)))"
+        " ORDER BY s.name");
+    if (st) {
+        sqlite3_bind_text(st, 1, proj, -1, SQLITE_TRANSIENT);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            json_object *row = json_object_new_object();
+            const char *sp = col(st, 0);
+            json_object_object_add(row, "scope", json_object_new_string(*sp ? "project" : "user"));
+            json_object_object_add(row, "scope_project", json_object_new_string(sp));
+            json_object_object_add(row, "name", json_object_new_string(col(st, 1)));
+            json_object_object_add(row, "reg_id", json_object_new_string(col(st, 2)));
+            json_object_object_add(row, "command", json_object_new_string(col(st, 3)));
+            json_object *args = json_tokener_parse(col(st, 4));
+            if (!args || !json_object_is_type(args, json_type_array)) {
+                if (args) json_object_put(args);
+                args = json_object_new_array();
+            }
+            json_object_object_add(row, "args", args);
+            /* Emit env_keys ONLY; never expose env values. */
+            json_object *env_keys = json_object_new_array();
+            json_object *env = json_tokener_parse(col(st, 5));
+            if (env && json_object_is_type(env, json_type_object)) {
+                json_object_object_foreach(env, k, v) {
+                    (void)v;
+                    json_object_array_add(env_keys, json_object_new_string(k));
+                }
+            }
+            if (env) json_object_put(env);
+            json_object_object_add(row, "env_keys", env_keys);
+            json_object_object_add(row, "isolated", json_object_new_boolean(sqlite3_column_int(st, 6) != 0));
+            json_object_object_add(row, "trust", json_object_new_string(col(st, 7)));
+            json_object_object_add(row, "created_by", json_object_new_string(col(st, 8)));
+            json_object_object_add(row, "created_at", json_object_new_int64(sqlite3_column_int64(st, 9)));
+            json_object_array_add(arr, row);
+        }
+        sqlite3_finalize(st);
+    }
+    char *out = strdup(json_object_to_json_string_ext(arr, JSON_C_TO_STRING_PLAIN));
+    json_object_put(arr);
+    return out;
+}
+
+int kb_code_catalog_get(sqlite3 *db, const char *reg_id, const char *owner_project,
+                        char **tools_json_out, long long *meta_gen_out) {
+    if (tools_json_out) *tools_json_out = NULL;
+    if (meta_gen_out) *meta_gen_out = 0;
+    if (!db || !reg_id || !*reg_id) return -1;
+    const char *owner = owner_project ? owner_project : "";
+    sqlite3_stmt *st = prep(db, "SELECT tools_json, meta_gen FROM code_catalogs WHERE reg_id = ?1 AND owner_project = ?2");
+    if (!st) return -1;
+    sqlite3_bind_text(st, 1, reg_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, owner, -1, SQLITE_TRANSIENT);
+    int found = sqlite3_step(st) == SQLITE_ROW;
+    if (found) {
+        if (tools_json_out) *tools_json_out = strdup(col(st, 0));
+        if (meta_gen_out) *meta_gen_out = sqlite3_column_int64(st, 1);
+    }
+    sqlite3_finalize(st);
+    return found ? 0 : -1;
+}
+
+int kb_code_catalog_set(sqlite3 *db, const char *reg_id, const char *owner_project,
+                        const char *tools_json, long long *meta_gen_out) {
+    if (meta_gen_out) *meta_gen_out = 0;
+    if (!db || !reg_id || !*reg_id) return -1;
+    const char *owner = owner_project ? owner_project : "";
+    const char *tj = tools_json ? tools_json : "";
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) return -1;
+    sqlite3_stmt *st = prep(db,
+        "INSERT INTO code_catalogs(reg_id, owner_project, tools_json, meta_gen, updated_at)"
+        " VALUES(?1, ?2, ?3, 1, ?4)"
+        " ON CONFLICT(reg_id, owner_project) DO UPDATE SET"
+        "  tools_json = excluded.tools_json,"
+        "  meta_gen = code_catalogs.meta_gen + 1,"
+        "  updated_at = excluded.updated_at");
+    int rc = -1;
+    if (st) {
+        sqlite3_bind_text(st, 1, reg_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, owner, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 3, tj, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 4, (long long)time(NULL));
+        if (sqlite3_step(st) == SQLITE_DONE) rc = 0;
+        sqlite3_finalize(st);
+    }
+    long long gen = 0;
+    if (rc == 0) {
+        st = prep(db, "SELECT meta_gen FROM code_catalogs WHERE reg_id = ?1 AND owner_project = ?2");
+        if (st) {
+            sqlite3_bind_text(st, 1, reg_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(st, 2, owner, -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(st) == SQLITE_ROW) gen = sqlite3_column_int64(st, 0);
+            else rc = -1;
+            sqlite3_finalize(st);
+        } else rc = -1;
+    }
+    if (sqlite3_exec(db, rc == 0 ? "COMMIT" : "ROLLBACK", NULL, NULL, NULL) != SQLITE_OK) rc = -1;
+    if (rc == 0 && meta_gen_out) *meta_gen_out = gen;
+    return rc;
+}
+
+/* Length-prefixed field: "<len>:<bytes>", so no stored text can forge a boundary (CODE-ADMIN-03). */
+static void snap_field(char **buf, size_t *len, size_t *cap, const char *tag, const char *v) {
+    const char *t = v ? v : "";
+    size_t n = strlen(t);
+    char head[40];
+    int h = snprintf(head, sizeof head, "%s%zu:", tag, n);
+    while (*len + (size_t)h + n + 1 > *cap) { *cap *= 2; *buf = realloc(*buf, *cap); if (!*buf) abort(); }
+    memcpy(*buf + *len, head, (size_t)h);
+    *len += (size_t)h;
+    memcpy(*buf + *len, t, n);
+    *len += n;
+    (*buf)[*len] = '\0';
+}
+
+/* Everything a grant decision reads, as one injective string: the (project, reg_id) rules, the catalog generation
+ * (absent vs present are distinct; a read failure is an error, not "absent") and, when asked, the policy value. With
+ * own_txn the reads share one read transaction; inside the caller's BEGIN IMMEDIATE they already do. NULL on any
+ * DB error (callers deny). *policy_out gets the policy value read, or NULL if the key is unset. */
+static char *grant_snapshot(sqlite3 *db, const char *project, const char *reg_id, const char *owner_project,
+                            const char *policy_key, char **policy_out, int own_txn) {
+    if (policy_out) *policy_out = NULL;
+    if (own_txn && sqlite3_exec(db, "BEGIN", NULL, NULL, NULL) != SQLITE_OK) return NULL;
+    size_t cap = 256, len = 0;
+    char *out = malloc(cap), *pol = NULL;
+    if (!out) abort();
+    out[0] = '\0';
+    int good = 0;
+    sqlite3_stmt *st = prep(db,
+        "SELECT project, tool_pattern, kind, level, class_at_grant, granted_by, granted_at, reason FROM code_grants"
+        " WHERE project IN (?1, '" KB_CODE_ALL_PROJECTS "') AND reg_id = ?2 ORDER BY project, tool_pattern, kind");
+    if (st && sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_bind_text(st, 2, reg_id, -1, SQLITE_TRANSIENT) == SQLITE_OK) {
+        int rc;
+        while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+            snap_field(&out, &len, &cap, "r", NULL);
+            for (int c = 0; c < 8; c++) snap_field(&out, &len, &cap, "f", (const char *)sqlite3_column_text(st, c));
+        }
+        good = rc == SQLITE_DONE;
+    }
+    if (st) sqlite3_finalize(st);
+    if (good) {
+        good = 0;
+        st = prep(db, "SELECT meta_gen FROM code_catalogs WHERE reg_id = ?1 AND owner_project = ?2");
+        if (st && sqlite3_bind_text(st, 1, reg_id, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+            sqlite3_bind_text(st, 2, owner_project ? owner_project : "", -1, SQLITE_TRANSIENT) == SQLITE_OK) {
+            int rc = sqlite3_step(st);
+            if (rc == SQLITE_ROW) {
+                char gen[32];
+                snprintf(gen, sizeof gen, "%lld", (long long)sqlite3_column_int64(st, 0));
+                snap_field(&out, &len, &cap, "c", gen);
+                good = 1;
+            } else if (rc == SQLITE_DONE) {
+                snap_field(&out, &len, &cap, "n", NULL);   /* no catalog yet */
+                good = 1;
+            }
+        }
+        if (st) sqlite3_finalize(st);
+    }
+    if (good && policy_key) {
+        good = 0;
+        st = prep(db, "SELECT v FROM meta WHERE k = ?1");
+        if (st && sqlite3_bind_text(st, 1, policy_key, -1, SQLITE_TRANSIENT) == SQLITE_OK) {
+            int rc = sqlite3_step(st);
+            if (rc == SQLITE_ROW) {
+                const char *v = (const char *)sqlite3_column_text(st, 0);
+                pol = strdup(v ? v : "");
+                snap_field(&out, &len, &cap, "p", pol);
+                good = 1;
+            } else if (rc == SQLITE_DONE) {
+                snap_field(&out, &len, &cap, "q", NULL);   /* policy unset */
+                good = 1;
+            }
+        }
+        if (st) sqlite3_finalize(st);
+    }
+    if (own_txn && sqlite3_exec(db, good ? "COMMIT" : "ROLLBACK", NULL, NULL, NULL) != SQLITE_OK) good = 0;
+    if (!good) { free(out); free(pol); return NULL; }
+    if (policy_out) *policy_out = pol;
+    else free(pol);
+    return out;
+}
+
+char *kb_code_grant_snapshot(sqlite3 *db, const char *project, const char *reg_id, const char *owner_project,
+                             const char *policy_key, char **policy_out) {
+    return grant_snapshot(db, project, reg_id, owner_project, policy_key, policy_out, 1);
+}
+
+/* Inside the caller's BEGIN IMMEDIATE (Sol R4-01, CODE-ADMIN-03): the decision still describes what is about to
+ * commit. 0 ok, -3 something it depended on changed (re-inspect, re-confirm), -1 DB error. */
+static int grant_recheck(sqlite3 *db, const char *project, const char *reg_id, const char *pattern,
+                         const char *kind, const struct kb_code_grant_guard *g) {
+    if (g->server_name) {
+        sqlite3_stmt *st = prep(db,
+            "SELECT reg_id FROM code_servers WHERE name = ?1 AND scope_project IN (?2, '')"
+            " ORDER BY (scope_project = '') LIMIT 1");
+        if (!st) return -1;
+        if (sqlite3_bind_text(st, 1, g->server_name, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+            sqlite3_bind_text(st, 2, project, -1, SQLITE_TRANSIENT) != SQLITE_OK) { sqlite3_finalize(st); return -1; }
+        int rc = sqlite3_step(st);
+        const char *cur = rc == SQLITE_ROW ? (const char *)sqlite3_column_text(st, 0) : NULL;
+        int same = cur && strcmp(cur, reg_id) == 0;
+        sqlite3_finalize(st);
+        if (rc != SQLITE_ROW && rc != SQLITE_DONE) return -1;
+        if (!same) return -3;   /* gone, replaced, or now shadowed by another registration */
+    } else if (strcmp(reg_id, "cntctr") != 0) {
+        return -1;
+    }
+    if (g->snapshot) {
+        char *now = grant_snapshot(db, project, reg_id, g->snapshot_owner, g->snapshot_policy_key, NULL, 0);
+        if (!now) return -1;
+        int same = strcmp(now, g->snapshot) == 0;
+        free(now);
+        if (!same) return -3;
+    }
+    if (g->policy_key) {
+        sqlite3_stmt *st = prep(db, "SELECT v FROM meta WHERE k = ?1");
+        if (!st) return -1;
+        if (sqlite3_bind_text(st, 1, g->policy_key, -1, SQLITE_TRANSIENT) != SQLITE_OK) { sqlite3_finalize(st); return -1; }
+        int rc = sqlite3_step(st);
+        const char *v = rc == SQLITE_ROW ? (const char *)sqlite3_column_text(st, 0) : NULL;
+        int allowed = v && strcmp(v, "allow") == 0;
+        sqlite3_finalize(st);
+        if (rc != SQLITE_ROW && rc != SQLITE_DONE) return -1;
+        if (!allowed) return -3;
+    }
+    if (!g->human_approved) {
+        sqlite3_stmt *st = prep(db,
+            "SELECT 1 FROM code_grants WHERE project = ?1 AND reg_id = ?2 AND tool_pattern = ?3"
+            " AND (?4 IS NULL OR kind = ?4) AND granted_by = 'human' AND (kind = 'class' OR level = 'deny') LIMIT 1");
+        if (!st) return -1;
+        int bound = sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+                    sqlite3_bind_text(st, 2, reg_id, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+                    sqlite3_bind_text(st, 3, pattern, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+                    (kind ? sqlite3_bind_text(st, 4, kind, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 4)) == SQLITE_OK;
+        if (!bound) { sqlite3_finalize(st); return -1; }
+        int rc = sqlite3_step(st);
+        sqlite3_finalize(st);
+        if (rc == SQLITE_ROW) return -3;
+        if (rc != SQLITE_DONE) return -1;
+    }
+    return 0;
+}
+
+static int grant_put_impl(sqlite3 *db, const char *project, const char *reg_id, const char *server,
+                          const char *pattern, const char *kind, const char *level,
+                          const char *class_at_grant, const char *granted_by, const char *reason, int from_mcp,
+                          const struct kb_code_grant_guard *guard) {
+    if (!db || !project || !*project || !reg_id || !*reg_id || !server || !*server ||
+        !pattern || !*pattern || !kind || !level || !granted_by || !*granted_by) return -1;
+    if (strcmp(kind, "access") == 0) {
+        if (strcmp(level, "allow") != 0 && strcmp(level, "read") != 0 && strcmp(level, "deny") != 0) return -1;
+        /* v1 positive allow is exact-tool only (no wildcards). */
+        if (strcmp(level, "allow") == 0 && (strchr(pattern, '*') || strchr(pattern, '?'))) return -1;
+    } else if (strcmp(kind, "class") == 0) {
+        if (strcmp(level, "class:write") != 0 && strcmp(level, "class:destructive") != 0) return -1;
+    } else {
+        return -1;
+    }
+
+    if (strcmp(project, KB_CODE_ALL_PROJECTS) == 0) {
+        /* The user-wide policy: a human sets it from the CLI, only as read or deny, never by MCP. */
+        if (from_mcp) return -2;
+        if (strcmp(granted_by, "human") != 0 || strcmp(kind, "access") != 0 ||
+            (strcmp(level, "read") != 0 && strcmp(level, "deny") != 0) || strcmp(reg_id, "cntctr") == 0) return -1;
+    }
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) return -1;
+    if (guard) {
+        int lrc = grant_recheck(db, project, reg_id, pattern, kind, guard);
+        if (lrc != 0) { sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL); return lrc; }
+    }
+    if (from_mcp) {
+        sqlite3_stmt *chk = prep(db,
+            "SELECT 1 FROM code_grants WHERE project = ?1 AND reg_id = ?2 AND tool_pattern = ?3"
+            " AND kind = ?4 AND granted_by = 'human' LIMIT 1");
+        if (!chk) { sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL); return -1; }
+        if (sqlite3_bind_text(chk, 1, project, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+            sqlite3_bind_text(chk, 2, reg_id, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+            sqlite3_bind_text(chk, 3, pattern, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+            sqlite3_bind_text(chk, 4, kind, -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+            sqlite3_finalize(chk);
+            sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+            return -1;
+        }
+        int step_rc = sqlite3_step(chk);
+        sqlite3_finalize(chk);
+        if (step_rc == SQLITE_ROW) {
+            sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+            return -2;
+        }
+        if (step_rc != SQLITE_DONE) {
+            sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+            return -1;
+        }
+    }
+
+    sqlite3_stmt *st = prep(db,
+        "INSERT INTO code_grants(project, reg_id, server, tool_pattern, kind, level, class_at_grant, granted_by, granted_at, reason)"
+        " VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+        " ON CONFLICT(project, reg_id, tool_pattern, kind) DO UPDATE SET"
+        "  server = excluded.server, level = excluded.level, class_at_grant = excluded.class_at_grant,"
+        "  granted_by = excluded.granted_by, granted_at = excluded.granted_at, reason = excluded.reason");
+    int rc = -1;
+    if (st) {
+        if (sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+            sqlite3_bind_text(st, 2, reg_id, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+            sqlite3_bind_text(st, 3, server, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+            sqlite3_bind_text(st, 4, pattern, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+            sqlite3_bind_text(st, 5, kind, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+            sqlite3_bind_text(st, 6, level, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+            sqlite3_bind_text(st, 7, class_at_grant ? class_at_grant : "", -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+            sqlite3_bind_text(st, 8, granted_by, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+            sqlite3_bind_int64(st, 9, (long long)time(NULL)) == SQLITE_OK &&
+            sqlite3_bind_text(st, 10, reason ? reason : "", -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+            sqlite3_step(st) == SQLITE_DONE) rc = 0;
+        sqlite3_finalize(st);
+    }
+    if (sqlite3_exec(db, rc == 0 ? "COMMIT" : "ROLLBACK", NULL, NULL, NULL) != SQLITE_OK) rc = -1;
+    return rc;
+}
+
+int kb_code_grant_put(sqlite3 *db, const char *project, const char *reg_id, const char *server,
+                      const char *pattern, const char *kind, const char *level,
+                      const char *class_at_grant, const char *granted_by, const char *reason, int from_mcp) {
+    return grant_put_impl(db, project, reg_id, server, pattern, kind, level, class_at_grant, granted_by,
+                          reason, from_mcp, NULL);
+}
+
+int kb_code_grant_put_checked(sqlite3 *db, const char *project, const char *reg_id, const char *server,
+                              const char *pattern, const char *kind, const char *level,
+                              const char *class_at_grant, const char *granted_by, const char *reason,
+                              int from_mcp, const struct kb_code_grant_guard *guard) {
+    if (!guard) return -1;
+    return grant_put_impl(db, project, reg_id, server, pattern, kind, level, class_at_grant, granted_by,
+                          reason, from_mcp, guard);
+}
+
+static int grant_del_impl(sqlite3 *db, const char *project, const char *reg_id, const char *pattern,
+                          const char *kind, int from_mcp, const struct kb_code_grant_guard *guard) {
+    if (!db || !project || !*project || !reg_id || !*reg_id || !pattern || !*pattern) return -1;
+    int has_kind = kind && *kind;
+    if (from_mcp && strcmp(project, KB_CODE_ALL_PROJECTS) == 0) return -2;
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) return -1;
+    if (guard) {
+        int lrc = grant_recheck(db, project, reg_id, pattern, has_kind ? kind : NULL, guard);
+        if (lrc != 0) { sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL); return lrc; }
+    }
+    if (from_mcp) {
+        sqlite3_stmt *chk = prep(db, has_kind
+            ? "SELECT 1 FROM code_grants WHERE project = ?1 AND reg_id = ?2 AND tool_pattern = ?3 AND kind = ?4 AND granted_by = 'human' LIMIT 1"
+            : "SELECT 1 FROM code_grants WHERE project = ?1 AND reg_id = ?2 AND tool_pattern = ?3 AND granted_by = 'human' LIMIT 1");
+        if (!chk) { sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL); return -1; }
+        int bind_ok = sqlite3_bind_text(chk, 1, project, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+                      sqlite3_bind_text(chk, 2, reg_id, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+                      sqlite3_bind_text(chk, 3, pattern, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+                      (!has_kind || sqlite3_bind_text(chk, 4, kind, -1, SQLITE_TRANSIENT) == SQLITE_OK);
+        if (!bind_ok) {
+            sqlite3_finalize(chk);
+            sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+            return -1;
+        }
+        int step_rc = sqlite3_step(chk);
+        sqlite3_finalize(chk);
+        if (step_rc == SQLITE_ROW) {
+            sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+            return -2;
+        }
+        if (step_rc != SQLITE_DONE) {
+            sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+            return -1;
+        }
+    }
+    sqlite3_stmt *st = prep(db, has_kind
+        ? "DELETE FROM code_grants WHERE project = ?1 AND reg_id = ?2 AND tool_pattern = ?3 AND kind = ?4"
+        : "DELETE FROM code_grants WHERE project = ?1 AND reg_id = ?2 AND tool_pattern = ?3");
+    int changed = -1;
+    if (st) {
+        int bind_ok = sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+                      sqlite3_bind_text(st, 2, reg_id, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+                      sqlite3_bind_text(st, 3, pattern, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+                      (!has_kind || sqlite3_bind_text(st, 4, kind, -1, SQLITE_TRANSIENT) == SQLITE_OK);
+        if (bind_ok && sqlite3_step(st) == SQLITE_DONE) changed = sqlite3_changes(db);
+        sqlite3_finalize(st);
+    }
+    if (sqlite3_exec(db, changed >= 0 ? "COMMIT" : "ROLLBACK", NULL, NULL, NULL) != SQLITE_OK) return -1;
+    return changed;
+}
+
+int kb_code_grant_del(sqlite3 *db, const char *project, const char *reg_id, const char *pattern,
+                      const char *kind, int from_mcp) {
+    return grant_del_impl(db, project, reg_id, pattern, kind, from_mcp, NULL);
+}
+
+int kb_code_grant_del_checked(sqlite3 *db, const char *project, const char *reg_id, const char *pattern,
+                              const char *kind, int from_mcp, const struct kb_code_grant_guard *guard) {
+    if (!guard) return -1;
+    return grant_del_impl(db, project, reg_id, pattern, kind, from_mcp, guard);
+}
+
+/* What the existing rows at (project, reg_id, pattern[, kind]) are, before a human confirms a change. */
+int kb_code_grant_inspect(sqlite3 *db, const char *project, const char *reg_id, const char *pattern,
+                          const char *kind, int *has_human, int *human_protected) {
+    *has_human = *human_protected = 0;
+    if (!db || !project || !reg_id || !pattern) return -2;
+    sqlite3_stmt *st = prep(db,
+        "SELECT kind, level, granted_by FROM code_grants WHERE project = ?1 AND reg_id = ?2 AND tool_pattern = ?3"
+        " AND (?4 IS NULL OR kind = ?4)");
+    if (!st) return -2;
+    int bound = sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+                sqlite3_bind_text(st, 2, reg_id, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+                sqlite3_bind_text(st, 3, pattern, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+                (kind && *kind ? sqlite3_bind_text(st, 4, kind, -1, SQLITE_TRANSIENT) : sqlite3_bind_null(st, 4)) == SQLITE_OK;
+    if (!bound) { sqlite3_finalize(st); return -2; }
+    int rc;
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+        const char *k = (const char *)sqlite3_column_text(st, 0), *lv = (const char *)sqlite3_column_text(st, 1),
+                   *by = (const char *)sqlite3_column_text(st, 2);
+        if (by && strcmp(by, "human") == 0) {
+            *has_human = 1;
+            if ((k && strcmp(k, "class") == 0) || (lv && strcmp(lv, "deny") == 0)) *human_protected = 1;
+        }
+    }
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE ? 0 : -2;
+}
+
+/* Project roots holding a project-local row named `name` (JSON array), or NULL on a DB error. */
+char *kb_code_server_shadows_json(sqlite3 *db, const char *name) {
+    sqlite3_stmt *st = prep(db, "SELECT scope_project FROM code_servers WHERE name = ?1 AND scope_project != '' ORDER BY scope_project");
+    if (!st) return NULL;
+    if (sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT) != SQLITE_OK) { sqlite3_finalize(st); return NULL; }
+    json_object *arr = json_object_new_array();
+    int rc;
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+        const char *sp = (const char *)sqlite3_column_text(st, 0);
+        json_object_array_add(arr, json_object_new_string(sp ? sp : ""));
+    }
+    sqlite3_finalize(st);
+    char *out = NULL;
+    if (rc == SQLITE_DONE) out = strdup(json_object_to_json_string_ext(arr, JSON_C_TO_STRING_PLAIN));
+    json_object_put(arr);
+    return out;
+}
+
+int kb_code_project_has_usable(sqlite3 *db, const char *project) {
+    if (!db || !project || !*project) return -1;
+    sqlite3_stmt *st = prep(db,
+        "SELECT 1 FROM code_servers s"
+        " WHERE (s.scope_project = ?1 OR (s.scope_project = '' AND NOT EXISTS ("
+        "   SELECT 1 FROM code_servers p WHERE p.scope_project = ?1 AND p.name = s.name)))"
+        "  AND EXISTS (SELECT 1 FROM code_grants g WHERE g.reg_id = s.reg_id AND g.project IN (?1, '" KB_CODE_ALL_PROJECTS "')"
+        "              AND g.kind = 'access' AND g.level != 'deny') LIMIT 1");
+    if (!st) return -1;
+    if (sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT) != SQLITE_OK) { sqlite3_finalize(st); return -1; }
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_ROW ? 1 : rc == SQLITE_DONE ? 0 : -1;
+}
+
+int kb_code_reg_user_scoped(sqlite3 *db, const char *reg_id) {
+    if (!db || !reg_id || !*reg_id) return 0;
+    sqlite3_stmt *st = prep(db, "SELECT 1 FROM code_servers WHERE reg_id = ?1 AND scope_project = '' LIMIT 1");
+    if (!st) return 0;
+    sqlite3_bind_text(st, 1, reg_id, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_ROW;
+}
+
+int kb_code_has_non_deny_grant(sqlite3 *db, const char *project, const char *reg_id) {
+    if (!db || !project || !*project || !reg_id || !*reg_id) return 0;
+    sqlite3_stmt *st = prep(db,
+        "SELECT 1 FROM code_grants WHERE project IN (?1, '" KB_CODE_ALL_PROJECTS "') AND reg_id = ?2"
+        " AND kind = 'access' AND level != 'deny' LIMIT 1");
+    if (!st) return 0;
+    sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, reg_id, -1, SQLITE_TRANSIENT);
+    int found = sqlite3_step(st) == SQLITE_ROW ? 1 : 0;
+    sqlite3_finalize(st);
+    return found;
+}
+
+char *kb_code_grant_list_json(sqlite3 *db, const char *project, const char *server) {
+    const char *proj = project ? project : "";
+    const char *srv = server ? server : "";
+    json_object *arr = json_object_new_array();
+    sqlite3_stmt *st = prep(db,
+        "SELECT g.project, g.reg_id, g.server, g.tool_pattern, g.kind, g.level,"
+        " g.class_at_grant, g.granted_by, g.granted_at, g.reason"
+        " FROM code_grants g"
+        " WHERE g.project IN (?1, '" KB_CODE_ALL_PROJECTS "')"
+        "  AND (g.reg_id = 'cntctr' OR g.reg_id IN ("
+        "    SELECT s.reg_id FROM code_servers s"
+        "    WHERE s.scope_project = ?1"
+        "       OR (s.scope_project = '' AND NOT EXISTS ("
+        "           SELECT 1 FROM code_servers p WHERE p.scope_project = ?1 AND p.name = s.name))"
+        "  ))"
+        "  AND (?2 = '' OR g.server = ?2)"
+        " ORDER BY g.server, g.tool_pattern, g.kind, g.project");
+    if (st) {
+        sqlite3_bind_text(st, 1, proj, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 2, srv, -1, SQLITE_TRANSIENT);
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            json_object *row = json_object_new_object();
+            json_object_object_add(row, "project", json_object_new_string(col(st, 0)));
+            json_object_object_add(row, "scope", json_object_new_string(strcmp(col(st, 0), KB_CODE_ALL_PROJECTS) == 0 ? "all-projects" : "project"));
+            json_object_object_add(row, "reg_id", json_object_new_string(col(st, 1)));
+            json_object_object_add(row, "server", json_object_new_string(col(st, 2)));
+            json_object_object_add(row, "tool_pattern", json_object_new_string(col(st, 3)));
+            json_object_object_add(row, "kind", json_object_new_string(col(st, 4)));
+            json_object_object_add(row, "level", json_object_new_string(col(st, 5)));
+            json_object_object_add(row, "class_at_grant", json_object_new_string(col(st, 6)));
+            json_object_object_add(row, "granted_by", json_object_new_string(col(st, 7)));
+            json_object_object_add(row, "granted_at", json_object_new_int64(sqlite3_column_int64(st, 8)));
+            json_object_object_add(row, "reason", json_object_new_string(col(st, 9)));
+            json_object_array_add(arr, row);
+        }
+        sqlite3_finalize(st);
+    }
+    char *out = strdup(json_object_to_json_string_ext(arr, JSON_C_TO_STRING_PLAIN));
+    json_object_put(arr);
+    return out;
+}
+
+static int code_glob_match(const char *pat, const char *str) {
+    const char *p = pat, *s = str, *star = NULL, *match = NULL;
+    while (*s) {
+        if (*p == '?' || *p == *s) { p++; s++; }
+        else if (*p == '*') { star = p++; match = s; }
+        else if (star) { p = star + 1; s = ++match; }
+        else return 0;
+    }
+    while (*p == '*') p++;
+    return *p == '\0';
+}
+
+struct code_pat_spec { int exact, literals, stars; size_t len; };
+
+static struct code_pat_spec code_pattern_spec(const char *pat) {
+    struct code_pat_spec sp = {1, 0, 0, 0};
+    for (const char *p = pat; *p; p++) {
+        sp.len++;
+        if (*p == '*') { sp.exact = 0; sp.stars++; }
+        else if (*p == '?') { sp.exact = 0; }
+        else { sp.literals++; }
+    }
+    return sp;
+}
+
+/* >0 if a is more specific than b, <0 if less, 0 if equal specificity. */
+static int code_spec_cmp(struct code_pat_spec a, struct code_pat_spec b) {
+    if (a.exact != b.exact) return a.exact - b.exact;
+    if (a.literals != b.literals) return a.literals - b.literals;
+    if (a.stars != b.stars) return b.stars - a.stars;
+    if (a.len != b.len) return a.len > b.len ? 1 : -1;
+    return 0;
+}
+
+static const char *code_class_name(enum code_class c) {
+    if (c == CODE_READ) return "read";
+    if (c == CODE_WRITE) return "write";
+    return "destructive";
+}
+
+static int code_parse_class(const char *s) {
+    if (!s) return 0;
+    if (strcmp(s, "read") == 0) return CODE_READ;
+    if (strcmp(s, "write") == 0 || strcmp(s, "class:write") == 0) return CODE_WRITE;
+    if (strcmp(s, "destructive") == 0 || strcmp(s, "class:destructive") == 0) return CODE_DESTRUCTIVE;
+    return 0;
+}
+
+static char *code_why(const char *fmt_str, ...) {
+    va_list ap;
+    char *s = NULL;
+    va_start(ap, fmt_str);
+    if (vasprintf(&s, fmt_str, ap) < 0) s = strdup("denied");
+    va_end(ap);
+    return s;
+}
+
+int kb_code_check_grant(sqlite3 *db, const char *project, const char *reg_id, const char *tool,
+                        enum code_class base_class, enum code_class *effective_out, char **why) {
+    if (why) *why = NULL;
+    if (effective_out) *effective_out = base_class;
+    if (!db || !project || !*project || !reg_id || !*reg_id || !tool || !*tool) {
+        if (why) *why = strdup("invalid grant check parameters");
+        return -1;
+    }
+
+    int has_class_rule = 0;
+    struct code_pat_spec best_class_spec = {0, 0, 0, 0};
+    enum code_class best_class_val = base_class;
+    int human_class_floor = 0;
+
+    int has_deny = 0, deny_global = 0;
+    char deny_pat[256] = "", deny_reason[256] = "";
+
+    /* Access rules by scope: [0] this project's own, [1] the all-projects policy. A project-local access rule beats the
+     * all-projects one whatever its specificity; the all-projects rule decides only when no local access rule matches. */
+    struct { int has; struct code_pat_spec spec; char level[32], cag[32], pat[256]; } acc[2] = {{0}, {0}};
+
+    sqlite3_stmt *st = prep(db,
+        "SELECT tool_pattern, kind, level, class_at_grant, reason, granted_by, project = '" KB_CODE_ALL_PROJECTS "'"
+        " FROM code_grants WHERE project IN (?1, '" KB_CODE_ALL_PROJECTS "') AND reg_id = ?2");
+    if (!st) {
+        if (why) *why = strdup("grant lookup failed");
+        return -1;
+    }
+    if (sqlite3_bind_text(st, 1, project, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(st, 2, reg_id, -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        if (why) *why = strdup("grant lookup failed");
+        return -1;
+    }
+    int step_rc;
+    while ((step_rc = sqlite3_step(st)) == SQLITE_ROW) {
+        const char *pat = col(st, 0), *kind = col(st, 1), *level = col(st, 2),
+                   *cag = col(st, 3), *reason = col(st, 4), *granted_by = col(st, 5);
+        int global = sqlite3_column_int(st, 6) != 0;
+        if (!code_glob_match(pat, tool)) continue;
+        struct code_pat_spec sp = code_pattern_spec(pat);
+        if (strcmp(kind, "class") == 0) {
+            if (global) continue;   /* the all-projects policy holds access rules only */
+            int cls = code_parse_class(level);
+            if (cls > 0) {
+                int cmp = has_class_rule ? code_spec_cmp(sp, best_class_spec) : 1;
+                if (cmp > 0) {
+                    has_class_rule = 1;
+                    best_class_spec = sp;
+                    best_class_val = (enum code_class)cls;
+                } else if (cmp == 0 && cls > (int)best_class_val) {
+                    best_class_val = (enum code_class)cls;
+                }
+                if (strcmp(granted_by, "human") == 0 && cls > human_class_floor)
+                    human_class_floor = cls;
+            }
+        } else if (strcmp(kind, "access") == 0) {
+            if (strcmp(level, "deny") == 0) {
+                if (!has_deny || (deny_global && !global)) {   /* name a project's own deny before the user-wide one */
+                    has_deny = 1;
+                    deny_global = global;
+                    snprintf(deny_pat, sizeof deny_pat, "%s", pat);
+                    snprintf(deny_reason, sizeof deny_reason, "%s", reason);
+                }
+            } else if (strcmp(level, "allow") == 0 || strcmp(level, "read") == 0) {
+                int s = global ? 1 : 0;
+                int cmp = acc[s].has ? code_spec_cmp(sp, acc[s].spec) : 1;
+                if (cmp > 0) {
+                    acc[s].has = 1;
+                    acc[s].spec = sp;
+                    snprintf(acc[s].level, sizeof acc[s].level, "%s", level);
+                    snprintf(acc[s].cag, sizeof acc[s].cag, "%s", cag);
+                    snprintf(acc[s].pat, sizeof acc[s].pat, "%s", pat);
+                }
+            }
+        }
+    }
+    sqlite3_finalize(st);
+    if (step_rc != SQLITE_DONE) {
+        if (why) *why = strdup("grant lookup interrupted or failed");
+        return -1;
+    }
+
+    /* Pass 1: effective class (class overrides can raise, never lower below base_class or human floor). */
+    enum code_class eff = base_class;
+    if (has_class_rule && best_class_val > eff) eff = best_class_val;
+    if (human_class_floor > (int)eff) eff = (enum code_class)human_class_floor;
+    if (effective_out) *effective_out = eff;
+
+    /* Pass 2: access decision (a deny from either scope beats everything: a project cannot undo the user-wide policy;
+     * default-deny when no access rule matches). */
+    if (has_deny) {
+        const char *where = deny_global ? " [all-projects]" : "";
+        if (why) *why = deny_reason[0] ? code_why("denied by rule %s%s (%s)", deny_pat, where, deny_reason)
+                                       : code_why("denied by rule %s%s", deny_pat, where);
+        return 1;
+    }
+    int has_access = acc[0].has || acc[1].has, s = acc[0].has ? 0 : 1;
+    const char *acc_level = acc[s].level, *acc_cag = acc[s].cag, *acc_pat = acc[s].pat;
+    if (!has_access) {
+        if (why) *why = code_why("no grant covers %s (class %s; default-deny)", tool, code_class_name(eff));
+        return 1;
+    }
+    if (strcmp(acc_level, "read") == 0) {
+        if (eff == CODE_READ) return 0;
+        if (why) *why = code_why("tool %s has class %s, exceeding read grant (%s%s)", tool, code_class_name(eff), acc_pat,
+                                 s ? " [all-projects]" : "");
+        return 1;
+    }
+    if (strcmp(acc_level, "allow") == 0) {
+        int granted_cls = code_parse_class(acc_cag);
+        if (granted_cls > 0 && (int)eff <= granted_cls) return 0;
+        if (why) *why = code_why("tool %s class rose to %s (granted at %s); re-approval required",
+                                 tool, code_class_name(eff), acc_cag[0] ? acc_cag : "unknown");
+        return 1;
+    }
+    if (why) *why = strdup("denied");
+    return 1;
+}
+
+int kb_code_run_save(sqlite3 *db, const char *id, const char *project, const char *caller,
+                     const char *script_hash, const char *result, const char *logs,
+                     const char *calls, const char *denied, int retained_capped, int ttl_sec) {
+    if (!db || !id || !*id || !project || !*project || !caller || !script_hash) return -1;
+    long long now = (long long)time(NULL);
+    long long expires = now + (long long)ttl_sec;
+    sqlite3_stmt *st = prep(db,
+        "INSERT OR REPLACE INTO code_runs"
+        "(id, project, caller, script_hash, result, logs, calls, denied, retained_capped, created, expires, expired)"
+        " VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0)");
+    if (!st) return -1;
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, project, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, caller, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 4, script_hash, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 5, result ? result : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 6, logs ? logs : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 7, calls ? calls : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 8, denied ? denied : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 9, retained_capped ? 1 : 0);
+    sqlite3_bind_int64(st, 10, now);
+    sqlite3_bind_int64(st, 11, expires);
+    int rc = sqlite3_step(st) == SQLITE_DONE ? 0 : -1;
+    sqlite3_finalize(st);
+    return rc;
+}
+
+int kb_code_run_expand(sqlite3 *db, const char *project, const char *id, const char *part,
+                       size_t offset, size_t limit, char **slice, size_t *total_len, int *retained_capped,
+                       size_t *start_out) {
+    if (slice) *slice = NULL;
+    if (total_len) *total_len = 0;
+    if (retained_capped) *retained_capped = 0;
+    if (start_out) *start_out = 0;
+    if (!db || !project || !*project || !id || !*id || !part) return -1;
+    const char *sql = NULL;
+    if (strcmp(part, "result") == 0)
+        sql = "SELECT result, retained_capped, expired, expires FROM code_runs WHERE id = ?1 AND project = ?2";
+    else if (strcmp(part, "logs") == 0)
+        sql = "SELECT logs, retained_capped, expired, expires FROM code_runs WHERE id = ?1 AND project = ?2";
+    else if (strcmp(part, "calls") == 0)
+        sql = "SELECT calls, retained_capped, expired, expires FROM code_runs WHERE id = ?1 AND project = ?2";
+    else if (strcmp(part, "denied") == 0)
+        sql = "SELECT denied, retained_capped, expired, expires FROM code_runs WHERE id = ?1 AND project = ?2";
+    else return -1;
+
+    sqlite3_stmt *st = prep(db, sql);
+    if (!st) return -2;
+    if (sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
+        sqlite3_bind_text(st, 2, project, -1, SQLITE_TRANSIENT) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return -2;
+    }
+    int srow = sqlite3_step(st);
+    if (srow != SQLITE_ROW) {
+        sqlite3_finalize(st);
+        return srow == SQLITE_DONE ? -1 : -2;   /* -1 not found; -2 the store could not say (never "not found") */
+    }
+    int is_expired = sqlite3_column_int(st, 2) != 0 || sqlite3_column_int64(st, 3) <= (long long)time(NULL);
+    if (is_expired) {
+        sqlite3_finalize(st);
+        return 1;
+    }
+    if (retained_capped) *retained_capped = sqlite3_column_int(st, 1);
+    const unsigned char *raw = sqlite3_column_text(st, 0);
+    size_t len = raw ? (size_t)sqlite3_column_bytes(st, 0) : 0;
+    if (total_len) *total_len = len;
+    if (limit == 0 || limit > 65536) limit = 65536;
+
+    size_t start = offset;
+    if (start >= len || !raw) {
+        sqlite3_finalize(st);
+        if (start_out) *start_out = len;
+        if (slice) *slice = strdup("");
+        return 0;
+    }
+    while (start < len && (raw[start] & 0xC0) == 0x80) start++;
+    if (start >= len) {
+        sqlite3_finalize(st);
+        if (start_out) *start_out = len;
+        if (slice) *slice = strdup("");
+        return 0;
+    }
+    if (start_out) *start_out = start;
+    size_t end = (len - start > limit) ? start + limit : len;
+    if (end < len) {
+        while (end > start && (raw[end] & 0xC0) == 0x80) end--;
+        if (end == start) {
+            end = start + 1;
+            while (end < len && (raw[end] & 0xC0) == 0x80) end++;
+        }
+    }
+    if (slice) {
+        size_t n = end - start;
+        char *buf = malloc(n + 1);
+        if (buf) {
+            memcpy(buf, raw + start, n);
+            buf[n] = '\0';
+        }
+        *slice = buf;
+    }
+    sqlite3_finalize(st);
+    return (slice && !*slice) ? -1 : 0;
+}
+
+int kb_code_run_sweep(sqlite3 *db, time_t now) {
+    if (!db) return -1;
+    sqlite3_stmt *st = prep(db,
+        "UPDATE code_runs SET expired = 1, result = NULL, logs = NULL, calls = NULL, denied = NULL"
+        " WHERE expired = 0 AND expires <= ?1");
+    if (!st) return -1;
+    sqlite3_bind_int64(st, 1, (long long)now);
+    int n = sqlite3_step(st) == SQLITE_DONE ? sqlite3_changes(db) : -1;
+    sqlite3_finalize(st);
+    return n;
 }

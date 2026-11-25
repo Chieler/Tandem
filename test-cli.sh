@@ -93,6 +93,39 @@ SCRIPT
  [ "$(wc -l < "$LOG")" -eq 3 ]
  [ "$(grep -c '^permission test-agent %42$' "$LOG")" -eq 2 ]
  [ "$(grep -c '^reply test-worker %42$' "$LOG")" -eq 1 ]
+ qjs_out=$("$BIN" _test-qjs)
+ [ "$qjs_out" = "ok 3 mem_capped" ]
+ # Phase 2 standalone CLI checks for cntctr code server add|list|remove and cli_admin_guard
+ export CNTCTR_TEST_ANCESTOR_STOP_PID=$$
+ cdb="$d/code-cli.db"
+ ! CNTCTR_DB="$cdb" env -u TMUX_PANE -u CNTCTR_PANE -u CNTCTR_ROOT "$BIN" code server add cntctr --cmd /bin/echo 2>/dev/null
+ ! CNTCTR_DB="$cdb" env -u TMUX_PANE -u CNTCTR_PANE -u CNTCTR_ROOT "$BIN" code server add bad.name --cmd /bin/echo 2>/dev/null
+ ! CNTCTR_DB="$cdb" env -u TMUX_PANE -u CNTCTR_PANE -u CNTCTR_ROOT "$BIN" code server add good --cmd "npx foo" 2>/dev/null
+ CNTCTR_DB="$cdb" env -u TMUX_PANE -u CNTCTR_PANE -u CNTCTR_ROOT "$BIN" code server add echo1 --cmd /bin/echo --arg hi --env SECRET=topsecret >/dev/null
+ clist=$(CNTCTR_DB="$cdb" env -u TMUX_PANE -u CNTCTR_PANE -u CNTCTR_ROOT "$BIN" code server list)
+ printf '%s\n' "$clist" | grep -q 'SECRET'
+ if printf '%s\n' "$clist" | grep -q 'topsecret'; then echo "FAIL: env value leaked"; exit 1; fi
+ cguard=$(CNTCTR_DB="$cdb" CNTCTR_ROOT="$d" env -u TMUX_PANE -u CNTCTR_PANE "$BIN" code server remove echo1 2>&1 || true)
+ printf '%s\n' "$cguard" | grep -q 'CNTCTR_ROOT'
+ clist_blk=$(CNTCTR_DB="$cdb" CNTCTR_ROOT="$d" env -u TMUX_PANE -u CNTCTR_PANE "$BIN" code server list 2>&1 || true)
+ printf '%s\n' "$clist_blk" | grep -q 'CNTCTR_ROOT'
+ clist_jblk=$(CNTCTR_DB="$cdb" CNTCTR_ROOT="$d" env -u TMUX_PANE -u CNTCTR_PANE "$BIN" code server list --json 2>&1 || true)
+ printf '%s\n' "$clist_jblk" | grep -q 'CNTCTR_ROOT'
+ CNTCTR_DB="$cdb" env -u TMUX_PANE -u CNTCTR_PANE -u CNTCTR_ROOT "$BIN" code server remove echo1 >/dev/null
+ CNTCTR_DB="$cdb" env -u TMUX_PANE -u CNTCTR_PANE -u CNTCTR_ROOT "$BIN" code server add -dash1 --cmd /bin/echo >/dev/null
+ CNTCTR_DB="$cdb" env -u TMUX_PANE -u CNTCTR_PANE -u CNTCTR_ROOT "$BIN" code server remove -- -dash1 >/dev/null
+ # Phase 6: argument errors exit 2 before any guard, probe or write; every write still runs cli_admin_guard first
+ cli6() { CNTCTR_DB="$cdb" env -u TMUX_PANE -u CNTCTR_PANE -u CNTCTR_ROOT "$BIN" code "$@" 2>&1; }
+ for bad in "grant" "grant fake" "grant fake.x" "grant fake.x bogus" "grant nodot allow" "revoke" "revoke fake.x --kind bad" "policy" "policy destructive-orchestrator" "policy destructive-orchestrator bogus" "server discover" "server restart" "server discover bad.name"; do
+  rc=0; cli6 $bad >/dev/null || rc=$?
+  [ "$rc" -eq 2 ] || { echo "FAIL: code $bad exited $rc, want 2"; exit 1; }
+ done
+ help6=$(cli6 || true)
+ printf '%s\n' "$help6" | grep -q 'per pane' || { echo "FAIL: code help does not say authority is per pane"; exit 1; }
+ for w in "grant fake.x allow" "revoke fake.x" "policy destructive-orchestrator allow" "server discover fake" "server restart fake" "grants" "stop"; do
+  blocked=$(CNTCTR_DB="$cdb" CNTCTR_ROOT="$d" env -u TMUX_PANE -u CNTCTR_PANE "$BIN" code $w 2>&1 || true)
+  printf '%s\n' "$blocked" | grep -q 'CNTCTR_ROOT' || { echo "FAIL: code $w not stopped by cli_admin_guard"; exit 1; }
+ done
 else
  echo 'notification test skipped: requires cntctr-test'
 fi

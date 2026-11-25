@@ -1,5 +1,6 @@
 cntctr
 cntctr-test
+build/
 *.dSYM/
 .claude/
 .worktrees/

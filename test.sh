@@ -60,6 +60,7 @@ EOF
 chmod +x "$TMPD/bin/tmux"
 FSH='printf "\033[?2004h"; exec sh'   # a fake agent that is a shell, same reason
 export HOME="$TMPD/home"   # fleet tools keep their cache under ~/.cache
+export CNTCTR_TEST_ANCESTOR_STOP_PID=$$   # cli_admin_guard stops its ancestor walk at the test shell
 export BIN INIT CNTCTR_ENTER_DELAY_MS=50 LC_ALL=en_US.UTF-8 PATH="$TMPD/bin:$PATH" CNTCTR_DB="$TMPD/kb.db" CNTCTR_MEM_URL=
 export CNTCTR_MAX_AGENTS=${CNTCTR_MAX_AGENTS:-256}
 unset TMUX_PANE CNTCTR_PANE CNTCTR_TMUX CNTCTR_NAME   # a cntctr-spawned agent has these; they would aim the tests at its real tmux server
@@ -2204,7 +2205,7 @@ f6_9() {
     sockpath=$(t display -p '#{socket_path}')
     rm -f "$d" "$d-wal" "$d-shm"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
-    same "F9 a new database carries a schema version" "$(sqx "$d" 'PRAGMA user_version')" 8
+    same "F9 a new database carries a schema version" "$(sqx "$d" 'PRAGMA user_version')" 9
     same "F9 and the machine row" "$(sqx "$d" "SELECT count(*) FROM meta WHERE k='machine'")" 1
     sqx "$d" "DELETE FROM meta WHERE k='machine'"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
@@ -2212,10 +2213,10 @@ f6_9() {
     sqx "$d" "ALTER TABLE mail DROP COLUMN socket; ALTER TABLE task_gate DROP COLUMN answered; PRAGMA user_version=0"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
     same "F9 an older database gets its columns back" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")$(sqx "$d" "SELECT count(*) FROM pragma_table_info('task_gate') WHERE name='answered'")" 11
-    same "F9 and the current version" "$(sqx "$d" 'PRAGMA user_version')" 8
+    same "F9 and the current version" "$(sqx "$d" 'PRAGMA user_version')" 9
     sqx "$d" "ALTER TABLE mail DROP COLUMN wake_attempts; PRAGMA user_version=6"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
-    same "F9 version six migrates the durable wake counter" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='wake_attempts'")$(sqx "$d" 'PRAGMA user_version')" 18
+    same "F9 version six migrates the durable wake counter" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='wake_attempts'")$(sqx "$d" 'PRAGMA user_version')" 19
     sqx "$d" "ALTER TABLE mail DROP COLUMN lease_until;
       INSERT INTO posts(rowid,scope,sender,text,at) VALUES(41,'scope','sender','first',1),(42,'scope','sender','last',2);
       INSERT INTO mail(post,name,pane,socket,state,shown,wake_attempts,staged_turn)
@@ -2289,7 +2290,7 @@ f7_2() {
     same "F7.2 and is not migrated by this build" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")" 0
     sqx "$d" "PRAGMA user_version=0"
     CNTCTR_DB=$d TMUX="$sockpath,0,0" "$BIN" hook status %0 >/dev/null
-    same "F7.2 an older database is migrated and stamped" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")$(sqx "$d" 'PRAGMA user_version')" 18
+    same "F7.2 an older database is migrated and stamped" "$(sqx "$d" "SELECT count(*) FROM pragma_table_info('mail') WHERE name='socket'")$(sqx "$d" 'PRAGMA user_version')" 19
 }
 
 # f7_3: an abandoned user's claim is protected until its lease expires.
@@ -3001,10 +3002,18 @@ int main(int argc, char **argv) {
     return 0;
 }
 EOF
-    local jsonc
+    local jsonc qjs_objs="" qf
     jsonc=$(brew --prefix json-c 2>/dev/null || echo /usr/local)
-    if ! "${CC:-cc}" -std=c11 -O1 -pthread -I. -I"$jsonc/include" -o "$TMPD/race_driver" \
-        "$TMPD/race_driver.c" kb.c fleet.c hooks.c usage.c -L"$jsonc/lib" -ljson-c -lsqlite3; then
+    for qf in dtoa libregexp libunicode quickjs; do
+        if [ -f "build/qjs/$qf.o" ]; then
+            qjs_objs="$qjs_objs build/qjs/$qf.o"
+        else
+            "${CC:-cc}" -std=c11 -O1 -D_GNU_SOURCE -w -c "vendor/quickjs/$qf.c" -o "$TMPD/qjs_$qf.o" || { bad "race could not build the Stop driver"; return 1; }
+            qjs_objs="$qjs_objs $TMPD/qjs_$qf.o"
+        fi
+    done
+    if ! "${CC:-cc}" -std=c11 -O1 -pthread -I. -Ivendor/quickjs -I"$jsonc/include" -o "$TMPD/race_driver" \
+        "$TMPD/race_driver.c" kb.c fleet.c hooks.c usage.c code_schema.c code_js.c code_mcp.c code_daemon.c $qjs_objs -L"$jsonc/lib" -ljson-c -lsqlite3 -lm; then
         bad "race could not build the Stop driver"
         return 1
     fi
@@ -3250,12 +3259,3233 @@ if [ "${ONLY:-}" = stale-name ]; then
     [ "$fail" -eq 0 ]; exit $?
 fi
 
+# ---- Code Mode Phase 2: storage, grant resolver, cli_admin_guard, server CLI ----
+code_kb_run() {
+    local d="$TMPD/code_kb" db mig projA projB wtA out rc reg_user reg_proj reg_gh reg_drop exp_json
+    mkdir -p "$d/projA" "$d/projB" "$d/bin"
+    db="$d/code.db"
+    mig="$d/mig.db"
+
+    # 1. Existing v0.1.0 DB migration creates all 4 code_* tables and stamps user_version = 9
+    sqlite3 "$mig" < tests/schema_v0.1.0.sql
+    CNTCTR_DB="$mig" "$BIN" _test-code-kb server-list "" >/dev/null 2>&1
+    same "code-kb migration stamps user_version 9" "$(sq "$mig" 'PRAGMA user_version')" 9
+    same "code-kb migration creates all 4 code_* tables" \
+        "$(sq "$mig" "SELECT group_concat(name, ',') FROM (SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'code_%' ORDER BY name)")" \
+        "code_catalogs,code_grants,code_runs,code_servers"
+
+    # 1b. A test build never opens a DB without CNTCTR_DB (a hand-run ./cntctr-test once migrated the user's real kb.db):
+    # it aborts before touching anything, and creates no kb.db under the HOME it was given. Test builds only: the guard is compiled out otherwise.
+    if [ "$(basename "$BIN")" = cntctr-test ]; then
+        mkdir -p "$d/leakhome"
+        out=$(printf '%s\n' "$INIT" | env -u CNTCTR_DB HOME="$d/leakhome" "$BIN" 2>&1 >/dev/null)
+        check "code-kb test build refuses to open a DB with CNTCTR_DB unset" "$out" "refusing to open a knowledge DB"
+        same "code-kb test build left no kb.db under the unisolated HOME" "$(ls "$d/leakhome/.local/share/cntctr/kb.db" 2>/dev/null)" ""
+        out=$(env -u CNTCTR_DB HOME="$d/leakhome" "$BIN" stats 2>&1 >/dev/null)
+        check "code-kb test build refuses stats with CNTCTR_DB unset" "$out" "refusing to open a knowledge DB"
+    fi
+
+    # Canonical project roots (git repo + worktree + symlink)
+    git -C "$d/projA" init -q
+    git -C "$d/projA" -c user.name=T -c user.email=t@example.invalid commit --allow-empty -qm init
+    git -C "$d/projA" worktree add -qb wt "$d/wtA" >/dev/null 2>&1
+    ln -s "$d/projA" "$d/linkA"
+    projA=$(CNTCTR_DB="$db" "$BIN" _test-code-kb resolve-cwd "$d/projA")
+    wtA=$(CNTCTR_DB="$db" "$BIN" _test-code-kb resolve-cwd "$d/wtA")
+    same "code-kb resolve_code_cwd unifies git worktree to common root" "$wtA" "$projA"
+    same "code-kb resolve_code_cwd resolves symlinks via realpath" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb resolve-cwd "$d/linkA")" "$projA"
+    projB=$(CNTCTR_DB="$db" "$BIN" _test-code-kb resolve-cwd "$d/projB")
+    same "code-kb shell_quote escapes apostrophes" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb shell-quote "proj's dir")" "'proj'\''s dir'"
+
+    # 2. CLI cntctr code server add|list|remove (plain non-tmux shell)
+    out=$(CNTCTR_DB="$db" CNTCTR_TEST_ANCESTOR_STOP_PID=$$ env -u TMUX_PANE -u CNTCTR_PANE -u CNTCTR_ROOT \
+        "$BIN" code server add cntctr --cmd /bin/echo 2>&1); rc=$?
+    same "code-kb CLI rejects reserved name cntctr" "$((rc != 0))" 1
+    out=$(CNTCTR_DB="$db" CNTCTR_TEST_ANCESTOR_STOP_PID=$$ env -u TMUX_PANE -u CNTCTR_PANE -u CNTCTR_ROOT \
+        "$BIN" code server add bad.name --cmd /bin/echo 2>&1); rc=$?
+    same "code-kb CLI rejects dotted name bad.name" "$((rc != 0))" 1
+    out=$(CNTCTR_DB="$db" CNTCTR_TEST_ANCESTOR_STOP_PID=$$ env -u TMUX_PANE -u CNTCTR_PANE -u CNTCTR_ROOT \
+        "$BIN" code server add myecho --cmd "npx foo" 2>&1); rc=$?
+    same "code-kb CLI rejects whitespace in --cmd" "$((rc != 0))" 1
+
+    out=$(CNTCTR_DB="$db" CNTCTR_TEST_ANCESTOR_STOP_PID=$$ env -u TMUX_PANE -u CNTCTR_PANE -u CNTCTR_ROOT \
+        "$BIN" code server add myecho --cmd /bin/echo --arg hi --env SECRET=topsecret 2>&1); rc=$?
+    same "code-kb CLI adds valid server" "$rc" 0
+    out=$(CNTCTR_DB="$db" CNTCTR_TEST_ANCESTOR_STOP_PID=$$ env -u TMUX_PANE -u CNTCTR_PANE -u CNTCTR_ROOT \
+        "$BIN" code server list 2>&1); rc=$?
+    same "code-kb CLI lists servers" "$rc" 0
+    check "code-kb CLI list shows env key SECRET" "$out" "SECRET"
+    refute "code-kb CLI list hides env value topsecret" "$out" "topsecret"
+
+    # Seed non-human grants across 2 projects and a catalog, then replace & remove via CLI -> dropped N grants in M projects
+    reg_drop=$(CNTCTR_DB="$db" "$BIN" _test-code-kb server-get "" myecho | jq -r '.reg_id')
+    CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$projA" "$reg_drop" myecho "*" access read "" orch "seed" 0 >/dev/null
+    CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$projA" "$reg_drop" myecho "ping" access allow "read" orch "seed" 0 >/dev/null
+    CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$projB" "$reg_drop" myecho "*" access read "" orch "seed" 0 >/dev/null
+    CNTCTR_DB="$db" "$BIN" _test-code-kb catalog-set "$reg_drop" "" '[{"name":"ping"}]' >/dev/null
+    out=$(CNTCTR_DB="$db" CNTCTR_TEST_ANCESTOR_STOP_PID=$$ env -u TMUX_PANE -u CNTCTR_PANE -u CNTCTR_ROOT \
+        "$BIN" code server add myecho --cmd /bin/echo --arg v2 2>&1); rc=$?
+    same "code-kb CLI replace succeeds" "$rc" 0
+    check "code-kb CLI replace reports dropped grants and projects" "$out" "dropped 3 grants in 2 projects"
+    same "code-kb CLI replace deletes old reg_id grants" "$(sq "$db" "SELECT count(*) FROM code_grants WHERE reg_id='$reg_drop'")" 0
+    same "code-kb CLI replace deletes old reg_id catalogs" "$(sq "$db" "SELECT count(*) FROM code_catalogs WHERE reg_id='$reg_drop'")" 0
+
+    reg_drop=$(CNTCTR_DB="$db" "$BIN" _test-code-kb server-get "" myecho | jq -r '.reg_id')
+    CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$projA" "$reg_drop" myecho "*" access read "" orch "seed" 0 >/dev/null
+    CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$projB" "$reg_drop" myecho "*" access read "" orch "seed" 0 >/dev/null
+    out=$(CNTCTR_DB="$db" CNTCTR_TEST_ANCESTOR_STOP_PID=$$ env -u TMUX_PANE -u CNTCTR_PANE -u CNTCTR_ROOT \
+        "$BIN" code server remove myecho 2>&1); rc=$?
+    same "code-kb CLI remove succeeds" "$rc" 0
+    check "code-kb CLI remove reports dropped grants and projects" "$out" "dropped 2 grants in 2 projects"
+    same "code-kb CLI remove deletes old reg_id grants" "$(sq "$db" "SELECT count(*) FROM code_grants WHERE reg_id='$reg_drop'")" 0
+
+    # 3. cli_admin_guard checks
+    out=$(CNTCTR_DB="$db" CNTCTR_TEST_ANCESTOR_STOP_PID=$$ CNTCTR_ROOT="$d" env -u TMUX_PANE -u CNTCTR_PANE \
+        "$BIN" code server add blocked1 --cmd /bin/echo 2>&1); rc=$?
+    same "code-kb cli_admin_guard refuses CNTCTR_ROOT" "$((rc != 0))" 1
+    check "code-kb cli_admin_guard names CNTCTR_ROOT" "$out" "CNTCTR_ROOT"
+
+    local p_worker p_stale
+    p_worker=$(newpane kb_worker)
+    t set -p -t "$p_worker" @cntctr_parent "%0"
+    out=$(CNTCTR_DB="$db" CNTCTR_TEST_ANCESTOR_STOP_PID=$$ TMUX_PANE="$p_worker" env -u CNTCTR_PANE -u CNTCTR_ROOT \
+        "$BIN" code server add blocked2 --cmd /bin/echo 2>&1); rc=$?
+    same "code-kb cli_admin_guard refuses @cntctr_parent pane" "$((rc != 0))" 1
+    check "code-kb cli_admin_guard names @cntctr_parent" "$out" "@cntctr_parent"
+
+    out=$(CNTCTR_DB="$db" CNTCTR_TEST_ANCESTOR_STOP_PID=$$ TMUX_PANE="$p_worker" TMUX="/nonexistent/sock,0,0" env -u CNTCTR_PANE -u CNTCTR_ROOT \
+        "$BIN" code server add blocked_tmuxerr --cmd /bin/echo 2>&1); rc=$?
+    same "code-kb cli_admin_guard fails closed on tmux error" "$((rc != 0))" 1
+    check "code-kb cli_admin_guard names tmux check" "$out" "tmux"
+
+    p_stale=$(newpane kb_stale)
+    t set -pu -t "$p_stale" @cntctr_parent 2>/dev/null || true
+    out=$(CNTCTR_DB="$db" CNTCTR_TEST_ANCESTOR_STOP_PID=$$ TMUX_PANE="$p_stale" env -u CNTCTR_PANE -u CNTCTR_ROOT \
+        "$BIN" code server add allowed_stale --cmd /bin/echo 2>&1); rc=$?
+    same "code-kb cli_admin_guard allows pane with stale @cntctr_name and empty @cntctr_parent" "$rc" 0
+    CNTCTR_DB="$db" CNTCTR_TEST_ANCESTOR_STOP_PID=$$ TMUX_PANE="$p_stale" env -u CNTCTR_PANE -u CNTCTR_ROOT \
+        "$BIN" code server remove allowed_stale >/dev/null 2>&1
+    t kill-pane -t "$p_worker"; t kill-pane -t "$p_stale"
+
+    # Fake claude & codex child wrappers (including with a real PTY)
+    cat > "$d/wrap.c" << 'EOF'
+#include <stdlib.h>
+#include <sys/wait.h>
+int main(int argc, char **argv) {
+    if (argc <= 1) return 1;
+    int s = system(argv[1]);
+    return WIFEXITED(s) ? WEXITSTATUS(s) : 1;
+}
+EOF
+    cc -o "$d/bin/claude" "$d/wrap.c"
+    cc -o "$d/bin/codex" "$d/wrap.c"
+    out=$(CNTCTR_DB="$db" CNTCTR_TEST_ANCESTOR_STOP_PID=$$ env -u TMUX_PANE -u CNTCTR_PANE -u CNTCTR_ROOT \
+        "$d/bin/claude" "'$BIN' code server add blocked3 --cmd /bin/echo" 2>&1); rc=$?
+    same "code-kb cli_admin_guard refuses claude ancestor" "$((rc != 0))" 1
+    check "code-kb cli_admin_guard names claude ancestor" "$out" "claude"
+
+    out=$(python3 - "$d/bin/codex" "$BIN" "$db" "$$" <<'PY'
+import os, pty, select, subprocess, sys
+codex, binp, db, stop_pid = sys.argv[1:]
+m, s = pty.openpty()
+env = dict(os.environ)
+env["CNTCTR_DB"] = db
+env["CNTCTR_TEST_ANCESTOR_STOP_PID"] = stop_pid
+for k in ("TMUX_PANE", "CNTCTR_PANE", "CNTCTR_ROOT"):
+    env.pop(k, None)
+p = subprocess.Popen([codex, f"'{binp}' code server add blocked4 --cmd /bin/echo"], stdin=s, stdout=s, stderr=s, env=env)
+os.close(s)
+buf = bytearray()
+while True:
+    r, _, _ = select.select([m], [], [], 5.0)
+    if not r:
+        break
+    try:
+        chunk = os.read(m, 4096)
+        if not chunk:
+            break
+        buf.extend(chunk)
+    except OSError:
+        break
+os.close(m)
+rc = p.wait()
+print(f"RC={rc} OUT={buf.decode('utf-8', 'replace')}")
+PY
+    )
+    refute "code-kb cli_admin_guard refuses codex ancestor even with PTY" "$out" "RC=0 "
+    check "code-kb cli_admin_guard names codex ancestor" "$out" "codex"
+
+    # Destructive prompt for human-rule server replace/remove (non-TTY refused, PTY y succeeds)
+    CNTCTR_DB="$db" CNTCTR_TEST_ANCESTOR_STOP_PID=$$ env -u TMUX_PANE -u CNTCTR_PANE -u CNTCTR_ROOT \
+        "$BIN" code server add hsrv --cmd /bin/echo >/dev/null 2>&1
+    local reg_hsrv
+    reg_hsrv=$(CNTCTR_DB="$db" "$BIN" _test-code-kb server-get "" hsrv | jq -r '.reg_id')
+    CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$projA" "$reg_hsrv" hsrv "*" access read "" human "by human" 0 >/dev/null
+    out=$(CNTCTR_DB="$db" CNTCTR_TEST_ANCESTOR_STOP_PID=$$ env -u TMUX_PANE -u CNTCTR_PANE -u CNTCTR_ROOT \
+        "$BIN" code server remove hsrv </dev/null 2>&1); rc=$?
+    same "code-kb CLI remove with human grants refuses without TTY" "$((rc != 0))" 1
+    check "code-kb CLI remove without TTY names TTY check" "$out" "TTY"
+    out=$(python3 - "$BIN" "$db" "$$" <<'PY'
+import os, pty, select, subprocess, sys, time
+binp, db, stop_pid = sys.argv[1:]
+m, s = pty.openpty()
+env = dict(os.environ)
+env["CNTCTR_DB"] = db
+env["CNTCTR_TEST_ANCESTOR_STOP_PID"] = stop_pid
+for k in ("TMUX_PANE", "CNTCTR_PANE", "CNTCTR_ROOT"):
+    env.pop(k, None)
+p = subprocess.Popen([binp, "code", "server", "remove", "hsrv"], stdin=s, stdout=s, stderr=s, env=env)
+os.close(s)
+buf = bytearray()
+sent = False
+deadline = time.time() + 5.0
+while time.time() < deadline:
+    r, _, _ = select.select([m], [], [], 0.2)
+    if r:
+        try:
+            chunk = os.read(m, 4096)
+            if not chunk:
+                break
+            buf.extend(chunk)
+            if not sent and b"[y/N]" in buf:
+                os.write(m, b"y\n")
+                sent = True
+        except OSError:
+            break
+    elif p.poll() is not None:
+        break
+os.close(m)
+rc = p.wait()
+print(f"RC={rc} OUT={buf.decode('utf-8', 'replace')}")
+PY
+    )
+    check "code-kb CLI remove with human grants succeeds with PTY y" "$out" "RC=0 "
+    check "code-kb CLI remove with human grants reports dropped grants" "$out" "dropped 1 grants in 1 projects"
+
+    # 4. Registration & catalog isolation + shadowing + effective grant listing + Sol R4-01 checked recheck
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb server-put "" fake /bin/echo '[]' '{}' 1 annotations human 0)
+    check "code-kb user server-put succeeds" "$out" "rc=0 "
+    reg_user=$(printf '%s' "$out" | sed -n 's/.*reg_id=\([^ ]*\).*/\1/p')
+
+    # MCP cannot shadow user-scoped server
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb server-put "$projA" fake /bin/echo '[]' '{}' 0 none orch 1)
+    check "code-kb MCP cannot shadow user server" "$out" "rc=-2 "
+
+    # CLI (from_mcp=0) project-local shadows user server with distinct reg_id
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb server-put "$projA" fake /bin/echo '["p"]' '{}' 0 annotations human 0)
+    check "code-kb CLI project-local server-put shadows user" "$out" "rc=0 "
+    reg_proj=$(printf '%s' "$out" | sed -n 's/.*reg_id=\([^ ]*\).*/\1/p')
+    same "code-kb shadowed server has distinct reg_id" "$([ "$reg_proj" != "$reg_user" ] && echo 1 || echo 0)" 1
+    same "code-kb server-get in projA returns project-local reg_id" \
+        "$(CNTCTR_DB="$db" "$BIN" _test-code-kb server-get "$projA" fake | jq -r '.reg_id')" "$reg_proj"
+    same "code-kb server-get in projB returns user reg_id" \
+        "$(CNTCTR_DB="$db" "$BIN" _test-code-kb server-get "$projB" fake | jq -r '.reg_id')" "$reg_user"
+
+    # Per-instance code_catalogs: separate (tools_json, meta_gen) for (reg_user, projA) vs (reg_user, projB)
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb catalog-set "$reg_user" "$projA" '[{"name":"a1"}]')
+    check "code-kb catalog-set projA meta_gen=1" "$out" "rc=0 meta_gen=1"
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb catalog-set "$reg_user" "$projA" '[{"name":"a2"}]')
+    check "code-kb catalog-set projA increments meta_gen=2" "$out" "rc=0 meta_gen=2"
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb catalog-set "$reg_user" "$projB" '[{"name":"b1"}]')
+    check "code-kb catalog-set projB independent meta_gen=1" "$out" "rc=0 meta_gen=1"
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb catalog-get "$reg_user" "$projA")
+    check "code-kb catalog-get projA returns a2 gen=2" "$out" 'rc=0 meta_gen=2 tools=[{"name":"a2"}]'
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb catalog-get "$reg_user" "$projB")
+    check "code-kb catalog-get projB returns b1 gen=1" "$out" 'rc=0 meta_gen=1 tools=[{"name":"b1"}]'
+
+    # kb_code_grant_list_json filters to effective reg_ids + virtual "cntctr"
+    CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$projA" "$reg_user" fake "*" access read "" human "shadowed" 0 >/dev/null
+    CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$projA" "$reg_proj" fake "*" access read "" human "active" 0 >/dev/null
+    CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$projA" "cntctr" cntctr "*" access read "" human "virtual" 0 >/dev/null
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-list "$projA")
+    same "code-kb grant-list excludes shadowed user reg_id and keeps effective + cntctr" \
+        "$(printf '%s' "$out" | jq -r 'map(.reg_id) | sort | join(",")')" \
+        "$(printf '%s\n%s\n' "$reg_proj" "cntctr" | sort | paste -sd, -)"
+
+    # Sol R4-01: checked put/del aborts (-3) if expected_reg_id is stale or human grants not approved
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb server-put-checked "$projA" fake /bin/echo "stale-reg" 1)
+    check "code-kb server-put-checked aborts on stale reg_id" "$out" "rc=-3 "
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb server-put-checked "$projA" fake /bin/echo "$reg_proj" 0)
+    check "code-kb server-put-checked aborts when human grants unapproved" "$out" "rc=-3 "
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb server-del-checked "$projA" fake "$reg_proj" 0)
+    check "code-kb server-del-checked aborts when human grants unapproved" "$out" "rc=-3 "
+
+    # MCP server-put/del refused (-2) when human grants exist on old reg_id
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb server-del "$projA" fake 1)
+    check "code-kb MCP server-del refused when human grants exist" "$out" "rc=-2 "
+
+    # 5. Grants two-pass, replacement & human protection
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb server-put "$projA" gh /bin/echo '[]' '{}' 0 annotations human 0)
+    reg_gh=$(printf '%s' "$out" | sed -n 's/.*reg_id=\([^ ]*\).*/\1/p')
+
+    # Default-deny when no rule matches
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-check "$projA" "$reg_gh" list_issues read)
+    check "code-kb default-deny denies read with no rules" "$out" "rc=1 effective=read "
+    same "code-kb has-non-deny false before grants" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb has-non-deny "$projA" "$reg_gh")" 0
+
+    # gh.* read allows read, denies write
+    same "code-kb grant-put gh.* read" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$projA" "$reg_gh" gh "*" access read "" orch "allow reads" 0)" "rc=0"
+    same "code-kb has-non-deny true after read grant" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb has-non-deny "$projA" "$reg_gh")" 1
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-check "$projA" "$reg_gh" list_issues read)
+    check "code-kb gh.* read allows read" "$out" "rc=0 effective=read"
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-check "$projA" "$reg_gh" create_issue write)
+    check "code-kb gh.* read denies write" "$out" "rc=1 effective=write "
+
+    # class:write override raises effective_out=CODE_WRITE without shadowing gh.* read
+    same "code-kb grant-put class:write" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$projA" "$reg_gh" gh "sneaky_read" class "class:write" "" human "override" 0)" "rc=0"
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-check "$projA" "$reg_gh" sneaky_read read)
+    check "code-kb class:write raises effective class and denies under read" "$out" "rc=1 effective=write "
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-check "$projA" "$reg_gh" list_issues read)
+    check "code-kb class:write does not shadow gh.* read for other tools" "$out" "rc=0 effective=read"
+
+    # Wildcard allow rejected
+    same "code-kb wildcard allow rejected" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$projA" "$reg_gh" gh "create_*" access allow "write" human "bad" 0)" "rc=-1"
+    same "code-kb ? wildcard allow rejected" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$projA" "$reg_gh" gh "create_?" access allow "write" human "bad" 0)" "rc=-1"
+
+    # Exact allow (class_at_grant=write) allows create_issue
+    same "code-kb exact allow grant-put" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$projA" "$reg_gh" gh "create_issue" access allow "write" orch "needed" 0)" "rc=0"
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-check "$projA" "$reg_gh" create_issue write)
+    check "code-kb exact allow allows create_issue" "$out" "rc=0 effective=write"
+
+    # Human protection: from_mcp=1 returns -2 when replacing or deleting human row; from_mcp=0 replaces deny with allow atomically
+    same "code-kb human deny put" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$projA" "$reg_gh" gh "deploy" access deny "" human "no deploy" 0)" "rc=0"
+    same "code-kb from_mcp=1 refused replacing human row" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$projA" "$reg_gh" gh "deploy" access allow "write" orch "try" 1)" "rc=-2"
+    same "code-kb from_mcp=1 refused deleting human row" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-del "$projA" "$reg_gh" "deploy" access 1)" "rc=-2"
+    same "code-kb from_mcp=0 atomically replaces deny with allow" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$projA" "$reg_gh" gh "deploy" access allow "write" human "approved" 0)" "rc=0"
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-check "$projA" "$reg_gh" deploy write)
+    check "code-kb replaced deny->allow now allows deploy" "$out" "rc=0 effective=write"
+
+    # class_at_grant=read denies if class rises to destructive
+    same "code-kb grant-put class_at_grant=read" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$projA" "$reg_gh" gh "upgrade_tool" access allow "read" orch "was read" 0)" "rc=0"
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-check "$projA" "$reg_gh" upgrade_tool destructive)
+    check "code-kb class_at_grant=read denies when class rises to destructive" "$out" "rc=1 effective=destructive "
+
+    # deny on gh.* beats exact allow
+    same "code-kb grant-put deny gh.*" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$projA" "$reg_gh" gh "*" access deny "" human "lockdown" 0)" "rc=0"
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-check "$projA" "$reg_gh" create_issue write)
+    check "code-kb deny on gh.* beats exact allow" "$out" "rc=1 effective=write "
+
+    # 5b. The all-projects policy (project "*"): human, access read/deny, user-scoped servers; precedence against project rules
+    local reg_ap reg_ap_loc kbs="$BIN" ap='*'
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb server-put "" apsrv /bin/echo '[]' '{}' 0 annotations human 0)
+    reg_ap=$(printf '%s' "$out" | sed -n 's/.*reg_id=\([^ ]*\).*/\1/p')
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-check "$projB" "$reg_ap" list_x read)
+    check "code-kb all-projects: default-deny before any rule" "$out" "rc=1 effective=read "
+    same "code-kb all-projects: read put is rc=0" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$ap" "$reg_ap" apsrv "*" access read "" human "everywhere" 0)" "rc=0"
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-check "$projB" "$reg_ap" list_x read)
+    check "code-kb all-projects: read rule allows a project with no rule of its own" "$out" "rc=0 effective=read"
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-check "$projB" "$reg_ap" write_x write)
+    check "code-kb all-projects: a read rule still denies a write tool" "$out" "rc=1 effective=write "
+    same "code-kb all-projects: has-non-deny counts the user-wide rule" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb has-non-deny "$projB" "$reg_ap")" 1
+    same "code-kb all-projects: allow is refused" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$ap" "$reg_ap" apsrv "x" access allow "write" human "no" 0)" "rc=-1"
+    same "code-kb all-projects: class rule is refused" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$ap" "$reg_ap" apsrv "x" class "class:write" "" human "no" 0)" "rc=-1"
+    same "code-kb all-projects: a non-human granter is refused" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$ap" "$reg_ap" apsrv "x" access read "" orch "no" 0)" "rc=-1"
+    same "code-kb all-projects: MCP put is refused" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$ap" "$reg_ap" apsrv "x" access read "" human "no" 1)" "rc=-2"
+    same "code-kb all-projects: the virtual cntctr server is refused" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$ap" cntctr cntctr "x" access read "" human "no" 0)" "rc=-1"
+    same "code-kb all-projects: MCP delete is refused" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-del "$ap" "$reg_ap" "*" access 1)" "rc=-2"
+    same "code-kb all-projects: the rule survived the MCP attempts" "$(sq "$db" "SELECT count(*) FROM code_grants WHERE project='*' AND reg_id='$reg_ap'")" 1
+    # a project-local deny beats the user-wide read, only there
+    same "code-kb all-projects: project-local deny put" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$projA" "$reg_ap" apsrv "secret_*" access deny "" human "not here" 0)" "rc=0"
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-check "$projA" "$reg_ap" secret_a read)
+    check "code-kb all-projects: a project-local deny beats the user-wide read" "$out" "rc=1 effective=read why=denied by rule secret_* (not here)"
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-check "$projB" "$reg_ap" secret_a read)
+    check "code-kb all-projects: ...and only in that project" "$out" "rc=0 effective=read"
+    # a user-wide deny beats a project-local read or allow
+    same "code-kb all-projects: user-wide deny put" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$ap" "$reg_ap" apsrv "banned" access deny "" human "never" 0)" "rc=0"
+    same "code-kb all-projects: project-local read of the banned tool put" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$projA" "$reg_ap" apsrv "banned" access read "" human "try" 0)" "rc=0"
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-check "$projA" "$reg_ap" banned read)
+    check "code-kb all-projects: a user-wide deny beats a project-local read" "$out" "rc=1 effective=read why=denied by rule banned [all-projects] (never)"
+    # a project-local allow decides for its tool; the user-wide read decides elsewhere
+    same "code-kb all-projects: project-local allow put" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$projA" "$reg_ap" apsrv "write_x" access allow "write" human "ok here" 0)" "rc=0"
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-check "$projA" "$reg_ap" write_x write)
+    check "code-kb all-projects: a project-local allow beats the user-wide read" "$out" "rc=0 effective=write"
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-check "$projB" "$reg_ap" write_x write)
+    check "code-kb all-projects: ...the user-wide read still holds elsewhere" "$out" "rc=1 effective=write "
+    # listing: marked, effective servers only
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-list "$projB")
+    same "code-kb all-projects: grant-list marks the user-wide row" "$(printf '%s' "$out" | jq -r '[.[] | select(.scope == "all-projects") | .tool_pattern] | join(",")')" "*,banned"
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb server-put "$projB" apsrv /bin/echo '[]' '{}' 0 annotations human 0)
+    reg_ap_loc=$(printf '%s' "$out" | sed -n 's/.*reg_id=\([^ ]*\).*/\1/p')
+    same "code-kb all-projects: a project-local server of that name is not covered" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-check "$projB" "$reg_ap_loc" list_x read | cut -c1-4)" "rc=1"
+    same "code-kb all-projects: ...and the shadowed user-wide rows are not listed there" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-list "$projB" | jq -r '[.[] | select(.scope == "all-projects")] | length')" 0
+    # replacing the server drops the user-wide rule with it; MCP cannot replace a server that has one
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb server-put "" apsrv /bin/true '[]' '{}' 0 annotations orch 1)
+    check "code-kb all-projects: MCP cannot replace a server with a human user-wide rule" "$out" "rc=-2 "
+    CNTCTR_DB="$db" "$BIN" _test-code-kb server-put "" apsrv /bin/true '[]' '{}' 0 annotations human 0 >/dev/null
+    same "code-kb all-projects: replacing the server dropped its user-wide rows" "$(sq "$db" "SELECT count(*) FROM code_grants WHERE project='*' AND reg_id='$reg_ap'")" 0
+
+    # 6. code_runs: UTF-8 boundary alignment, 64 KiB clamp, wrong project not-found, sweep -> expired, invisible to recall
+    local utf8_text="aé€😀z"
+    same "code-kb run-save utf8" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb run-save run1 "$projA" tester hash1 "$utf8_text" "log1" "call1" "den1" 1 3600)" "rc=0"
+    exp_json=$(CNTCTR_DB="$db" "$BIN" _test-code-kb run-expand "$projA" run1 result 0 2)
+    same "code-kb run-expand UTF-8 avoids splitting 2-byte char" "$(printf '%s' "$exp_json" | jq -r '.slice')" "a"
+    same "code-kb run-expand reports total_len and retained_capped" "$(printf '%s' "$exp_json" | jq -r '[.rc,.total_len,.retained_capped]|join(",")')" "0,11,1"
+    exp_json=$(CNTCTR_DB="$db" "$BIN" _test-code-kb run-expand "$projA" run1 result 1 4)
+    same "code-kb run-expand UTF-8 avoids splitting 3-byte char" "$(printf '%s' "$exp_json" | jq -r '.slice')" "é"
+    exp_json=$(CNTCTR_DB="$db" "$BIN" _test-code-kb run-expand "$projA" run1 result 3 6)
+    same "code-kb run-expand UTF-8 avoids splitting 4-byte emoji" "$(printf '%s' "$exp_json" | jq -r '.slice')" "€"
+    exp_json=$(CNTCTR_DB="$db" "$BIN" _test-code-kb run-expand "$projA" run1 result 6 5)
+    same "code-kb run-expand UTF-8 reads emoji+tail" "$(printf '%s' "$exp_json" | jq -r '.slice')" "😀z"
+
+    # 64 KiB clamp
+    python3 -c 'import sys; sys.stdout.write("X" * 70000)' | \
+        CNTCTR_DB="$db" "$BIN" _test-code-kb run-save runbig "$projA" tester hash2 "@stdin" "" "" "" 0 3600 >/dev/null
+    exp_json=$(CNTCTR_DB="$db" "$BIN" _test-code-kb run-expand "$projA" runbig result 0 100000)
+    same "code-kb run-expand clamps limit to 65536" "$(printf '%s' "$exp_json" | jq -r '[.rc,(.slice|length),.total_len]|join(",")')" "0,65536,70000"
+
+    # Wrong project returns not-found
+    exp_json=$(CNTCTR_DB="$db" "$BIN" _test-code-kb run-expand "$projB" run1 result 0 100)
+    same "code-kb run-expand wrong project returns not_found" "$(printf '%s' "$exp_json" | jq -r '.status')" "not_found"
+
+    # Sweep turns expand into expired
+    same "code-kb run-save short ttl" "$(CNTCTR_DB="$db" "$BIN" _test-code-kb run-save runexp "$projA" tester hash3 "SECRET_RUN_MARKER" "" "" "" 0 1)" "rc=0"
+    local future=$(( $(date +%s) + 100 ))
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb run-sweep "$future")
+    check "code-kb run-sweep sweeps expired run" "$out" "swept=1"
+    exp_json=$(CNTCTR_DB="$db" "$BIN" _test-code-kb run-expand "$projA" runexp result 0 100)
+    same "code-kb run-expand after sweep returns expired" "$(printf '%s' "$exp_json" | jq -r '.status')" "expired"
+
+    # recall returns nothing from code_* tables
+    out=$(cd "$d/projA" && CNTCTR_DB="$db" rpc "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"recall","arguments":{"query":"SECRET_RUN_MARKER"}}}' | tail -n 1)
+    refute "code-kb recall does not leak code_runs" "$(txt "$out")" "SECRET_RUN_MARKER"
+
+    # 7. Sol Phase 2 review fixes (CODE-KB-01 through CODE-KB-06)
+    # CODE-KB-01: interrupted grant scan must fail closed (deny), never allow from partial rows
+    local reg_r1
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb server-put "$projA" r1srv /bin/echo '[]' '{}' 0 annotations human 0)
+    reg_r1=$(printf '%s' "$out" | sed -n 's/.*reg_id=\([^ ]*\).*/\1/p')
+    CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$projA" "$reg_r1" r1srv "t1" access allow "read" human "seed" 0 >/dev/null
+    CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$projA" "$reg_r1" r1srv "t2" access allow "read" human "seed" 0 >/dev/null
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-check-interrupt "$projA" "$reg_r1" t1 read)
+    refute "code-kb CODE-KB-01 progress handler actually interrupted scan" "$out" "fired=0 "
+    check "code-kb CODE-KB-01 interrupted scan never allows from partial rows" "$out" "allowed_on_interrupt=0"
+
+    # CODE-KB-02: DB error during auth checks must roll back mutation, never treat error as absence
+    local reg_r2
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb server-put "$projA" r2srv /bin/echo '[]' '{}' 0 annotations human 0)
+    reg_r2=$(printf '%s' "$out" | sed -n 's/.*reg_id=\([^ ]*\).*/\1/p')
+    CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$projA" "$reg_r2" r2srv "hrule" access deny "" human "locked" 0 >/dev/null
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb auth-interrupt grant-put "$projA" "$reg_r2" r2srv "hrule")
+    refute "code-kb CODE-KB-02 grant-put interrupt fired" "$out" "fired=0 "
+    check "code-kb CODE-KB-02 grant-put never bypasses human rule on DB error" "$out" "bypassed=0"
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb auth-interrupt grant-del "$projA" "$reg_r2" "hrule")
+    refute "code-kb CODE-KB-02 grant-del interrupt fired" "$out" "fired=0 "
+    check "code-kb CODE-KB-02 grant-del never bypasses human rule on DB error" "$out" "bypassed=0"
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb auth-interrupt server-put-human "$projA" r2srv)
+    refute "code-kb CODE-KB-02 server-put-human interrupt fired" "$out" "fired=0 "
+    check "code-kb CODE-KB-02 server-put never bypasses human grant check on DB error" "$out" "bypassed=0"
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb auth-interrupt server-del-human "$projA" r2srv)
+    refute "code-kb CODE-KB-02 server-del-human interrupt fired" "$out" "fired=0 "
+    check "code-kb CODE-KB-02 server-del never bypasses human grant check on DB error" "$out" "bypassed=0"
+    CNTCTR_DB="$db" "$BIN" _test-code-kb server-put "" r2user /bin/echo '[]' '{}' 0 annotations human 0 >/dev/null
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb auth-interrupt server-shadow "$projA" r2user)
+    refute "code-kb CODE-KB-02 server-shadow interrupt fired" "$out" "fired=0 "
+    check "code-kb CODE-KB-02 server-put never bypasses user-shadowing check on DB error" "$out" "bypassed=0"
+
+    # CODE-KB-03: strongest matching human-set class acts as floor (more-specific non-human class cannot lower it)
+    local reg_r3
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb server-put "$projA" r3srv /bin/echo '[]' '{}' 0 annotations human 0)
+    reg_r3=$(printf '%s' "$out" | sed -n 's/.*reg_id=\([^ ]*\).*/\1/p')
+    CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$projA" "$reg_r3" r3srv "*" class "class:destructive" "" human "floor" 0 >/dev/null
+    CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$projA" "$reg_r3" r3srv "nuke" class "class:write" "" orch "try lower" 0 >/dev/null
+    CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$projA" "$reg_r3" r3srv "nuke" access allow "write" orch "allow write" 0 >/dev/null
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-check "$projA" "$reg_r3" nuke read)
+    check "code-kb CODE-KB-03 human class:destructive floor beats more-specific orch class:write" "$out" "rc=1 effective=destructive "
+
+    # CODE-KB-04: server list runs cli_admin_guard before git probe (both text and --json modes)
+    mkdir -p "$d/fakegit"
+    cat > "$d/fakegit/git" <<EOF
+#!/bin/sh
+: > "$d/git_probed"
+exit 1
+EOF
+    chmod +x "$d/fakegit/git"
+    rm -f "$d/git_probed"
+    out=$(PATH="$d/fakegit:$PATH" CNTCTR_DB="$db" CNTCTR_TEST_ANCESTOR_STOP_PID=$$ CNTCTR_ROOT="$d" env -u TMUX_PANE -u CNTCTR_PANE \
+        "$BIN" code server list 2>&1); rc=$?
+    same "code-kb CODE-KB-04 server list refuses under CNTCTR_ROOT" "$((rc != 0))" 1
+    check "code-kb CODE-KB-04 server list names guard check" "$out" "CNTCTR_ROOT"
+    same "code-kb CODE-KB-04 server list refused before git probe" "$([ -e "$d/git_probed" ] && echo 1 || echo 0)" 0
+    out=$(PATH="$d/fakegit:$PATH" CNTCTR_DB="$db" CNTCTR_TEST_ANCESTOR_STOP_PID=$$ CNTCTR_ROOT="$d" env -u TMUX_PANE -u CNTCTR_PANE \
+        "$BIN" code server list --json 2>&1); rc=$?
+    same "code-kb CODE-KB-04 server list --json refuses under CNTCTR_ROOT" "$((rc != 0))" 1
+    check "code-kb CODE-KB-04 server list --json names guard check" "$out" "CNTCTR_ROOT"
+    same "code-kb CODE-KB-04 server list --json refused before git probe" "$([ -e "$d/git_probed" ] && echo 1 || echo 0)" 0
+
+    # CODE-KB-05: reject overlong scope_project instead of silently truncating
+    local long_scope
+    long_scope=$(python3 -c 'print("/" + "a" * 5000)')
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb server-put "$long_scope" oversrv /bin/echo '[]' '{}' 0 annotations human 0 2>&1); rc=$?
+    same "code-kb CODE-KB-05 overlong scope_project rejected" "$((rc != 0))" 1
+    same "code-kb CODE-KB-05 no truncated oversrv row stored" "$(sq "$db" "SELECT count(*) FROM code_servers WHERE name='oversrv'")" 0
+
+    # CODE-KB-06: server remove supports '--' so names starting with '-' are removable
+    out=$(CNTCTR_DB="$db" CNTCTR_TEST_ANCESTOR_STOP_PID=$$ env -u TMUX_PANE -u CNTCTR_PANE -u CNTCTR_ROOT \
+        "$BIN" code server add -dashsrv --cmd /bin/echo 2>&1); rc=$?
+    same "code-kb CODE-KB-06 server add accepts leading-dash name" "$rc" 0
+    out=$(CNTCTR_DB="$db" CNTCTR_TEST_ANCESTOR_STOP_PID=$$ env -u TMUX_PANE -u CNTCTR_PANE -u CNTCTR_ROOT \
+        "$BIN" code server remove -- -dashsrv 2>&1); rc=$?
+    same "code-kb CODE-KB-06 server remove -- removes leading-dash name" "$rc" 0
+    same "code-kb CODE-KB-06 leading-dash server actually removed" "$(sq "$db" "SELECT count(*) FROM code_servers WHERE name='-dashsrv'")" 0
+}
+if [ "${ONLY:-}" = code-kb ]; then
+    code_kb_run
+    printf '%d passed, %d failed\n' "$pass" "$fail"
+    [ "$fail" -eq 0 ]; exit $?
+fi
+
+# ---- Code Mode Phase 3: QuickJS runner, tri-state schema validator, refcounted bridge ----
+code_js_run() {
+    local d="$TMPD/code_js" db proj proj_q reg_mock reg_lazy out
+    mkdir -p "$d/proj" "$d/proj's dir"
+    db="$d/code.db"
+    proj=$(CNTCTR_DB="$db" "$BIN" _test-code-kb resolve-cwd "$d/proj")
+    proj_q=$(CNTCTR_DB="$db" "$BIN" _test-code-kb resolve-cwd "$d/proj's dir")
+    reg_mock="reg-mock"
+    reg_lazy="reg-lazy"
+
+    # Seed grants for $proj: mock.* read, lazy.* read
+    CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$proj" "$reg_mock" mock "*" access read "" human "seed" 0 >/dev/null
+    CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$proj" "$reg_lazy" lazy "*" access read "" human "seed" 0 >/dev/null
+    CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put "$proj" "$reg_lazy" lazy "blocked*" access deny "" human "seed deny" 0 >/dev/null
+
+    # Helper to run a JSON spec through _test-code-js run
+    _js_run() {
+        CNTCTR_DB="$db" "$BIN" _test-code-js run
+    }
+
+    # 1. Basic async script: omitted args default to {}, explicit args, unwrapped JSON, console.log, calls
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg,
+        script: "console.log(\"hello\", 42); const a = await tools.mock.fast(); const b = await tools.mock.fast({q:\"hi\"}); return {a, b};"
+    }' | _js_run)
+    same "code-js basic script succeeds" "$(printf '%s' "$out" | jq -r '.is_error')" 0
+    same "code-js omitted args defaults to {}" "$(printf '%s' "$out" | jq -r '.result | fromjson | .a.echo | length')" 0
+    same "code-js explicit args unwrapped JSON" "$(printf '%s' "$out" | jq -r '.result | fromjson | .b.echo.q')" "hi"
+    check "code-js captures console.log" "$(printf '%s' "$out" | jq -r '.logs')" "hello 42"
+    check "code-js records calls" "$(printf '%s' "$out" | jq -r '.calls')" "mock.fast read "
+
+    # 2. Sandbox isolation
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg,
+        script: "return {req: typeof require, proc: typeof process, f: typeof fetch, s: typeof std, o: typeof os};"
+    }' | _js_run)
+    same "code-js sandbox ok" "$(printf '%s' "$out" | jq -r '.is_error')" 0
+    same "code-js typeof require/process/fetch/std/os undefined" \
+        "$(printf '%s' "$out" | jq -r '.result | fromjson | [.req,.proc,.f,.s,.o] | join(",")')" \
+        "undefined,undefined,undefined,undefined,undefined"
+
+    # 3. Promise.all concurrency via barrier (no timing threshold)
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg, barrier_n: 3, wall_sec: 10,
+        script: "const res = await Promise.all([tools.mock.barrier_tool({}), tools.mock.barrier_tool({}), tools.mock.barrier_tool({})]); return res.length;"
+    }' | _js_run)
+    same "code-js Promise.all barrier resolves" "$(printf '%s' "$out" | jq -r '.is_error')" 0
+    same "code-js Promise.all barrier result length 3" "$(printf '%s' "$out" | jq -r '.result')" "3"
+    same "code-js Promise.all barrier peak_inflight == 3" "$(printf '%s' "$out" | jq -r '.peak_inflight')" 3
+
+    # 4. In-flight & queue caps
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg, max_inflight: 4, wall_sec: 10,
+        script: "const ps = []; for (let i = 0; i < 20; i++) ps.push(tools.mock.slow_3000ms({})); await Promise.all(ps);"
+    }' | _js_run)
+    same "code-js max_inflight fanout fails" "$(printf '%s' "$out" | jq -r '.is_error')" 1
+    check "code-js max_inflight names CNTCTR_CODE_MAX_INFLIGHT" "$(printf '%s' "$out" | jq -r '.result')" "CNTCTR_CODE_MAX_INFLIGHT"
+
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg, max_queue_bytes: 1024, wall_sec: 10,
+        script: "await tools.mock.fast({q: \"x\".repeat(4096)});"
+    }' | _js_run)
+    same "code-js max_queue_bytes rejects large args" "$(printf '%s' "$out" | jq -r '.is_error')" 1
+    check "code-js max_queue_bytes names CNTCTR_CODE_MAX_QUEUE_BYTES" "$(printf '%s' "$out" | jq -r '.result')" "CNTCTR_CODE_MAX_QUEUE_BYTES"
+
+    # 5. CPU budget via CLOCK_THREAD_CPUTIME_ID
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg, cpu_sec: 1, wall_sec: 10,
+        script: "while (true) {}"
+    }' | _js_run)
+    same "code-js CPU spin fails" "$(printf '%s' "$out" | jq -r '.is_error')" 1
+    check "code-js CPU spin names CNTCTR_CODE_CPU_SEC" "$(printf '%s' "$out" | jq -r '.result')" "CNTCTR_CODE_CPU_SEC"
+
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg, cpu_sec: 1, wall_sec: 5,
+        script: "return await tools.mock.slow_1500ms({});"
+    }' | _js_run)
+    same "code-js slow_1500ms with cpu_sec=1 wall_sec=5 succeeds" "$(printf '%s' "$out" | jq -r '.is_error')" 0
+
+    # 6. Wall limit + microtask job-loop check
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg, cpu_sec: 10, wall_sec: 1,
+        script: "return await tools.mock.slow_3000ms({});"
+    }' | _js_run)
+    same "code-js slow_3000ms with wall_sec=1 fails" "$(printf '%s' "$out" | jq -r '.is_error')" 1
+    check "code-js wall timeout names CNTCTR_CODE_WALL_SEC" "$(printf '%s' "$out" | jq -r '.result')" "CNTCTR_CODE_WALL_SEC"
+
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg, cpu_sec: 10, wall_sec: 1,
+        script: "function spin(){ Promise.resolve().then(spin); } spin(); await new Promise(() => {});"
+    }' | _js_run)
+    same "code-js microtask spin hits wall limit" "$(printf '%s' "$out" | jq -r '.is_error')" 1
+    check "code-js microtask spin names CNTCTR_CODE_WALL_SEC" "$(printf '%s' "$out" | jq -r '.result')" "CNTCTR_CODE_WALL_SEC"
+
+    # 7. Per-call timeout (catchable)
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg, call_sec: 1, wall_sec: 5,
+        script: "try { await tools.mock.slow_3000ms({}); return \"no\"; } catch (e) { return {caught: e.message}; }"
+    }' | _js_run)
+    same "code-js per-call timeout is catchable" "$(printf '%s' "$out" | jq -r '.is_error')" 0
+    check "code-js per-call timeout names CNTCTR_CODE_CALL_SEC" "$(printf '%s' "$out" | jq -r '.result | fromjson | .caught')" "CNTCTR_CODE_CALL_SEC"
+
+    # 8. Review Focus #2: native stack, memory limit, hostile JS, late completion & cancel races
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg, max_stack_bytes: 1048576,
+        script: "function rec(n){ return rec(n+1) + 1; } return rec(0);"
+    }' | _js_run)
+    same "code-js infinite recursion fails cleanly without SIGSEGV" "$(printf '%s' "$out" | jq -r '.is_error')" 1
+    check "code-js infinite recursion mentions stack" "$(printf '%s' "$out" | jq -r '.result')" "stack"
+
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg, max_mb: 4,
+        script: "let a=[]; for(;;) a.push(new Array(10000));"
+    }' | _js_run)
+    same "code-js memory limit fails" "$(printf '%s' "$out" | jq -r '.is_error')" 1
+    check "code-js memory limit names CNTCTR_CODE_MAX_MB" "$(printf '%s' "$out" | jq -r '.result')" "CNTCTR_CODE_MAX_MB"
+    check "code-js memory limit reports usage" "$(printf '%s' "$out" | jq -r '.result')" "bytes"
+
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg,
+        script: "Object.prototype.toString = () => { throw 1; }; console.log({a:1}); throw new Error(\"boom\");"
+    }' | _js_run)
+    same "code-js hostile Object.prototype.toString fails cleanly" "$(printf '%s' "$out" | jq -r '.is_error')" 1
+
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg,
+        script: "const a = {}; a.self = a; await tools.mock.fast(a);"
+    }' | _js_run)
+    same "code-js circular object arg fails cleanly" "$(printf '%s' "$out" | jq -r '.is_error')" 1
+
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg,
+        script: "await tools.mock.fast({n: BigInt(1)});"
+    }' | _js_run)
+    same "code-js BigInt arg fails cleanly" "$(printf '%s' "$out" | jq -r '.is_error')" 1
+
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg,
+        script: "await tools.mock.fast({q: \"a\\u0000b\"});"
+    }' | _js_run)
+    same "code-js NUL string value arg fails cleanly" "$(printf '%s' "$out" | jq -r '.is_error')" 1
+    check "code-js NUL arg mentions NUL" "$(printf '%s' "$out" | jq -r '.result')" "NUL"
+
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg,
+        script: "await tools.mock.fast({\"a\\u0000b\": \"x\"});"
+    }' | _js_run)
+    same "code-js NUL object key arg fails cleanly" "$(printf '%s' "$out" | jq -r '.is_error')" 1
+
+    # Late completion after wall_sec=1 (mock sleeps 1500ms, test waits 2000ms for detached completion under ASan)
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg, wall_sec: 1, wait_late_ms: 2000,
+        script: "return await tools.mock.slow_1500ms({});"
+    }' | _js_run)
+    same "code-js late completion run times out cleanly" "$(printf '%s' "$out" | jq -r '.is_error')" 1
+    check "code-js late completion names CNTCTR_CODE_WALL_SEC" "$(printf '%s' "$out" | jq -r '.result')" "CNTCTR_CODE_WALL_SEC"
+    same "code-js late completion callback ran after detach without UAF" \
+        "$(printf '%s' "$out" | jq -r 'if .late_completions >= 1 then 1 else 0 end')" 1
+
+    # Unawaited call triggers cancel_call on run exit
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg, wall_sec: 5,
+        script: "tools.mock.slow_3000ms({}); return \"done\";"
+    }' | _js_run)
+    same "code-js unawaited call script returns cleanly" "$(printf '%s' "$out" | jq -r '.is_error')" 0
+    same "code-js unawaited call triggered cancel_call" \
+        "$(printf '%s' "$out" | jq -r 'if .cancel_count >= 1 then 1 else 0 end')" 1
+
+    # External code_run_cancel_signal wakes promptly with zero UAF
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg, wall_sec: 10, cancel_after_ms: 200,
+        script: "return await tools.mock.slow_3000ms({});"
+    }' | _js_run)
+    same "code-js external cancel fails run" "$(printf '%s' "$out" | jq -r '.is_error')" 1
+    check "code-js external cancel reports reason" "$(printf '%s' "$out" | jq -r '.result')" "test cancel"
+    same "code-js external cancel woke promptly (<2000ms)" \
+        "$(printf '%s' "$out" | jq -r 'if .elapsed_ms < 2000 then 1 else 0 end')" 1
+    same "code-js external cancel invoked cancel_call" \
+        "$(printf '%s' "$out" | jq -r 'if .cancel_count >= 1 then 1 else 0 end')" 1
+
+    # 9. Tri-state C schema validator
+    out=$("$BIN" _test-code-js schema '{"type":"object","properties":{"q":{"type":"string"}}}' '{"q":123}')
+    same "code-js schema wrong type rejects" "$(printf '%s' "$out" | jq -r '.validate')" 1
+    check "code-js schema wrong type names field q" "$(printf '%s' "$out" | jq -r '.err')" "q"
+
+    out=$("$BIN" _test-code-js schema '{"type":"object","required":["name"],"properties":{"name":{"type":"string"}}}' '{}')
+    same "code-js schema missing required rejects" "$(printf '%s' "$out" | jq -r '.validate')" 1
+    check "code-js schema missing required names field name" "$(printf '%s' "$out" | jq -r '.err')" "name"
+
+    out=$("$BIN" _test-code-js schema '{"type":"object","properties":{"mode":{"enum":["a","b"]}}}' '{"mode":"c"}')
+    same "code-js schema bad enum rejects" "$(printf '%s' "$out" | jq -r '.validate')" 1
+    check "code-js schema bad enum names field mode" "$(printf '%s' "$out" | jq -r '.err')" "mode"
+
+    out=$("$BIN" _test-code-js schema '{"type":"object","properties":{"nested":{"type":"object","required":["id"],"properties":{"id":{"type":"integer"}}}}}' '{"nested":{"id":"nope"}}')
+    same "code-js schema nested error rejects" "$(printf '%s' "$out" | jq -r '.validate')" 1
+    check "code-js schema nested error names nested.id" "$(printf '%s' "$out" | jq -r '.err')" "nested.id"
+
+    out=$("$BIN" _test-code-js schema '{"type":"object","x-custom":1,"properties":{"x":{"type":"string"}}}' '{"x":"ok"}')
+    same "code-js schema top-level unknown keyword evaluates INDETERMINATE" "$(printf '%s' "$out" | jq -r '.eval')" 2
+    same "code-js schema top-level unknown keyword passes" "$(printf '%s' "$out" | jq -r '.validate')" 0
+
+    out=$("$BIN" _test-code-js schema '{"oneOf":[{"type":"object"},{"properties":{"a":{"type":"integer"}}},{"x-custom":1}]}' '{"a":1}')
+    same "code-js schema oneOf 2 VALID + 1 INDETERMINATE rejects" "$(printf '%s' "$out" | jq -r '.eval')" 1
+    same "code-js schema oneOf 2 VALID + 1 INDETERMINATE validate=1" "$(printf '%s' "$out" | jq -r '.validate')" 1
+
+    out=$("$BIN" _test-code-js schema '{"allOf":[{"required":["must_have"]},{"x-custom":1}]}' '{}')
+    same "code-js schema allOf 1 INVALID + 1 INDETERMINATE rejects" "$(printf '%s' "$out" | jq -r '.eval')" 1
+    same "code-js schema allOf 1 INVALID + 1 INDETERMINATE validate=1" "$(printf '%s' "$out" | jq -r '.validate')" 1
+
+    out=$("$BIN" _test-code-js schema '{"anyOf":[{"required":["must_have"]},{"x-custom":1}]}' '{}')
+    same "code-js schema anyOf 1 INVALID + 1 INDETERMINATE indeterminate" "$(printf '%s' "$out" | jq -r '.eval')" 2
+    same "code-js schema anyOf 1 INVALID + 1 INDETERMINATE passes" "$(printf '%s' "$out" | jq -r '.validate')" 0
+
+    out=$("$BIN" _test-code-js schema '{"$defs":{"id":{"type":"integer"}},"type":"object","properties":{"x":{"$ref":"#/$defs/id"}}}' '{"x":"bad"}')
+    same 'code-js schema local $defs $ref rejects bad type' "$(printf '%s' "$out" | jq -r '.validate')" 1
+    check 'code-js schema local $defs $ref names field x' "$(printf '%s' "$out" | jq -r '.err')" "x"
+
+    out=$("$BIN" _test-code-js schema '{"$defs":{"loop":{"$ref":"#/$defs/loop"}},"$ref":"#/$defs/loop"}' '{}')
+    same 'code-js schema cyclic $ref depth cap returns INDETERMINATE' "$(printf '%s' "$out" | jq -r '.eval')" 2
+    same 'code-js schema cyclic $ref fails open cleanly' "$(printf '%s' "$out" | jq -r '.validate')" 0
+
+    # Schema rejection via JS bridge names field before dispatching
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg,
+        script: "await tools.mock.fast({nested: {id: \"not-an-int\"}});"
+    }' | _js_run)
+    same "code-js bridge schema violation rejects" "$(printf '%s' "$out" | jq -r '.is_error')" 1
+    check "code-js bridge schema violation names nested.id" "$(printf '%s' "$out" | jq -r '.result')" "nested.id"
+
+    # 10. Mistyped tool name, denials with shell-quoted commands, CODE_CALL_DENIED, scope, lazy gate
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg,
+        script: "await tools.mock.fsat({});"
+    }' | _js_run)
+    same "code-js mistyped tool fails" "$(printf '%s' "$out" | jq -r '.is_error')" 1
+    check "code-js mistyped tool suggests fast" "$(printf '%s' "$out" | jq -r '.result')" "fast"
+
+    # Read denial on ungranted project with apostrophe in path
+    out=$(jq -nc --arg db "$db" --arg proj "$proj_q" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg,
+        script: "await tools.mock.fast({});"
+    }' | _js_run)
+    same "code-js read denial fails" "$(printf '%s' "$out" | jq -r '.is_error')" 1
+    local q_proj_q
+    q_proj_q=$(CNTCTR_DB="$db" "$BIN" _test-code-kb shell-quote "$proj_q")
+    check "code-js read denial suggests shell-quoted grant mock.* read" \
+        "$(printf '%s' "$out" | jq -r '.denied')" "cd ${q_proj_q} && cntctr code grant 'mock.*' read"
+
+    # Write denial on project with only mock.* read
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg,
+        script: "await tools.mock.write_tool({name:\"x\"});"
+    }' | _js_run)
+    same "code-js write denial fails" "$(printf '%s' "$out" | jq -r '.is_error')" 1
+    local q_proj
+    q_proj=$(CNTCTR_DB="$db" "$BIN" _test-code-kb shell-quote "$proj")
+    check "code-js write denial suggests shell-quoted grant mock.write_tool allow" \
+        "$(printf '%s' "$out" | jq -r '.denied')" "cd ${q_proj} && cntctr code grant 'mock.write_tool' allow"
+    check "code-js write denial recorded in calls" "$(printf '%s' "$out" | jq -r '.calls')" "mock.write_tool write "
+
+    # CODE_CALL_DENIED from async dispatcher records in denied and calls
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg,
+        script: "try { await tools.mock.async_denied({}); return \"no\"; } catch (e) { return {caught: e.message}; }"
+    }' | _js_run)
+    same "code-js async CODE_CALL_DENIED is catchable" "$(printf '%s' "$out" | jq -r '.is_error')" 0
+    check "code-js async CODE_CALL_DENIED recorded in denied" "$(printf '%s' "$out" | jq -r '.denied')" "mock.async_denied"
+    check "code-js async CODE_CALL_DENIED recorded in calls" "$(printf '%s' "$out" | jq -r '.calls')" "mock.async_denied"
+
+    # scope only narrows
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg, scope: ["mock.fast", "mock.write_tool"],
+        script: "const r = {}; r.ok = (await tools.mock.fast({})).ok; try { await tools.mock.barrier_tool({}); } catch(e) { r.narrow = e.message; } try { await tools.mock.write_tool({name:\"a\"}); } catch(e) { r.still_denied = e.message; } return r;"
+    }' | _js_run)
+    same "code-js scope narrows cleanly" "$(printf '%s' "$out" | jq -r '.is_error')" 0
+    same "code-js scope permits in-scope granted tool" "$(printf '%s' "$out" | jq -r '.result | fromjson | .ok')" true
+    check "code-js scope blocks out-of-scope granted tool" "$(printf '%s' "$out" | jq -r '.result | fromjson | .narrow')" "scope"
+    check "code-js scope cannot widen ungranted write tool" "$(printf '%s' "$out" | jq -r '.result | fromjson | .still_denied')" "grant"
+
+    # Uncatalogued server lazy discovery respects scope & deny before dispatching (Sol R3-03)
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" --arg lreg "$reg_lazy" '{
+        db: $db, project: $proj, reg_id: $reg, uncat_reg_id: $lreg, scope: ["mock.*"],
+        script: "try { await tools.lazy.ping({}); } catch(e) { return e.message; }"
+    }' | _js_run)
+    same "code-js uncatalogued scope-excluded does not dispatch" "$(printf '%s' "$out" | jq -r '.lazy_dispatches')" 0
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" --arg lreg "$reg_lazy" '{
+        db: $db, project: $proj, reg_id: $reg, uncat_reg_id: $lreg,
+        script: "try { await tools.lazy.blocked_op({}); } catch(e) { return e.message; }"
+    }' | _js_run)
+    same "code-js uncatalogued deny-matched does not dispatch" "$(printf '%s' "$out" | jq -r '.lazy_dispatches')" 0
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" --arg lreg "$reg_lazy" '{
+        db: $db, project: $proj, reg_id: $reg, uncat_reg_id: $lreg,
+        script: "return await tools.lazy.ping({});"
+    }' | _js_run)
+    same "code-js uncatalogued granted & permitted dispatches lazily" "$(printf '%s' "$out" | jq -r '.lazy_dispatches')" 1
+    same "code-js uncatalogued lazy dispatch succeeds" "$(printf '%s' "$out" | jq -r '.is_error')" 0
+
+    # 11. C-side buffer caps & all 4 previews with offset= expand hints
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg, result_cap_bytes: 512, calls_preview_bytes: 512, max_log_bytes: 1048576,
+        script: "const line = \"L\".repeat(1000); for (let i = 0; i < 2200; i++) console.log(line); for (let i = 0; i < 30; i++) { await tools.mock.fast({}); try { await tools.mock.write_tool({name:\"a\"}); } catch(e) {} } return \"R\".repeat(2000);"
+    }' | _js_run)
+    same "code-js buffer cap test succeeds" "$(printf '%s' "$out" | jq -r '.is_error')" 0
+    same "code-js 2 MiB log loop sets retained_capped=1" "$(printf '%s' "$out" | jq -r '.retained_capped')" 1
+    same "code-js retained logs capped at <= 1 MiB" \
+        "$(printf '%s' "$out" | jq -r 'if (.logs | length) <= 1048576 then 1 else 0 end')" 1
+    check "code-js retained logs mentions dropped lines" "$(printf '%s' "$out" | jq -r '.logs')" "log lines dropped"
+    check "code-js result_preview has offset=" "$(printf '%s' "$out" | jq -r '.result_preview')" "offset="
+    check "code-js logs_preview has offset=" "$(printf '%s' "$out" | jq -r '.logs_preview')" "offset="
+    check "code-js calls_preview has offset=" "$(printf '%s' "$out" | jq -r '.calls_preview')" "offset="
+    check "code-js denied_preview has offset=" "$(printf '%s' "$out" | jq -r '.denied_preview')" "offset="
+    same "code-js all 4 previews are bounded" \
+        "$(printf '%s' "$out" | jq -r 'if (.result_preview|length) <= 600 and (.logs_preview|length) <= 600 and (.calls_preview|length) <= 600 and (.denied_preview|length) <= 600 then 1 else 0 end')" 1
+
+    # ---- Phase 3 review fixes (CODE-JS-02 through CODE-JS-09) ----
+    # CODE-JS-02: reentrant toJSON() inflating queued_bytes past max_queue_bytes must be rejected before dispatch
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg, max_queue_bytes: 1024, wall_sec: 10,
+        script: "const arg = { toJSON() { tools.mock.slow_3000ms({q: \"a\".repeat(700)}); return {q: \"b\".repeat(700)}; } }; try { await tools.mock.fast(arg); return \"dispatched\"; } catch(e) { return {caught: e.message}; }"
+    }' | _js_run)
+    same "code-js CODE-JS-02 reentrant toJSON queued_bytes rechecked" "$(printf '%s' "$out" | jq -r '.is_error')" 0
+    check "code-js CODE-JS-02 reentrant overflow names CNTCTR_CODE_MAX_QUEUE_BYTES" \
+        "$(printf '%s' "$out" | jq -r '.result | fromjson | .caught // ""')" "CNTCTR_CODE_MAX_QUEUE_BYTES"
+
+    # CODE-JS-03: console.log renders incrementally within remaining budget and stops when exhausted
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg, max_log_bytes: 256,
+        script: "let side = 0; const bomb = { toJSON() { side++; return \"z\"; } }; console.log(\"x\".repeat(1024), bomb); console.log(bomb); return {side};"
+    }' | _js_run)
+    same "code-js CODE-JS-03 console.log incremental budget succeeds" "$(printf '%s' "$out" | jq -r '.is_error')" 0
+    same "code-js CODE-JS-03 console.log stops rendering once budget exhausted" \
+        "$(printf '%s' "$out" | jq -r '.result | fromjson | .side')" 0
+    same "code-js CODE-JS-03 console.log sets retained_capped=1" "$(printf '%s' "$out" | jq -r '.retained_capped')" 1
+    check "code-js CODE-JS-03 console.log counts both dropped lines" "$(printf '%s' "$out" | jq -r '.logs')" "2 log lines dropped"
+
+    # CODE-JS-04: schema validator work budget bounds wide branching DAG (within depth 16) and skips unsafe backtracking regex
+    local dag_schema
+    dag_schema=$(python3 -c '
+import json
+defs = {
+    "d0": {"allOf": [{"$ref": "#/$defs/d1"}] * 16},
+    "d1": {"allOf": [{"$ref": "#/$defs/d2"}] * 16},
+    "d2": {"allOf": [{"$ref": "#/$defs/d3"}] * 16},
+    "d3": {"allOf": [{"$ref": "#/$defs/d4"}] * 16},
+    "d4": {"type": "object"}
+}
+print(json.dumps({"$defs": defs, "$ref": "#/$defs/d0"}))
+')
+    out=$("$BIN" _test-code-js schema "$dag_schema" '{}')
+    same "code-js CODE-JS-04 wide DAG within depth cap hits work budget -> INDETERMINATE" "$(printf '%s' "$out" | jq -r '.eval')" 2
+    same "code-js CODE-JS-04 wide DAG fails open cleanly" "$(printf '%s' "$out" | jq -r '.validate')" 0
+
+    local redos_args
+    redos_args=$(python3 -c 'import json; print(json.dumps({"q": "a"*30 + "!"}))')
+    out=$("$BIN" _test-code-js schema '{"type":"object","properties":{"q":{"type":"string","pattern":"^(a+)+$"}}}' "$redos_args")
+    same "code-js CODE-JS-04 unsafe nested-quantifier regex skipped -> INDETERMINATE" "$(printf '%s' "$out" | jq -r '.eval')" 2
+    same "code-js CODE-JS-04 unsafe regex fails open cleanly" "$(printf '%s' "$out" | jq -r '.validate')" 0
+
+    # CODE-JS-04 + CODE-JS-02: expired wall deadline during arg serialization stops before dispatch
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" --argjson fs "$dag_schema" '{
+        db: $db, project: $proj, reg_id: $reg, wall_sec: 1, cpu_sec: 5, fast_schema: $fs,
+        script: "const arg = { toJSON() { const t0 = Date.now(); while (Date.now() - t0 < 1200) {} return {}; } }; await tools.mock.fast(arg);"
+    }' | _js_run)
+    same "code-js CODE-JS-04 expired run aborts before dispatch" "$(printf '%s' "$out" | jq -r '.is_error')" 1
+    check "code-js CODE-JS-04 expired run names CNTCTR_CODE_WALL_SEC" "$(printf '%s' "$out" | jq -r '.result')" "CNTCTR_CODE_WALL_SEC"
+    same "code-js CODE-JS-04 expired run never dispatches tool" "$(printf '%s' "$out" | jq -r '.fast_dispatches')" 0
+
+    # CODE-JS-05: completion delivered after call deadline must time out rather than resolve as success
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg, call_sec: 1, cpu_sec: 5, wall_sec: 10,
+        script: "const p = tools.mock.slow_1500ms({}); const t0 = Date.now(); while (Date.now() - t0 < 2300) {} try { await p; return \"resolved\"; } catch(e) { return {caught: e.message}; }"
+    }' | _js_run)
+    same "code-js CODE-JS-05 late completion past call_sec is catchably rejected" "$(printf '%s' "$out" | jq -r '.is_error')" 0
+    check "code-js CODE-JS-05 late completion names CNTCTR_CODE_CALL_SEC" \
+        "$(printf '%s' "$out" | jq -r '.result | fromjson | .caught // ""')" "CNTCTR_CODE_CALL_SEC"
+
+    # CODE-JS-06: small preview caps strictly bound total rendered preview length
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg, result_cap_bytes: 8, calls_preview_bytes: 8,
+        script: "await tools.mock.fast({}); return \"0123456789abcdef\";"
+    }' | _js_run)
+    same "code-js CODE-JS-06 cap=8 result_preview strictly <= 8 bytes" \
+        "$(printf '%s' "$out" | jq -r 'if (.result_preview|length) <= 8 then 1 else 0 end')" 1
+    same "code-js CODE-JS-06 cap=8 calls_preview strictly <= 8 bytes" \
+        "$(printf '%s' "$out" | jq -r 'if (.calls_preview|length) <= 8 then 1 else 0 end')" 1
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg, result_cap_bytes: 32,
+        script: "return \"0123456789abcdef0123456789abcdef0123456789abcdef\";"
+    }' | _js_run)
+    same "code-js CODE-JS-06 cap=32 result_preview strictly <= 32 bytes" \
+        "$(printf '%s' "$out" | jq -r 'if (.result_preview|length) <= 32 then 1 else 0 end')" 1
+    check "code-js CODE-JS-06 cap=32 result_preview keeps compact offset=" "$(printf '%s' "$out" | jq -r '.result_preview')" "offset="
+
+    # CODE-JS-07: exact integer comparisons beyond 2^53
+    out=$("$BIN" _test-code-js schema '{"type":"integer","maximum":9007199254740992}' '9007199254740993')
+    same "code-js CODE-JS-07 maximum 2^53 rejects 2^53+1" "$(printf '%s' "$out" | jq -r '.validate')" 1
+    out=$("$BIN" _test-code-js schema '{"type":"integer","maximum":9007199254740992}' '9007199254740992')
+    same "code-js CODE-JS-07 maximum 2^53 accepts 2^53" "$(printf '%s' "$out" | jq -r '.validate')" 0
+    out=$("$BIN" _test-code-js schema '{"const":9007199254740992}' '9007199254740993')
+    same "code-js CODE-JS-07 const 2^53 rejects 2^53+1" "$(printf '%s' "$out" | jq -r '.validate')" 1
+    out=$("$BIN" _test-code-js schema '{"type":"integer","multipleOf":2}' '9007199254740993')
+    same "code-js CODE-JS-07 multipleOf 2 rejects 2^53+1" "$(printf '%s' "$out" | jq -r '.validate')" 1
+
+    # CODE-JS-08: RFC 6901 section 6 percent-decoding in local $ref fragments
+    out=$("$BIN" _test-code-js schema '{"$defs":{"my type":{"type":"integer"}},"type":"object","properties":{"x":{"$ref":"#/$defs/my%20type"}}}' '{"x":"bad"}')
+    same 'code-js CODE-JS-08 percent-encoded $ref rejects bad type' "$(printf '%s' "$out" | jq -r '.eval')" 1
+    same 'code-js CODE-JS-08 percent-encoded $ref validate=1' "$(printf '%s' "$out" | jq -r '.validate')" 1
+    out=$("$BIN" _test-code-js schema '{"$defs":{"my type":{"type":"integer"}},"type":"object","properties":{"x":{"$ref":"#/$defs/my%20type"}}}' '{"x":42}')
+    same 'code-js CODE-JS-08 percent-encoded $ref accepts valid int' "$(printf '%s' "$out" | jq -r '.eval')" 0
+
+    # CODE-JS-09: SQLite busy wait must honor external cancellation promptly (exclusive lock blocks reader)
+    rm -f "$d/lock_ready" "$d/lock_stop"
+    python3 -c '
+import sqlite3, sys, time, os
+conn = sqlite3.connect(sys.argv[1], isolation_level=None)
+conn.execute("PRAGMA locking_mode = EXCLUSIVE")
+conn.execute("BEGIN EXCLUSIVE")
+conn.execute("INSERT OR REPLACE INTO meta(k,v) VALUES(\"_test_lock\",\"1\")")
+open(sys.argv[2], "w").close()
+t0 = time.monotonic()
+while not os.path.exists(sys.argv[3]) and time.monotonic() - t0 < 6.0:
+    time.sleep(0.05)
+conn.execute("ROLLBACK")
+conn.execute("PRAGMA locking_mode = NORMAL")
+conn.execute("SELECT 1 FROM meta LIMIT 1")
+conn.close()
+' "$db" "$d/lock_ready" "$d/lock_stop" &
+    local lock_pid=$!
+    for _ in $(seq 100); do [ -f "$d/lock_ready" ] && break; sleep 0.02; done
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg, wall_sec: 10, cancel_after_ms: 200,
+        script: "await tools.mock.fast({}); return \"ok\";"
+    }' | _js_run)
+    : > "$d/lock_stop"
+    wait "$lock_pid" 2>/dev/null || true
+    same "code-js CODE-JS-09 cancel wakes SQLite busy wait promptly (<1500ms)" \
+        "$(printf '%s' "$out" | jq -r 'if .elapsed_ms < 1500 then 1 else 0 end')" 1
+    same "code-js CODE-JS-09 cancelled busy wait fails run" "$(printf '%s' "$out" | jq -r '.is_error')" 1
+    check "code-js CODE-JS-09 cancelled busy wait reports reason" "$(printf '%s' "$out" | jq -r '.result')" "test cancel"
+
+    # ---- Phase 3 round 2 review fixes (CODE-JS-03/04/05/07/10/11) ----
+    # CODE-JS-03: Error args in console.log read name/message incrementally within budget (never read message if name overflows)
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg, max_log_bytes: 256,
+        script: "let msg_read = 0; const e = new Error(\"init\"); e.name = \"N\".repeat(512); Object.defineProperty(e, \"message\", { get() { msg_read++; return \"M\".repeat(512); } }); console.log(e); return {msg_read};"
+    }' | _js_run)
+    same "code-js CODE-JS-03r2 Error oversized name stops before reading message" \
+        "$(printf '%s' "$out" | jq -r '.result | fromjson | .msg_read')" 0
+    same "code-js CODE-JS-03r2 Error oversized name sets retained_capped=1" \
+        "$(printf '%s' "$out" | jq -r '.retained_capped')" 1
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg,
+        script: "console.log(new TypeError(\"boom\")); console.log(new Error(\"\")); return \"ok\";"
+    }' | _js_run)
+    check "code-js CODE-JS-03r2 normal Error formatting preserves Name: message" \
+        "$(printf '%s' "$out" | jq -r '.logs')" "TypeError: boom"
+
+    # CODE-JS-04: pattern always yields INDETERMINATE (fail-open; no POSIX/ECMAScript mismatch); other keywords still reject
+    out=$("$BIN" _test-code-js schema '{"type":"string","pattern":"[\\d]+"}' '"5"')
+    same 'code-js CODE-JS-04r3 pattern [\d]+ yields INDETERMINATE' "$(printf '%s' "$out" | jq -r '.eval')" 2
+    same 'code-js CODE-JS-04r3 pattern [\d]+ passes fail-open' "$(printf '%s' "$out" | jq -r '.validate')" 0
+
+    out=$("$BIN" _test-code-js schema '{"type":"string","pattern":"^.$"}' '"é"')
+    same 'code-js CODE-JS-04r3 pattern ^.$ on UTF-8 é yields INDETERMINATE' "$(printf '%s' "$out" | jq -r '.eval')" 2
+    same 'code-js CODE-JS-04r3 pattern ^.$ on UTF-8 é passes fail-open' "$(printf '%s' "$out" | jq -r '.validate')" 0
+
+    out=$("$BIN" _test-code-js schema '{"type":"string","pattern":"^[a-z0-9_-]+$"}' '"bad!"')
+    same 'code-js CODE-JS-04r3 pattern never rejects -> INDETERMINATE' "$(printf '%s' "$out" | jq -r '.eval')" 2
+    same 'code-js CODE-JS-04r3 pattern passes fail-open' "$(printf '%s' "$out" | jq -r '.validate')" 0
+
+    out=$("$BIN" _test-code-js schema '{"type":"string","pattern":"^[a-z]+$"}' '123')
+    same 'code-js CODE-JS-04r3 other keywords alongside pattern still reject' "$(printf '%s' "$out" | jq -r '.eval')" 1
+    same 'code-js CODE-JS-04r3 other keywords alongside pattern validate=1' "$(printf '%s' "$out" | jq -r '.validate')" 1
+
+    local byte_utf8_schema byte_utf8_val
+    byte_utf8_schema=$(python3 -c 'import json; print(json.dumps({"allOf": [{"minLength": 1}] * 200}))')
+    byte_utf8_val=$(python3 -c 'import json; print(json.dumps("a" * 8192))')
+    out=$("$BIN" _test-code-js schema "$byte_utf8_schema" "$byte_utf8_val")
+    same "code-js CODE-JS-04r2 repeated long UTF-8 scans hit byte budget -> INDETERMINATE" "$(printf '%s' "$out" | jq -r '.eval')" 2
+
+    local byte_eq_schema byte_eq_val
+    byte_eq_schema=$(python3 -c 'import json; print(json.dumps({"$defs": {"s": {"const": ("a" * 8191) + "x"}}, "anyOf": [{"$ref": "#/$defs/s"}] * 200}))')
+    byte_eq_val=$(python3 -c 'import json; print(json.dumps(("a" * 8191) + "y"))')
+    out=$("$BIN" _test-code-js schema "$byte_eq_schema" "$byte_eq_val")
+    same "code-js CODE-JS-04r2 repeated long equality scans hit byte budget -> INDETERMINATE" "$(printf '%s' "$out" | jq -r '.eval')" 2
+
+    # CODE-JS-05: on-time completion claimed before deadline still resolves even if JS stays busy past call_sec.
+    # inline:true makes the mock complete before dispatch returns, so the claim precedes the 1 s deadline by construction
+    # (no worker thread to schedule, so machine load cannot turn this into a timeout).
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg, call_sec: 1, cpu_sec: 5, wall_sec: 10,
+        script: "const p = tools.mock.fast({q:\"ontime\", inline:true}); const t0 = Date.now(); while (Date.now() - t0 < 1400) {} return await p;"
+    }' | _js_run)
+    same "code-js CODE-JS-05r2 on-time completion resolves after busy JS" "$(printf '%s' "$out" | jq -r '.is_error')" 0
+    same "code-js CODE-JS-05r2 on-time completion preserves payload" \
+        "$(printf '%s' "$out" | jq -r '.result | fromjson | .echo.q // ""')" "ontime"
+
+    # CODE-JS-07: multipleOf routes integral doubles through exact divisibility and returns INDETERMINATE on unreliable fractions
+    out=$("$BIN" _test-code-js schema '{"multipleOf":2.0}' '1000000001')
+    same "code-js CODE-JS-07r2 multipleOf 2.0 rejects 1000000001" "$(printf '%s' "$out" | jq -r '.eval')" 1
+    same "code-js CODE-JS-07r2 multipleOf 2.0 validate=1 for 1000000001" "$(printf '%s' "$out" | jq -r '.validate')" 1
+    out=$("$BIN" _test-code-js schema '{"multipleOf":2.0}' '9007199254740993')
+    same "code-js CODE-JS-07r2 multipleOf 2.0 rejects 2^53+1" "$(printf '%s' "$out" | jq -r '.eval')" 1
+    out=$("$BIN" _test-code-js schema '{"multipleOf":2.0}' '1000000000.0')
+    same "code-js CODE-JS-07r2 multipleOf 2.0 accepts 1000000000.0" "$(printf '%s' "$out" | jq -r '.eval')" 0
+    out=$("$BIN" _test-code-js schema '{"multipleOf":0.1}' '0.3')
+    same "code-js CODE-JS-07r2 fractional multipleOf 0.1 on 0.3 returns INDETERMINATE" "$(printf '%s' "$out" | jq -r '.eval')" 2
+    same "code-js CODE-JS-07r2 fractional multipleOf 0.1 on 0.3 passes fail-open" "$(printf '%s' "$out" | jq -r '.validate')" 0
+    out=$("$BIN" _test-code-js schema '{"multipleOf":0.1}' '0.35')
+    same "code-js CODE-JS-07r2 fractional multipleOf 0.1 rejects 0.35" "$(printf '%s' "$out" | jq -r '.eval')" 1
+    out=$("$BIN" _test-code-js schema '{"multipleOf":8e-324}' '2.4e-323')
+    same "code-js CODE-JS-07r3 subnormal multipleOf 8e-324 on 2.4e-323 returns INDETERMINATE" "$(printf '%s' "$out" | jq -r '.eval')" 2
+    same "code-js CODE-JS-07r3 subnormal multipleOf passes fail-open" "$(printf '%s' "$out" | jq -r '.validate')" 0
+    out=$("$BIN" _test-code-js schema '{"multipleOf":1e-305}' '3e-305')
+    same "code-js CODE-JS-07r3 underflow-adjacent multipleOf returns INDETERMINATE" "$(printf '%s' "$out" | jq -r '.eval')" 2
+
+    # CODE-JS-10: concurrent validation of one shared schema under numeric diagnostics must not race
+    out=$("$BIN" _test-code-js schema-race 2>&1)
+    rc=$?
+    same "code-js CODE-JS-10 shared schema concurrent numeric diagnostics exit 0" "$rc" 0
+    same "code-js CODE-JS-10 shared schema concurrent numeric diagnostics zero failures" \
+        "$(printf '%s' "$out" | jq -r '.failures // -1')" 0
+
+    # CODE-JS-11: embedded NUL in console.log is escaped and does not truncate later lines
+    out=$(jq -nc --arg db "$db" --arg proj "$proj" --arg reg "$reg_mock" '{
+        db: $db, project: $proj, reg_id: $reg,
+        script: "console.log(\"first\\u0000tail\"); console.log(\"second_line\"); return \"ok\";"
+    }' | _js_run)
+    same "code-js CODE-JS-11 embedded NUL log succeeds" "$(printf '%s' "$out" | jq -r '.is_error')" 0
+    check "code-js CODE-JS-11 embedded NUL escapes NUL and keeps tail" "$(printf '%s' "$out" | jq -r '.logs')" "first\\u0000tail"
+    check "code-js CODE-JS-11 embedded NUL preserves subsequent log line" "$(printf '%s' "$out" | jq -r '.logs')" "second_line"
+}
+if [ "${ONLY:-}" = code-js ]; then
+    code_js_run
+    printf '%d passed, %d failed\n' "$pass" "$fail"
+    [ "$fail" -eq 0 ]; exit $?
+fi
+
+# ---- Code Mode Phase 4: daemon skeleton, Unix socket, lockfile, semver drain, status ----
+code_daemon_run() {
+    local d="$TMPD/cd" out rc dpid dpid2 old_pid new_pid new_pid2 smode dmode
+    mkdir -p "$d"
+
+    _cd_stat_mode() {
+        stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null
+    }
+    _cd_wait_file() {
+        local f=$1 i=0
+        while [ ! -f "$f" ] && [ "$i" -lt 200 ]; do
+            sleep 0.02
+            i=$((i + 1))
+        done
+        [ -f "$f" ]
+    }
+    _cd_wait_dead() {
+        local p=$1 i=0
+        while kill -0 "$p" 2>/dev/null && [ "$i" -lt 200 ]; do
+            sleep 0.02
+            i=$((i + 1))
+        done
+        ! kill -0 "$p" 2>/dev/null
+    }
+    _cd_wait_off() {
+        local db=$1 i=0 st=""
+        while [ "$i" -lt 200 ]; do
+            st=$(CNTCTR_DB="$db" env -u CNTCTR_CODE_SOCK "$BIN" code status 2>&1)
+            [ "$st" = "code: off" ] && return 0
+            sleep 0.05
+            i=$((i + 1))
+        done
+        return 1
+    }
+
+    # 1. When off: status prints 'code: off', --short prints 'code ○', stop exits 0, none start daemon
+    mkdir -p "$d/off"
+    out=$(CNTCTR_DB="$d/off/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" code status 2>&1); rc=$?
+    same "code-daemon off status exit 0" "$rc" 0
+    same "code-daemon off status text" "$out" "code: off"
+    same "code-daemon off status does not create socket" "$([ -e "$d/off/code.sock" ] && echo yes || echo no)" "no"
+
+    out=$(CNTCTR_DB="$d/off/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" code status --short 2>&1); rc=$?
+    same "code-daemon off status --short exit 0" "$rc" 0
+    same "code-daemon off status --short text" "$out" "code ○"
+
+    out=$(CNTCTR_DB="$d/off/kb.db" env -u CNTCTR_CODE_SOCK -u CNTCTR_ROOT "$BIN" code stop 2>&1); rc=$?
+    same "code-daemon off stop exit 0" "$rc" 0
+    same "code-daemon off stop does not create socket" "$([ -e "$d/off/code.sock" ] && echo yes || echo no)" "no"
+
+    # 2. Cold start via _test-code-rpc ping, status formats, 0600 sock in 0700 dir, detached (ppid=1)
+    out=$(CNTCTR_DB="$d/s1/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1); rc=$?
+    same "code-daemon cold start ping exit 0" "$rc" 0
+    same "code-daemon cold start ping ok" "$(printf '%s' "$out" | jq -r '.ok // false' 2>/dev/null)" "true"
+    same "code-daemon cold start ping pong" "$(printf '%s' "$out" | jq -r '.pong // false' 2>/dev/null)" "true"
+    dpid=$(printf '%s' "$out" | jq -r '.pid // 0' 2>/dev/null)
+    same "code-daemon cold start pid alive" "$([ "$dpid" -gt 1 ] 2>/dev/null && kill -0 "$dpid" 2>/dev/null && echo yes || echo no)" "yes"
+    same "code-daemon double-fork detached (ppid 1)" "$(ps -o ppid= -p "$dpid" 2>/dev/null | tr -d ' ')" "1"
+
+    out=$(CNTCTR_DB="$d/s1/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" code status 2>&1); rc=$?
+    same "code-daemon on status exit 0" "$rc" 0
+    if printf '%s\n' "$out" | grep -Eq '^code: on · pid [0-9]+ · 0 servers · [0-9]+ MB · 0 projects · up [0-9]+[smhd]$'; then
+        ok_
+    else
+        bad "code-daemon on status format" "  got: $out"
+    fi
+    out=$(CNTCTR_DB="$d/s1/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" code status --short 2>&1); rc=$?
+    same "code-daemon on status --short exit 0" "$rc" 0
+    same "code-daemon on status --short text" "$out" "code ●0"
+
+    out=$(CNTCTR_DB="$d/s1/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" code status --verbose 2>&1); rc=$?
+    same "code-daemon on status --verbose exit 0" "$rc" 0
+    check "code-daemon on status --verbose includes socket path" "$out" "code.sock"
+
+    smode=$(_cd_stat_mode "$d/s1/code.sock")
+    dmode=$(_cd_stat_mode "$d/s1")
+    same "code-daemon socket mode 0600" "$smode" "600"
+    same "code-daemon socket dir mode 0700" "$dmode" "700"
+
+    out=$(CNTCTR_DB="$d/s1/kb.db" env -u CNTCTR_CODE_SOCK -u CNTCTR_ROOT "$BIN" code stop 2>&1); rc=$?
+    same "code-daemon stop running exit 0" "$rc" 0
+    same "code-daemon stop waits for exit" "$(_cd_wait_dead "$dpid" && echo yes || echo no)" "yes"
+    same "code-daemon status after stop is off" "$(CNTCTR_DB="$d/s1/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" code status 2>&1)" "code: off"
+
+    # 3. Scrubbed env check: SECRET_TEST_TOKEN absent; CNTCTR_TEST_DAEMON_VERSION & ASAN_OPTIONS pass through under CNTCTR_TEST_HOOKS
+    out=$(CNTCTR_DB="$d/env/kb.db" env -u CNTCTR_CODE_SOCK \
+        SECRET_TEST_TOKEN=leak CNTCTR_TEST_DAEMON_VERSION=0.5.5 CNTCTR_TEST_CLIENT_VERSION=0.5.5 \
+        ASAN_OPTIONS="${ASAN_OPTIONS:+${ASAN_OPTIONS}:}halt_on_error=1" \
+        "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1); rc=$?
+    same "code-daemon scrubbed env launch exit 0" "$rc" 0
+    out=$(CNTCTR_DB="$d/env/kb.db" env -u CNTCTR_CODE_SOCK CNTCTR_TEST_CLIENT_VERSION=0.5.5 \
+        "$BIN" _test-code-rpc '{"method":"test_env","key":"SECRET_TEST_TOKEN"}' 2>&1); rc=$?
+    same "code-daemon scrubbed env hides SECRET_TEST_TOKEN" "$(printf '%s' "$out" | jq -r '.present' 2>/dev/null)" "false"
+    out=$(CNTCTR_DB="$d/env/kb.db" env -u CNTCTR_CODE_SOCK CNTCTR_TEST_CLIENT_VERSION=0.5.5 \
+        "$BIN" _test-code-rpc '{"method":"test_env","key":"CNTCTR_TEST_DAEMON_VERSION"}' 2>&1); rc=$?
+    same "code-daemon test hook passes CNTCTR_TEST_DAEMON_VERSION" "$(printf '%s' "$out" | jq -r '.value // ""' 2>/dev/null)" "0.5.5"
+    out=$(CNTCTR_DB="$d/env/kb.db" env -u CNTCTR_CODE_SOCK CNTCTR_TEST_CLIENT_VERSION=0.5.5 \
+        "$BIN" _test-code-rpc '{"method":"test_env","key":"ASAN_OPTIONS"}' 2>&1); rc=$?
+    check "code-daemon test hook passes ASAN_OPTIONS" "$(printf '%s' "$out" | jq -r '.value // ""' 2>/dev/null)" "halt_on_error=1"
+    CNTCTR_DB="$d/env/kb.db" env -u CNTCTR_CODE_SOCK -u CNTCTR_ROOT "$BIN" code stop >/dev/null 2>&1
+
+    # 4. Oversized sun_path (115 chars) fails cleanly naming CNTCTR_CODE_SOCK
+    local long_sock="/tmp/$(printf 'a%.0s' $(seq 1 105)).sock"
+    out=$(CNTCTR_DB="$d/off/kb.db" CNTCTR_CODE_SOCK="$long_sock" "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1); rc=$?
+    same "code-daemon 115-char sock rpc fails" "$((rc != 0))" 1
+    check "code-daemon 115-char sock rpc names CNTCTR_CODE_SOCK" "$out" "CNTCTR_CODE_SOCK"
+    out=$(CNTCTR_DB="$d/off/kb.db" CNTCTR_CODE_SOCK="$long_sock" "$BIN" code status 2>&1); rc=$?
+    same "code-daemon 115-char sock status fails" "$((rc != 0))" 1
+    check "code-daemon 115-char sock status names CNTCTR_CODE_SOCK" "$out" "CNTCTR_CODE_SOCK"
+
+    # 5. db_mismatch: daemon on db1, client with CNTCTR_CODE_SOCK=db1's sock and CNTCTR_DB=db2
+    mkdir -p "$d/m1" "$d/m2"
+    out=$(CNTCTR_DB="$d/m1/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1); rc=$?
+    same "code-daemon db_mismatch setup ping exit 0" "$rc" 0
+    dpid=$(printf '%s' "$out" | jq -r '.pid // 0' 2>/dev/null)
+    out=$(CNTCTR_DB="$d/m2/kb.db" CNTCTR_CODE_SOCK="$d/m1/code.sock" "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1); rc=$?
+    same "code-daemon db_mismatch fails" "$((rc != 0))" 1
+    check "code-daemon db_mismatch error tag" "$out" "db_mismatch"
+    check "code-daemon db_mismatch names db1" "$out" "m1/kb.db"
+    check "code-daemon db_mismatch names db2" "$out" "m2/kb.db"
+    check "code-daemon db_mismatch names CNTCTR_CODE_SOCK" "$out" "CNTCTR_CODE_SOCK"
+    same "code-daemon db_mismatch leaves daemon alive" "$(kill -0 "$dpid" 2>/dev/null && echo yes || echo no)" "yes"
+    CNTCTR_DB="$d/m1/kb.db" env -u CNTCTR_CODE_SOCK -u CNTCTR_ROOT "$BIN" code stop >/dev/null 2>&1
+
+    # 6. 4 parallel cold-start pings -> all 4 succeed, 1 daemon PID
+    mkdir -p "$d/p4"
+    local p4_pids="" i
+    for i in 1 2 3 4; do
+        CNTCTR_DB="$d/p4/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" _test-code-rpc '{"method":"ping"}' \
+            > "$d/p4/r$i.out" 2>&1 &
+        p4_pids="$p4_pids $!"
+    done
+    local p4_ok=1 p4_first=""
+    for i in $p4_pids; do wait "$i" || p4_ok=0; done
+    same "code-daemon 4 parallel cold starts all exit 0" "$p4_ok" 1
+    local p4_same=1
+    for i in 1 2 3 4; do
+        local rpid
+        rpid=$(jq -r '.pid // 0' "$d/p4/r$i.out" 2>/dev/null)
+        [ -z "$p4_first" ] && p4_first="$rpid"
+        [ "$rpid" = "$p4_first" ] && [ "$rpid" -gt 1 ] 2>/dev/null || p4_same=0
+    done
+    same "code-daemon 4 parallel cold starts share 1 daemon PID" "$p4_same" 1
+    CNTCTR_DB="$d/p4/kb.db" env -u CNTCTR_CODE_SOCK -u CNTCTR_ROOT "$BIN" code stop >/dev/null 2>&1
+
+    # 7. Two concurrent newer upgraders + one live run completing within grace + draining rejects work RPC
+    mkdir -p "$d/u1"
+    out=$(CNTCTR_DB="$d/u1/kb.db" env -u CNTCTR_CODE_SOCK \
+        CNTCTR_TEST_DAEMON_VERSION=0.0.1 CNTCTR_TEST_CLIENT_VERSION=0.0.1 \
+        "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1); rc=$?
+    same "code-daemon upgrade1 start old daemon exit 0" "$rc" 0
+    old_pid=$(printf '%s' "$out" | jq -r '.pid // 0' 2>/dev/null)
+
+    CNTCTR_DB="$d/u1/kb.db" env -u CNTCTR_CODE_SOCK CNTCTR_TEST_CLIENT_VERSION=0.0.1 \
+        "$BIN" _test-code-rpc "$(jq -nc --arg rf "$d/u1/hold.ready" '{method:"test_hold",ms:1000,ready_file:$rf}')" \
+        > "$d/u1/hold.out" 2>&1 &
+    local hold_job=$!
+    same "code-daemon upgrade1 hold active" "$(_cd_wait_file "$d/u1/hold.ready" && echo yes || echo no)" "yes"
+
+    # Launch 2 concurrent normal-version upgraders
+    CNTCTR_DB="$d/u1/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" _test-code-rpc '{"method":"ping"}' > "$d/u1/up1.out" 2>&1 &
+    local up1_job=$!
+    CNTCTR_DB="$d/u1/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" _test-code-rpc '{"method":"ping"}' > "$d/u1/up2.out" 2>&1 &
+    local up2_job=$!
+
+    # Poll until daemon reports draining=true via --no-autostart status, then test work RPC rejection while draining
+    local dr_seen=0 dr_work_out="" dr_work_rc=0
+    for i in $(seq 1 100); do
+        out=$(CNTCTR_DB="$d/u1/kb.db" env -u CNTCTR_CODE_SOCK CNTCTR_TEST_CLIENT_VERSION=0.0.1 \
+            "$BIN" _test-code-rpc --no-autostart '{"method":"status"}' 2>&1)
+        if [ "$(printf '%s' "$out" | jq -r '.draining // false' 2>/dev/null)" = "true" ]; then
+            dr_seen=1
+            dr_work_out=$(CNTCTR_DB="$d/u1/kb.db" env -u CNTCTR_CODE_SOCK CNTCTR_TEST_CLIENT_VERSION=0.0.1 \
+                "$BIN" _test-code-rpc --no-autostart '{"method":"ping"}' 2>&1); dr_work_rc=$?
+            break
+        fi
+        sleep 0.02
+    done
+    same "code-daemon upgrade1 observed draining status while hold active" "$dr_seen" 1
+    same "code-daemon upgrade1 draining work RPC rejected" "$((dr_work_rc != 0))" 1
+    check "code-daemon upgrade1 draining work RPC retryable message" "$dr_work_out" "cntctr is upgrading; retry in a few seconds"
+
+    local hold_rc=0 up1_rc=0 up2_rc=0
+    wait "$hold_job" || hold_rc=$?
+    wait "$up1_job" || up1_rc=$?
+    wait "$up2_job" || up2_rc=$?
+    same "code-daemon upgrade1 live run completes cleanly" "$hold_rc" 0
+    same "code-daemon upgrade1 live run ok" "$(jq -r '.ok // false' "$d/u1/hold.out" 2>/dev/null)" "true"
+    same "code-daemon upgrade1 upgrader 1 succeeds" "$up1_rc" 0
+    same "code-daemon upgrade1 upgrader 2 succeeds" "$up2_rc" 0
+    new_pid=$(jq -r '.pid // 0' "$d/u1/up1.out" 2>/dev/null)
+    new_pid2=$(jq -r '.pid // 0' "$d/u1/up2.out" 2>/dev/null)
+    same "code-daemon upgrade1 both upgraders hit 1 new daemon" "$new_pid" "$new_pid2"
+    same "code-daemon upgrade1 new daemon PID differs from old" "$((new_pid != old_pid && new_pid > 1))" 1
+    same "code-daemon upgrade1 old daemon exited" "$(_cd_wait_dead "$old_pid" && echo yes || echo no)" "yes"
+    CNTCTR_DB="$d/u1/kb.db" env -u CNTCTR_CODE_SOCK -u CNTCTR_ROOT "$BIN" code stop >/dev/null 2>&1
+
+    # 8. Drain grace timeout: test_hold > CNTCTR_CODE_DRAIN_GRACE_SEC=1 cancelled with "daemon upgrading; rerun"
+    mkdir -p "$d/u2"
+    out=$(CNTCTR_DB="$d/u2/kb.db" env -u CNTCTR_CODE_SOCK \
+        CNTCTR_TEST_DAEMON_VERSION=0.0.1 CNTCTR_TEST_CLIENT_VERSION=0.0.1 CNTCTR_CODE_DRAIN_GRACE_SEC=1 \
+        "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1); rc=$?
+    same "code-daemon upgrade2 start old daemon exit 0" "$rc" 0
+    old_pid=$(printf '%s' "$out" | jq -r '.pid // 0' 2>/dev/null)
+
+    CNTCTR_DB="$d/u2/kb.db" env -u CNTCTR_CODE_SOCK CNTCTR_TEST_CLIENT_VERSION=0.0.1 \
+        "$BIN" _test-code-rpc "$(jq -nc --arg rf "$d/u2/hold.ready" '{method:"test_hold",ms:15000,ready_file:$rf}')" \
+        > "$d/u2/hold.out" 2>&1 &
+    hold_job=$!
+    same "code-daemon upgrade2 hold active" "$(_cd_wait_file "$d/u2/hold.ready" && echo yes || echo no)" "yes"
+
+    CNTCTR_DB="$d/u2/kb.db" env -u CNTCTR_CODE_SOCK CNTCTR_CODE_DRAIN_GRACE_SEC=1 \
+        "$BIN" _test-code-rpc '{"method":"ping"}' > "$d/u2/up1.out" 2>&1 &
+    up1_job=$!
+    CNTCTR_DB="$d/u2/kb.db" env -u CNTCTR_CODE_SOCK CNTCTR_CODE_DRAIN_GRACE_SEC=1 \
+        "$BIN" _test-code-rpc '{"method":"ping"}' > "$d/u2/up2.out" 2>&1 &
+    up2_job=$!
+
+    hold_rc=0; up1_rc=0; up2_rc=0
+    wait "$hold_job" || hold_rc=$?
+    wait "$up1_job" || up1_rc=$?
+    wait "$up2_job" || up2_rc=$?
+    same "code-daemon upgrade2 grace-exceeded run fails" "$((hold_rc != 0))" 1
+    check "code-daemon upgrade2 grace-exceeded error text" "$(cat "$d/u2/hold.out")" "daemon upgrading; rerun"
+    same "code-daemon upgrade2 upgrader 1 succeeds" "$up1_rc" 0
+    same "code-daemon upgrade2 upgrader 2 succeeds" "$up2_rc" 0
+    new_pid=$(jq -r '.pid // 0' "$d/u2/up1.out" 2>/dev/null)
+    new_pid2=$(jq -r '.pid // 0' "$d/u2/up2.out" 2>/dev/null)
+    same "code-daemon upgrade2 both upgraders hit 1 new daemon" "$new_pid" "$new_pid2"
+    same "code-daemon upgrade2 new daemon PID differs from old" "$((new_pid != old_pid && new_pid > 1))" 1
+    same "code-daemon upgrade2 old daemon exited" "$(_cd_wait_dead "$old_pid" && echo yes || echo no)" "yes"
+    CNTCTR_DB="$d/u2/kb.db" env -u CNTCTR_CODE_SOCK -u CNTCTR_ROOT "$BIN" code stop >/dev/null 2>&1
+
+    # 9. Older client vs newer daemon -> daemon NOT drained (same PID), client gets version_mismatch
+    mkdir -p "$d/ov"
+    out=$(CNTCTR_DB="$d/ov/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1); rc=$?
+    same "code-daemon older-client setup exit 0" "$rc" 0
+    dpid=$(printf '%s' "$out" | jq -r '.pid // 0' 2>/dev/null)
+    out=$(CNTCTR_DB="$d/ov/kb.db" env -u CNTCTR_CODE_SOCK CNTCTR_TEST_CLIENT_VERSION=0.0.1 \
+        "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1); rc=$?
+    same "code-daemon older client rejected" "$((rc != 0))" 1
+    check "code-daemon older client version_mismatch" "$out" "version_mismatch"
+    check "code-daemon older client mentions newer" "$out" "is newer"
+    check "code-daemon older client advises restart" "$out" "restart your harness"
+    out=$(CNTCTR_DB="$d/ov/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1); rc=$?
+    dpid2=$(printf '%s' "$out" | jq -r '.pid // 0' 2>/dev/null)
+    same "code-daemon older client did not drain daemon" "$dpid2" "$dpid"
+    CNTCTR_DB="$d/ov/kb.db" env -u CNTCTR_CODE_SOCK -u CNTCTR_ROOT "$BIN" code stop >/dev/null 2>&1
+
+    # 10. Idle exit boundary: CNTCTR_CODE_DAEMON_IDLE_SEC=1
+    mkdir -p "$d/id"
+    out=$(CNTCTR_DB="$d/id/kb.db" env -u CNTCTR_CODE_SOCK CNTCTR_CODE_DAEMON_IDLE_SEC=1 \
+        "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1); rc=$?
+    same "code-daemon idle setup exit 0" "$rc" 0
+    dpid=$(printf '%s' "$out" | jq -r '.pid // 0' 2>/dev/null)
+    # Poll status (which does not reset idle timer) until uptime_sec >= 1 or daemon begins exiting,
+    # then fire concurrent pings right at the 1s boundary so retries under code.lock succeed.
+    for i in $(seq 1 100); do
+        out=$(CNTCTR_DB="$d/id/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" _test-code-rpc --no-autostart '{"method":"status"}' 2>&1) || break
+        [ "$(printf '%s' "$out" | jq -r '.uptime_sec // 0' 2>/dev/null)" -ge 1 ] 2>/dev/null && break
+        sleep 0.02
+    done
+    local b_pids="" boundary_ok=1
+    for i in 1 2 3 4; do
+        CNTCTR_DB="$d/id/kb.db" env -u CNTCTR_CODE_SOCK CNTCTR_CODE_DAEMON_IDLE_SEC=1 \
+            "$BIN" _test-code-rpc '{"method":"ping"}' >/dev/null 2>&1 &
+        b_pids="$b_pids $!"
+    done
+    for i in $b_pids; do wait "$i" || boundary_ok=0; done
+    same "code-daemon idle boundary pings succeed" "$boundary_ok" 1
+    out=$(CNTCTR_DB="$d/id/kb.db" env -u CNTCTR_CODE_SOCK CNTCTR_CODE_DAEMON_IDLE_SEC=1 \
+        "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1)
+    dpid=$(printf '%s' "$out" | jq -r '.pid // 0' 2>/dev/null)
+    # Now stay quiet (polling status does NOT reset idle timer) until daemon exits cleanly on idle timeout
+    same "code-daemon idle exits cleanly to off" "$(_cd_wait_off "$d/id/kb.db" && echo yes || echo no)" "yes"
+    same "code-daemon idle unlinks socket" "$([ -e "$d/id/code.sock" ] && echo yes || echo no)" "no"
+    same "code-daemon idle process exited" "$(_cd_wait_dead "$dpid" && echo yes || echo no)" "yes"
+
+    # 11. Client cancellation polling (<=200 ms slice) + daemon releases active_runs on client disconnect
+    mkdir -p "$d/cn"
+    out=$(CNTCTR_DB="$d/cn/kb.db" env -u CNTCTR_CODE_SOCK \
+        "$BIN" _test-code-rpc --cancel-after 150 '{"method":"test_hold","ms":15000}' 2>&1); rc=$?
+    same "code-daemon cancel-after exits non-zero" "$((rc != 0))" 1
+    check "code-daemon cancel-after reports cancelled" "$out" "cancelled"
+    local runs_zero=0
+    for i in $(seq 1 50); do
+        out=$(CNTCTR_DB="$d/cn/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" _test-code-rpc --no-autostart '{"method":"status"}' 2>&1)
+        if [ "$(printf '%s' "$out" | jq -r '.active_runs // -1' 2>/dev/null)" = "0" ]; then
+            runs_zero=1
+            break
+        fi
+        sleep 0.02
+    done
+    same "code-daemon cancel disconnects and drops active_runs to 0" "$runs_zero" 1
+    CNTCTR_DB="$d/cn/kb.db" env -u CNTCTR_CODE_SOCK -u CNTCTR_ROOT "$BIN" code stop >/dev/null 2>&1
+
+    # 12. Crash recovery: kill -9 -> status prints 'code: off' (no stale on), next autostart restarts cleanly
+    mkdir -p "$d/cr"
+    out=$(CNTCTR_DB="$d/cr/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1); rc=$?
+    same "code-daemon crash setup exit 0" "$rc" 0
+    dpid=$(printf '%s' "$out" | jq -r '.pid // 0' 2>/dev/null)
+    kill -9 "$dpid" 2>/dev/null
+    same "code-daemon crash target killed" "$(_cd_wait_dead "$dpid" && echo yes || echo no)" "yes"
+    same "code-daemon crash stale socket exists before probe" "$([ -e "$d/cr/code.sock" ] && echo yes || echo no)" "yes"
+    out=$(CNTCTR_DB="$d/cr/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" code status 2>&1); rc=$?
+    same "code-daemon crash status exit 0" "$rc" 0
+    same "code-daemon crash status prints off (not stale on)" "$out" "code: off"
+    same "code-daemon crash status --short prints off" \
+        "$(CNTCTR_DB="$d/cr/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" code status --short 2>&1)" "code ○"
+    out=$(CNTCTR_DB="$d/cr/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1); rc=$?
+    same "code-daemon crash autostart restarts exit 0" "$rc" 0
+    dpid2=$(printf '%s' "$out" | jq -r '.pid // 0' 2>/dev/null)
+    same "code-daemon crash restarted with new PID" "$((dpid2 != dpid && dpid2 > 1))" 1
+    CNTCTR_DB="$d/cr/kb.db" env -u CNTCTR_CODE_SOCK -u CNTCTR_ROOT "$BIN" code stop >/dev/null 2>&1
+
+    # 13. CODE-DAEMON-02: trusted parent dir, O_NOFOLLOW symlink lockfile, regular file not unlinked as stale socket
+    mkdir -p "$d/bp"
+    chmod 0777 "$d/bp"
+    out=$(CNTCTR_DB="$d/bp/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1); rc=$?
+    chmod 0700 "$d/bp"
+    same "code-daemon CODE-DAEMON-02 rejects world-writable socket dir" "$((rc != 0))" 1
+    check "code-daemon CODE-DAEMON-02 world-writable error explains perms" "$out" "writable"
+
+    mkdir -p "$d/sl"
+    printf 'keep\n' > "$d/sl/target"
+    ln -s "$d/sl/target" "$d/sl/code.lock"
+    out=$(CNTCTR_DB="$d/sl/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1); rc=$?
+    same "code-daemon CODE-DAEMON-02 rejects symlink lockfile" "$((rc != 0))" 1
+    same "code-daemon CODE-DAEMON-02 symlink target untouched" "$(/bin/cat "$d/sl/target")" "keep"
+
+    mkdir -p "$d/rf"
+    printf 'not-a-socket\n' > "$d/rf/code.sock"
+    out=$(CNTCTR_DB="$d/rf/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1); rc=$?
+    same "code-daemon CODE-DAEMON-02 rejects regular file at sock_path" "$((rc != 0))" 1
+    same "code-daemon CODE-DAEMON-02 does not unlink regular file at sock_path" "$(/bin/cat "$d/rf/code.sock" 2>/dev/null)" "not-a-socket"
+
+    # 14. CODE-DAEMON-04: lock timeout, lock cancel, and outbound frame cap
+    mkdir -p "$d/lk"
+    python3 -c '
+import fcntl, os, sys, time
+lpath, rpath, spath = sys.argv[1], sys.argv[2], sys.argv[3]
+fd = os.open(lpath, os.O_CREAT | os.O_RDWR, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+with open(rpath, "w") as f: f.write("locked\n")
+while not os.path.exists(spath):
+    time.sleep(0.02)
+os.close(fd)
+' "$d/lk/code.lock" "$d/lk/lock.ready" "$d/lk/lock.stop" &
+    local lk_job=$!
+    same "code-daemon CODE-DAEMON-04 lock holder ready" "$(_cd_wait_file "$d/lk/lock.ready" && echo yes || echo no)" "yes"
+    out=$(CNTCTR_DB="$d/lk/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" _test-code-rpc --timeout 250 '{"method":"ping"}' 2>&1); rc=$?
+    same "code-daemon CODE-DAEMON-04 lock acquisition honors timeout" "$((rc != 0))" 1
+    check "code-daemon CODE-DAEMON-04 lock timeout message" "$out" "timed out"
+    out=$(CNTCTR_DB="$d/lk/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" _test-code-rpc --cancel-after 150 '{"method":"ping"}' 2>&1); rc=$?
+    same "code-daemon CODE-DAEMON-04 lock acquisition honors cancel" "$((rc != 0))" 1
+    check "code-daemon CODE-DAEMON-04 lock cancel message" "$out" "cancelled"
+    : > "$d/lk/lock.stop"
+    wait "$lk_job"
+
+    mkdir -p "$d/cap"
+    out=$(python3 -c 'import json; print(json.dumps({"method":"ping","pad":"x" * (1200 * 1024)}))' | \
+        CNTCTR_DB="$d/cap/kb.db" env -u CNTCTR_CODE_SOCK CNTCTR_CODE_MAX_MB=4 "$BIN" _test-code-rpc - 2>&1); rc=$?
+    same "code-daemon CODE-DAEMON-04 oversized outbound frame rejected" "$((rc != 0))" 1
+    check "code-daemon CODE-DAEMON-04 oversized outbound frame names limit" "$out" "line limit"
+    CNTCTR_DB="$d/cap/kb.db" env -u CNTCTR_CODE_SOCK -u CNTCTR_ROOT "$BIN" code stop >/dev/null 2>&1
+
+    # 15. CODE-DAEMON-05 & CODE-DAEMON-06: SemVer prerelease numeric ordering, daemon-side drain check, older code stop rejected
+    mkdir -p "$d/sv"
+    out=$(CNTCTR_DB="$d/sv/kb.db" env -u CNTCTR_CODE_SOCK \
+        CNTCTR_TEST_DAEMON_VERSION=0.5.5-alpha.2 CNTCTR_TEST_CLIENT_VERSION=0.5.5-alpha.2 \
+        "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1); rc=$?
+    same "code-daemon CODE-DAEMON-06 start alpha.2 daemon exit 0" "$rc" 0
+    old_pid=$(printf '%s' "$out" | jq -r '.pid // 0' 2>/dev/null)
+    out=$(CNTCTR_DB="$d/sv/kb.db" env -u CNTCTR_CODE_SOCK \
+        CNTCTR_TEST_DAEMON_VERSION=0.5.5-alpha.10 CNTCTR_TEST_CLIENT_VERSION=0.5.5-alpha.10 \
+        "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1); rc=$?
+    same "code-daemon CODE-DAEMON-06 alpha.10 upgrades alpha.2 exit 0" "$rc" 0
+    new_pid=$(printf '%s' "$out" | jq -r '.pid // 0' 2>/dev/null)
+    same "code-daemon CODE-DAEMON-06 alpha.10 replaced alpha.2 PID" "$((new_pid != old_pid && new_pid > 1))" 1
+    out=$(CNTCTR_DB="$d/sv/kb.db" env -u CNTCTR_CODE_SOCK \
+        CNTCTR_TEST_CLIENT_VERSION=0.5.5-alpha.2 "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1); rc=$?
+    same "code-daemon CODE-DAEMON-06 alpha.2 rejected vs alpha.10" "$((rc != 0))" 1
+    check "code-daemon CODE-DAEMON-06 alpha.2 version_mismatch" "$out" "version_mismatch"
+
+    # Older client code stop is refused (rc != 0) and daemon stays alive
+    out=$(CNTCTR_DB="$d/sv/kb.db" env -u CNTCTR_CODE_SOCK -u CNTCTR_ROOT \
+        CNTCTR_TEST_CLIENT_VERSION=0.5.5-alpha.2 "$BIN" code stop 2>&1); rc=$?
+    same "code-daemon CODE-DAEMON-06 older code stop fails" "$((rc != 0))" 1
+    check "code-daemon CODE-DAEMON-06 older code stop names version_mismatch" "$out" "version_mismatch"
+    same "code-daemon CODE-DAEMON-06 older code stop keeps daemon alive" "$(kill -0 "$new_pid" 2>/dev/null && echo yes || echo no)" "yes"
+
+    # Direct raw older-client drain RPC is rejected by daemon itself
+    out=$(python3 -c '
+import json, os, socket, sys
+sock, db = sys.argv[1], os.path.realpath(os.path.dirname(sys.argv[2])) + "/" + os.path.basename(sys.argv[2])
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sock)
+f = s.makefile("rwb", buffering=0)
+f.write((json.dumps({"id":0,"method":"hello","proto":1,"version":"0.5.5-alpha.2","db":db}) + "\n").encode())
+_ = f.readline()
+f.write((json.dumps({"id":1,"method":"drain"}) + "\n").encode())
+resp = f.readline().decode().strip()
+s.close()
+print(resp)
+' "$d/sv/code.sock" "$d/sv/kb.db" 2>&1)
+    same "code-daemon CODE-DAEMON-06 raw older drain rejected ok=false" "$(printf '%s' "$out" | jq -r '.ok' 2>/dev/null)" "false"
+    check "code-daemon CODE-DAEMON-06 raw older drain error" "$out" "version_mismatch"
+    same "code-daemon CODE-DAEMON-06 raw older drain keeps daemon alive" "$(kill -0 "$new_pid" 2>/dev/null && echo yes || echo no)" "yes"
+    CNTCTR_DB="$d/sv/kb.db" env -u CNTCTR_CODE_SOCK -u CNTCTR_ROOT CNTCTR_TEST_CLIENT_VERSION=0.5.5-alpha.10 "$BIN" code stop >/dev/null 2>&1
+
+    # 16. CODE-DAEMON-01 & CODE-DAEMON-07: open non-work/status connection neither postpones idle exit nor blocks clean shutdown
+    mkdir -p "$d/st"
+    out=$(CNTCTR_DB="$d/st/kb.db" env -u CNTCTR_CODE_SOCK CNTCTR_CODE_DAEMON_IDLE_SEC=1 \
+        "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1); rc=$?
+    same "code-daemon CODE-DAEMON-07 setup exit 0" "$rc" 0
+    dpid=$(printf '%s' "$out" | jq -r '.pid // 0' 2>/dev/null)
+    python3 -c '
+import json, os, socket, sys
+sock, db, rpath = sys.argv[1], os.path.realpath(os.path.dirname(sys.argv[2])) + "/" + os.path.basename(sys.argv[2]), sys.argv[3]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sock)
+f = s.makefile("rwb", buffering=0)
+f.write((json.dumps({"id":0,"method":"hello","proto":1,"version":"0.5.5","db":db}) + "\n").encode())
+_ = f.readline()
+f.write((json.dumps({"id":1,"method":"status"}) + "\n").encode())
+_ = f.readline()
+with open(rpath, "w") as rf: rf.write("open\n")
+# Hold connection open until daemon shuts it down (EOF)
+s.settimeout(5.0)
+data = s.recv(16)
+s.close()
+sys.exit(0 if data == b"" else 1)
+' "$d/st/code.sock" "$d/st/kb.db" "$d/st/open.ready" &
+    local st_job=$!
+    same "code-daemon CODE-DAEMON-07 status conn open" "$(_cd_wait_file "$d/st/open.ready" && echo yes || echo no)" "yes"
+    same "code-daemon CODE-DAEMON-07 daemon idle-exits despite open status conn" "$(_cd_wait_dead "$dpid" && echo yes || echo no)" "yes"
+    local st_rc=0
+    wait "$st_job" || st_rc=$?
+    same "code-daemon CODE-DAEMON-01 shutdown cleanly closed open worker conn" "$st_rc" 0
+
+    # 17. CODE-DAEMON-03: startup lock reservation stays held by grandchild across launcher cancel until listen()
+    mkdir -p "$d/r3"
+    CNTCTR_DB="$d/r3/kb.db" env -u CNTCTR_CODE_SOCK CNTCTR_TEST_DAEMON_PRE_BIND_BARRIER="$d/r3/bar" \
+        "$BIN" _test-code-rpc --cancel-after 150 '{"method":"ping"}' > "$d/r3/c1.out" 2>&1 &
+    local c1_job=$!
+    same "code-daemon CODE-DAEMON-03 grandchild reached pre-bind barrier" "$(_cd_wait_file "$d/r3/bar.ready" && echo yes || echo no)" "yes"
+    local gc_pid
+    gc_pid=$(/bin/cat "$d/r3/bar.ready" | tr -d '[:space:]')
+    local c1_rc=0
+    wait "$c1_job" || c1_rc=$?
+    same "code-daemon CODE-DAEMON-03 launcher 1 cancelled cleanly" "$((c1_rc != 0))" 1
+    # Verify code.lock is STILL held by grandchild even after launcher 1 exited
+    local still_locked
+    still_locked=$(python3 -c '
+import fcntl, os, sys
+fd = os.open(sys.argv[1], os.O_RDWR)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    print("unlocked")
+except BlockingIOError:
+    print("locked")
+finally:
+    os.close(fd)
+' "$d/r3/code.lock")
+    same "code-daemon CODE-DAEMON-03 grandchild still holds code.lock after launcher exit" "$still_locked" "locked"
+    # Launch client 2 while grandchild still holds lock; release barrier and verify client 2 connects to gc_pid
+    CNTCTR_DB="$d/r3/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" _test-code-rpc '{"method":"ping"}' > "$d/r3/c2.out" 2>&1 &
+    local c2_job=$!
+    : > "$d/r3/bar.go"
+    local c2_rc=0
+    wait "$c2_job" || c2_rc=$?
+    same "code-daemon CODE-DAEMON-03 client 2 succeeds after grandchild finishes listen" "$c2_rc" 0
+    same "code-daemon CODE-DAEMON-03 client 2 connected to original grandchild PID (no second daemon)" \
+        "$(jq -r '.pid // 0' "$d/r3/c2.out" 2>/dev/null)" "$gc_pid"
+    CNTCTR_DB="$d/r3/kb.db" env -u CNTCTR_CODE_SOCK -u CNTCTR_ROOT "$BIN" code stop >/dev/null 2>&1
+
+    # 18. Round-2 CODE-DAEMON-02: writable ancestor dir & group-writable 0775 final dir rejected; 0755 accepted
+    mkdir -p "$d/anc/sub"
+    chmod 0700 "$d/anc/sub"
+    chmod 0777 "$d/anc"
+    out=$(CNTCTR_DB="$d/anc/sub/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1); rc=$?
+    chmod 0700 "$d/anc"
+    same "code-daemon R2-02 rejects world-writable ancestor dir" "$((rc != 0))" 1
+    check "code-daemon R2-02 ancestor error names offending dir" "$out" "/anc"
+
+    mkdir -p "$d/gw"
+    chmod 0775 "$d/gw"
+    out=$(CNTCTR_DB="$d/gw/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1); rc=$?
+    chmod 0700 "$d/gw"
+    same "code-daemon R2-02 rejects group-writable 0775 final dir" "$((rc != 0))" 1
+    check "code-daemon R2-02 0775 error names offending dir" "$out" "/gw"
+
+    mkdir -p "$d/ok755"
+    chmod 0755 "$d/ok755"
+    out=$(CNTCTR_DB="$d/ok755/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1); rc=$?
+    same "code-daemon R2-02 accepts same-UID 0755 final dir" "$rc" 0
+    CNTCTR_DB="$d/ok755/kb.db" env -u CNTCTR_CODE_SOCK -u CNTCTR_ROOT "$BIN" code stop >/dev/null 2>&1
+
+    # 19. Round-2 CODE-DAEMON-03: manually supplied unlocked CNTCTR_CODE_LOCK_FD must not bypass code.lock
+    mkdir -p "$d/f3"
+    python3 -c '
+import fcntl, os, subprocess, sys, time
+sock, db, lpath, binp = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+canon_db = os.path.realpath(os.path.dirname(db)) + "/" + os.path.basename(db)
+hold = os.open(lpath, os.O_CREAT | os.O_RDWR, 0o600)
+fcntl.flock(hold, fcntl.LOCK_EX)
+# Open a separate unlocked description on the same lock inode and pass it as fd 7 (distinct from hold)
+unlocked = os.open(lpath, os.O_RDWR)
+os.dup2(unlocked, 7)
+os.set_inheritable(7, True)
+if unlocked != 7: os.close(unlocked)
+env = dict(os.environ)
+env["CNTCTR_CODE_LOCK_FD"] = "7"
+env["CNTCTR_CODE_DAEMON_IDLE_SEC"] = "5"
+env.pop("CNTCTR_CODE_SOCK", None)
+proc = subprocess.Popen([binp, "_code-daemon", sock, canon_db], env=env, pass_fds=(7,),
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+os.close(7)
+# Poll briefly to prove daemon did NOT bind while lock is held by `hold`
+bound_early = False
+for _ in range(15):
+    if os.path.exists(sock):
+        bound_early = True
+        break
+    time.sleep(0.02)
+# Release hold -> daemon must now acquire lock and bind
+fcntl.flock(hold, fcntl.LOCK_UN)
+os.close(hold)
+bound_after = False
+for _ in range(100):
+    if os.path.exists(sock):
+        bound_after = True
+        break
+    time.sleep(0.02)
+print("early=" + str(bound_early) + " after=" + str(bound_after))
+sys.exit(0 if (not bound_early and bound_after) else 1)
+' "$d/f3/code.sock" "$d/f3/kb.db" "$d/f3/code.lock" "$BIN" > "$d/f3/res.out" 2>&1; rc=$?
+    same "code-daemon R2-03 unlocked inherited fd does not bypass code.lock" "$rc" 0
+    CNTCTR_DB="$d/f3/kb.db" env -u CNTCTR_CODE_SOCK -u CNTCTR_ROOT "$BIN" code stop >/dev/null 2>&1
+
+    # 20. Round-2 CODE-DAEMON-06: SemVer build metadata (+build.1 vs +build.2) has equal precedence (compatible, no drain)
+    mkdir -p "$d/bm"
+    out=$(CNTCTR_DB="$d/bm/kb.db" env -u CNTCTR_CODE_SOCK \
+        CNTCTR_TEST_DAEMON_VERSION=0.5.5+build.1 CNTCTR_TEST_CLIENT_VERSION=0.5.5+build.1 \
+        "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1); rc=$?
+    same "code-daemon R2-06 start +build.1 daemon exit 0" "$rc" 0
+    dpid=$(printf '%s' "$out" | jq -r '.pid // 0' 2>/dev/null)
+    out=$(CNTCTR_DB="$d/bm/kb.db" env -u CNTCTR_CODE_SOCK \
+        CNTCTR_TEST_CLIENT_VERSION=0.5.5+build.2 "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1); rc=$?
+    same "code-daemon R2-06 +build.2 compatible with +build.1 exit 0" "$rc" 0
+    dpid2=$(printf '%s' "$out" | jq -r '.pid // 0' 2>/dev/null)
+    same "code-daemon R2-06 +build.2 did not drain +build.1 daemon" "$dpid2" "$dpid"
+    CNTCTR_DB="$d/bm/kb.db" env -u CNTCTR_CODE_SOCK -u CNTCTR_ROOT CNTCTR_TEST_CLIENT_VERSION=0.5.5+build.2 "$BIN" code stop >/dev/null 2>&1
+
+    # 21. Round-2 CODE-DAEMON-09: fd opened above lowered soft RLIMIT_NOFILE is closed in spawned daemon
+    mkdir -p "$d/hf"
+    python3 -c '
+import os, resource, select, subprocess, sys
+db, binp = sys.argv[1], sys.argv[2]
+r, w = os.pipe()
+os.dup2(w, 300)
+os.set_inheritable(300, True)
+os.close(w)
+soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+resource.setrlimit(resource.RLIMIT_NOFILE, (min(128, soft), hard))
+env = dict(os.environ)
+env["CNTCTR_DB"] = db
+env.pop("CNTCTR_CODE_SOCK", None)
+res = subprocess.run([binp, "_test-code-rpc", "{\"method\":\"ping\"}"], env=env, pass_fds=(300,),
+                     capture_output=True, text=True)
+os.close(300)
+if res.returncode != 0:
+    print("rpc failed:", res.stderr)
+    sys.exit(1)
+rd, _, _ = select.select([r], [], [], 2.0)
+data = os.read(r, 16) if rd else None
+os.close(r)
+sys.exit(0 if data == b"" else 1)
+' "$d/hf/kb.db" "$BIN" > "$d/hf/res.out" 2>&1; rc=$?
+    same "code-daemon R2-09 daemon closes high fd above lowered soft RLIMIT_NOFILE" "$rc" 0
+    CNTCTR_DB="$d/hf/kb.db" env -u CNTCTR_CODE_SOCK -u CNTCTR_ROOT "$BIN" code stop >/dev/null 2>&1
+
+    # 22. Round-3 CODE-DAEMON-02: untrusted ancestor with missing parent components creates nothing; normal missing parents work
+    mkdir -p "$d/uanc"
+    chmod 0777 "$d/uanc"
+    out=$(CNTCTR_DB="$d/uanc/m1/m2/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1); rc=$?
+    same "code-daemon R3-02 untrusted ancestor with missing parents fails" "$((rc != 0))" 1
+    check "code-daemon R3-02 untrusted ancestor error names offending dir" "$out" "/uanc"
+    same "code-daemon R3-02 untrusted ancestor created no missing dir" "$([ -e "$d/uanc/m1" ] && echo yes || echo no)" "no"
+    chmod 0700 "$d/uanc"
+
+    out=$(CNTCTR_DB="$d/np1/np2/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1); rc=$?
+    same "code-daemon R3-02 normal missing multi-level parents succeed" "$rc" 0
+    same "code-daemon R3-02 normal missing final dir mode 0700" "$(_cd_stat_mode "$d/np1/np2")" "700"
+    same "code-daemon R3-02 normal missing socket mode 0600" "$(_cd_stat_mode "$d/np1/np2/code.sock")" "600"
+    CNTCTR_DB="$d/np1/np2/kb.db" env -u CNTCTR_CODE_SOCK -u CNTCTR_ROOT "$BIN" code stop >/dev/null 2>&1
+
+    # 23. Round-4 CODE-DAEMON-10 (no UAF on mkdirat/openat error paths under ASan) & CODE-DAEMON-11 (umask 0277/0477)
+    mkdir -p "$d/ro"
+    chmod 0500 "$d/ro"
+    out=$(CNTCTR_DB="$d/ro/cantcreate/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1); rc=$?
+    chmod 0700 "$d/ro"
+    same "code-daemon R4-10 mkdirat failure exits non-zero cleanly" "$((rc != 0))" 1
+    refute "code-daemon R4-10 mkdirat failure has no ASan error" "$out" "AddressSanitizer"
+    check "code-daemon R4-10 mkdirat error names component" "$out" "cantcreate"
+
+    mkdir -p "$d/nf"
+    printf 'file\n' > "$d/nf/blocked"
+    out=$(CNTCTR_DB="$d/nf/blocked/sub/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" _test-code-rpc '{"method":"ping"}' 2>&1); rc=$?
+    same "code-daemon R4-10 openat non-dir failure exits non-zero cleanly" "$((rc != 0))" 1
+    refute "code-daemon R4-10 openat failure has no ASan error" "$out" "AddressSanitizer"
+    check "code-daemon R4-10 openat error names component" "$out" "blocked"
+
+    out=$( (umask 0277 && CNTCTR_DB="$d/u277/sub/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" _test-code-rpc '{"method":"ping"}') 2>&1 ); rc=$?
+    same "code-daemon R4-11 umask 0277 creates dir and succeeds" "$rc" 0
+    same "code-daemon R4-11 umask 0277 final dir mode 0700" "$(_cd_stat_mode "$d/u277/sub")" "700"
+    CNTCTR_DB="$d/u277/sub/kb.db" env -u CNTCTR_CODE_SOCK -u CNTCTR_ROOT "$BIN" code stop >/dev/null 2>&1
+
+    out=$( (umask 0477 && CNTCTR_DB="$d/u477/sub/kb.db" env -u CNTCTR_CODE_SOCK "$BIN" _test-code-rpc '{"method":"ping"}') 2>&1 ); rc=$?
+    same "code-daemon R4-11 umask 0477 creates dir and succeeds" "$rc" 0
+    same "code-daemon R4-11 umask 0477 final dir mode 0700" "$(_cd_stat_mode "$d/u477/sub")" "700"
+    CNTCTR_DB="$d/u477/sub/kb.db" env -u CNTCTR_CODE_SOCK -u CNTCTR_ROOT "$BIN" code stop >/dev/null 2>&1
+
+    # 24. Round-5 CODE-DAEMON-11: even with require_trusted=0 (db_path dir), refuse mkdirat under 0777 parent and create nothing
+    mkdir -p "$d/r5s" "$d/r5db"
+    chmod 0700 "$d/r5s"
+    chmod 0777 "$d/r5db"
+    out=$(CNTCTR_CODE_DAEMON_IDLE_SEC=1 "$BIN" _code-daemon "$d/r5s/code.sock" "$d/r5db/missing/kb.db" 2>&1); rc=$?
+    same "code-daemon R5-11 require_trusted=0 refuses 0777 parent" "$((rc != 0))" 1
+    check "code-daemon R5-11 error names offending parent" "$out" "/r5db"
+    same "code-daemon R5-11 created no dir under 0777 parent" "$([ -e "$d/r5db/missing" ] && echo yes || echo no)" "no"
+    chmod 0700 "$d/r5db"
+}
+if [ "${ONLY:-}" = code-daemon ]; then
+    code_daemon_run
+    printf '%d passed, %d failed\n' "$pass" "$fail"
+    [ "$fail" -eq 0 ]; exit $?
+fi
+
+# ---- Code Mode Phase 5: fake MCP fixture, downstream MCP stdio client, per-instance catalogs, atomic recheck, LRU pool & daemon wiring ----
+code_mcp_run() {
+    local d="$TMPD/cm" fixture py out rc projA projB reg reg2 pid1 pid2 dpid
+    mkdir -p "$d"
+    fixture="$(pwd)/fixtures/fake-mcp.py"
+    py="$(command -v python3)"
+
+    _cm_wait_file() {
+        local f=$1 i=0
+        while [ ! -f "$f" ] && [ "$i" -lt 250 ]; do
+            sleep 0.02
+            i=$((i + 1))
+        done
+        [ -f "$f" ]
+    }
+    _cm_wait_dead() {
+        local p=$1 i=0
+        while kill -0 "$p" 2>/dev/null && [ "$i" -lt 250 ]; do
+            sleep 0.02
+            i=$((i + 1))
+        done
+        ! kill -0 "$p" 2>/dev/null
+    }
+    _cm_add() {
+        local db=$1 cwd=$2; shift 2
+        (cd "$cwd" && CNTCTR_DB="$db" CNTCTR_TEST_ANCESTOR_STOP_PID=$$ \
+            env -u TMUX_PANE -u CNTCTR_PANE -u CNTCTR_ROOT -u CNTCTR_CODE_SOCK \
+            "$BIN" code server add "$@")
+    }
+    _cm_rpc() {
+        local db=$1; shift
+        CNTCTR_DB="$db" env -u CNTCTR_CODE_SOCK "$BIN" _test-code-rpc "$@"
+    }
+    _cm_stop() {
+        local db=$1
+        CNTCTR_DB="$db" env -u CNTCTR_CODE_SOCK -u CNTCTR_ROOT "$BIN" code stop >/dev/null 2>&1 || true
+    }
+
+    # 1. Strict protocol order in fake-mcp.py directly & paginated discover through daemon
+    mkdir -p "$d/p1/projA"
+    projA=$(CNTCTR_DB="$d/p1/kb.db" "$BIN" _test-code-kb resolve-cwd "$d/p1/projA")
+    out=$(python3 -c '
+import json, subprocess, sys
+p = subprocess.Popen([sys.argv[1], sys.argv[2], "--paginate"],
+                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+def send(obj):
+    p.stdin.write(json.dumps(obj) + "\n")
+    p.stdin.flush()
+    return json.loads(p.stdout.readline())
+# Reject tools/list before initialize
+r1 = send({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}})
+# Initialize
+r2 = send({"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}})
+# Reject tools/list after initialize but BEFORE notifications/initialized
+r3 = send({"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}})
+# Reject tools/call before notifications/initialized
+r4 = send({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"ping","arguments":{}}})
+# Send notifications/initialized
+p.stdin.write(json.dumps({"jsonrpc":"2.0","method":"notifications/initialized"}) + "\n")
+p.stdin.flush()
+# Now tools/list returns page 1 with nextCursor, then page 2
+r5 = send({"jsonrpc":"2.0","id":5,"method":"tools/list","params":{}})
+cur = r5.get("result", {}).get("nextCursor", "")
+r6 = send({"jsonrpc":"2.0","id":6,"method":"tools/list","params":{"cursor":cur}}) if cur else {}
+p.stdin.close()
+p.wait(timeout=5)
+print(json.dumps({
+    "pre_init_err": "error" in r1,
+    "init_ok": "result" in r2 and bool(r2["result"].get("protocolVersion")),
+    "pre_notif_list_err": "error" in r3,
+    "pre_notif_call_err": "error" in r4,
+    "has_cursor": bool(cur),
+    "p2_done": "result" in r6 and not r6["result"].get("nextCursor"),
+    "total_tools": len(r5.get("result",{}).get("tools",[])) + len(r6.get("result",{}).get("tools",[]))
+}))
+' "$py" "$fixture" 2>&1); rc=$?
+    same "code-mcp fixture strict init order exit 0" "$rc" 0
+    same "code-mcp fixture rejects tools/list before initialize" "$(printf '%s' "$out" | jq -r '.pre_init_err // false' 2>/dev/null)" "true"
+    same "code-mcp fixture accepts initialize" "$(printf '%s' "$out" | jq -r '.init_ok // false' 2>/dev/null)" "true"
+    same "code-mcp fixture rejects tools/list before notifications/initialized" "$(printf '%s' "$out" | jq -r '.pre_notif_list_err // false' 2>/dev/null)" "true"
+    same "code-mcp fixture rejects tools/call before notifications/initialized" "$(printf '%s' "$out" | jq -r '.pre_notif_call_err // false' 2>/dev/null)" "true"
+    same "code-mcp fixture paginates with nextCursor" "$(printf '%s' "$out" | jq -r '.has_cursor // false' 2>/dev/null)" "true"
+    same "code-mcp fixture page 2 finishes cleanly" "$(printf '%s' "$out" | jq -r '.p2_done // false' 2>/dev/null)" "true"
+
+    _cm_add "$d/p1/kb.db" "$d/p1/projA" fake --cmd "$py" --arg "$fixture" --arg "--paginate" --arg "--both-hints" \
+        --env FAKE_ENV_TAG=secret_env_val --trust annotations >/dev/null 2>&1
+    same "code-mcp register paginated fake server" "$?" 0
+    out=$(_cm_rpc "$d/p1/kb.db" "$(jq -nc --arg p "$projA" '{method:"discover",project:$p,server:"fake"}')" 2>&1); rc=$?
+    same "code-mcp discover paginated server exit 0" "$rc" 0
+    same "code-mcp discover ok" "$(printf '%s' "$out" | jq -r '.ok // false' 2>/dev/null)" "true"
+    same "code-mcp discover collected all 9 tools across pages" "$(printf '%s' "$out" | jq -r '.tools | length' 2>/dev/null)" "9"
+
+    # 2. Class mapping & --trust none (preserves destructiveHint!)
+    same "code-mcp trust=annotations ping=read" "$(printf '%s' "$out" | jq -r '.tools[] | select(.name=="ping") | .class' 2>/dev/null)" "read"
+    same "code-mcp trust=annotations write_item=write" "$(printf '%s' "$out" | jq -r '.tools[] | select(.name=="write_item") | .class' 2>/dev/null)" "write"
+    same "code-mcp trust=annotations unannotated_op=write" "$(printf '%s' "$out" | jq -r '.tools[] | select(.name=="unannotated_op") | .class' 2>/dev/null)" "write"
+    same "code-mcp trust=annotations --both-hints nuke=destructive" "$(printf '%s' "$out" | jq -r '.tools[] | select(.name=="nuke") | .class' 2>/dev/null)" "destructive"
+
+    # Status hides env values
+    out=$(_cm_rpc "$d/p1/kb.db" '{"method":"status"}' 2>&1)
+    refute "code-mcp status never leaks env value" "$out" "secret_env_val"
+    check "code-mcp status shows server_count=1" "$(printf '%s' "$out" | jq -r '.server_count' 2>/dev/null)" "1"
+
+    # Register trust=none server and verify ping->write while nuke STAYS destructive
+    _cm_add "$d/p1/kb.db" "$d/p1/projA" untrusted --cmd "$py" --arg "$fixture" --arg "--both-hints" --trust none >/dev/null 2>&1
+    out=$(_cm_rpc "$d/p1/kb.db" "$(jq -nc --arg p "$projA" '{method:"discover",project:$p,server:"untrusted"}')" 2>&1); rc=$?
+    same "code-mcp discover trust=none exit 0" "$rc" 0
+    same "code-mcp trust=none ping becomes write" "$(printf '%s' "$out" | jq -r '.tools[] | select(.name=="ping") | .class' 2>/dev/null)" "write"
+    same "code-mcp trust=none nuke STAYS destructive" "$(printf '%s' "$out" | jq -r '.tools[] | select(.name=="nuke") | .class' 2>/dev/null)" "destructive"
+
+    # find RPC returns catalog & grant status without spawning
+    reg=$(CNTCTR_DB="$d/p1/kb.db" "$BIN" _test-code-kb server-get "$projA" fake | jq -r '.reg_id')
+    CNTCTR_DB="$d/p1/kb.db" "$BIN" _test-code-kb grant-put "$projA" "$reg" fake "*" access read "" orch "seed" 0 >/dev/null
+    out=$(_cm_rpc "$d/p1/kb.db" "$(jq -nc --arg p "$projA" '{method:"find",project:$p,server:"fake"}')" 2>&1); rc=$?
+    same "code-mcp find RPC exit 0" "$rc" 0
+    same "code-mcp find reports ping granted=true" "$(printf '%s' "$out" | jq -r '.tools[] | select(.name=="ping") | .granted' 2>/dev/null)" "true"
+    same "code-mcp find reports write_item granted=false" "$(printf '%s' "$out" | jq -r '.tools[] | select(.name=="write_item") | .granted' 2>/dev/null)" "false"
+
+    # Verify scrubbed env + no leaked daemon socket fds in tool server + expand RPC
+    out=$(SECRET_DOWNSTREAM_LEAK=should_not_appear _cm_rpc "$d/p1/kb.db" \
+        "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"console.log(\"hello_expand\"); return await tools.fake.ping();"}')" 2>&1); rc=$?
+    same "code-mcp run ping exit 0" "$rc" 0
+    same "code-mcp run ping is_error=false" "$(printf '%s' "$out" | jq -r '.is_error' 2>/dev/null)" "false"
+    same "code-mcp run ping env_tag from --env" "$(printf '%s' "$out" | jq -r '.result | fromjson | .env_tag' 2>/dev/null)" "secret_env_val"
+    same "code-mcp downstream does not inherit SECRET_DOWNSTREAM_LEAK" "$(printf '%s' "$out" | jq -r '.result | fromjson | .leaked_secret' 2>/dev/null)" "false"
+    same "code-mcp downstream has no leaked daemon socket fds" "$(printf '%s' "$out" | jq -r '.result | fromjson | .leaked_sock_fds' 2>/dev/null)" "0"
+    local run_id
+    run_id=$(printf '%s' "$out" | jq -r '.run_id // ""' 2>/dev/null)
+    same "code-mcp run returns non-empty run_id" "$([ -n "$run_id" ] && echo yes || echo no)" "yes"
+    out=$(_cm_rpc "$d/p1/kb.db" "$(jq -nc --arg p "$projA" --arg r "$run_id" '{method:"expand",project:$p,run_id:$r,part:"logs",offset:0,limit:1024}')" 2>&1); rc=$?
+    same "code-mcp expand RPC exit 0" "$rc" 0
+    check "code-mcp expand returns stored logs" "$(printf '%s' "$out" | jq -r '.slice // ""' 2>/dev/null)" "hello_expand"
+    _cm_stop "$d/p1/kb.db"
+
+    # 3. Shared vs --project vs --isolated & per-instance catalogs + list_changed refresh
+    mkdir -p "$d/p3/projA" "$d/p3/projB"
+    projA=$(CNTCTR_DB="$d/p3/kb.db" "$BIN" _test-code-kb resolve-cwd "$d/p3/projA")
+    projB=$(CNTCTR_DB="$d/p3/kb.db" "$BIN" _test-code-kb resolve-cwd "$d/p3/projB")
+
+    _cm_add "$d/p3/kb.db" "$d/p3/projA" shared --cmd "$py" --arg "$fixture" --trust annotations >/dev/null 2>&1
+    _cm_add "$d/p3/kb.db" "$d/p3/projA" local --project --cmd "$py" --arg "$fixture" --trust annotations >/dev/null 2>&1
+    _cm_add "$d/p3/kb.db" "$d/p3/projA" iso --isolated --cmd "$py" --arg "$fixture" --arg "--isolated-tag" --trust annotations >/dev/null 2>&1
+
+    local reg_sh reg_loc reg_iso
+    reg_sh=$(CNTCTR_DB="$d/p3/kb.db" "$BIN" _test-code-kb server-get "$projA" shared | jq -r '.reg_id')
+    reg_loc=$(CNTCTR_DB="$d/p3/kb.db" "$BIN" _test-code-kb server-get "$projA" local | jq -r '.reg_id')
+    reg_iso=$(CNTCTR_DB="$d/p3/kb.db" "$BIN" _test-code-kb server-get "$projA" iso | jq -r '.reg_id')
+    CNTCTR_DB="$d/p3/kb.db" "$BIN" _test-code-kb grant-put "$projA" "$reg_sh" shared "*" access read "" orch "seed" 0 >/dev/null
+    CNTCTR_DB="$d/p3/kb.db" "$BIN" _test-code-kb grant-put "$projB" "$reg_sh" shared "*" access read "" orch "seed" 0 >/dev/null
+    CNTCTR_DB="$d/p3/kb.db" "$BIN" _test-code-kb grant-put "$projA" "$reg_loc" local "*" access read "" orch "seed" 0 >/dev/null
+    CNTCTR_DB="$d/p3/kb.db" "$BIN" _test-code-kb grant-put "$projA" "$reg_iso" iso "*" access read "" orch "seed" 0 >/dev/null
+    CNTCTR_DB="$d/p3/kb.db" "$BIN" _test-code-kb grant-put "$projB" "$reg_iso" iso "*" access read "" orch "seed" 0 >/dev/null
+
+    # Shared: same pid across projA & projB
+    out=$(_cm_rpc "$d/p3/kb.db" "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"return await tools.shared.ping();"}')" 2>&1)
+    pid1=$(printf '%s' "$out" | jq -r '.result | fromjson | .pid // 0' 2>/dev/null)
+    out=$(_cm_rpc "$d/p3/kb.db" "$(jq -nc --arg p "$projB" '{method:"run",project:$p,caller:"t",script:"return await tools.shared.ping();"}')" 2>&1)
+    pid2=$(printf '%s' "$out" | jq -r '.result | fromjson | .pid // 0' 2>/dev/null)
+    same "code-mcp user-shared server shares PID across projA and projB" "$((pid1 > 1 && pid1 == pid2))" 1
+
+    # --project: cwd == projA
+    out=$(_cm_rpc "$d/p3/kb.db" "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"return await tools.local.ping();"}')" 2>&1)
+    same "code-mcp --project runs with cwd == projA" "$(printf '%s' "$out" | jq -r '.result | fromjson | .cwd // ""' 2>/dev/null)" "$projA"
+
+    # --isolated: distinct PIDs, distinct per-instance catalogs, and list_changed refreshes only projA
+    out=$(_cm_rpc "$d/p3/kb.db" "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"return await tools.iso.ping();"}')" 2>&1)
+    pid1=$(printf '%s' "$out" | jq -r '.result | fromjson | .pid // 0' 2>/dev/null)
+    out=$(_cm_rpc "$d/p3/kb.db" "$(jq -nc --arg p "$projB" '{method:"run",project:$p,caller:"t",script:"return await tools.iso.ping();"}')" 2>&1)
+    pid2=$(printf '%s' "$out" | jq -r '.result | fromjson | .pid // 0' 2>/dev/null)
+    same "code-mcp --isolated spawns distinct PIDs for projA and projB" "$((pid1 > 1 && pid2 > 1 && pid1 != pid2))" 1
+
+    local catA catB genA1 genB1 genA2 genB2
+    catA=$(CNTCTR_DB="$d/p3/kb.db" "$BIN" _test-code-kb catalog-get "$reg_iso" "$projA")
+    catB=$(CNTCTR_DB="$d/p3/kb.db" "$BIN" _test-code-kb catalog-get "$reg_iso" "$projB")
+    check "code-mcp isolated projA catalog has tag_projA" "$catA" "tag_projA"
+    refute "code-mcp isolated projA catalog omits tag_projB" "$catA" "tag_projB"
+    check "code-mcp isolated projB catalog has tag_projB" "$catB" "tag_projB"
+    refute "code-mcp isolated projB catalog omits tag_projA" "$catB" "tag_projA"
+    genA1=$(sq "$d/p3/kb.db" "SELECT meta_gen FROM code_catalogs WHERE reg_id='$reg_iso' AND owner_project='$projA'")
+    genB1=$(sq "$d/p3/kb.db" "SELECT meta_gen FROM code_catalogs WHERE reg_id='$reg_iso' AND owner_project='$projB'")
+
+    # Trigger notifications/tools/list_changed on projA adding tool 'dyn_alpha'
+    out=$(_cm_rpc "$d/p3/kb.db" "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"return await tools.iso.emit_changed({add_tool:\"dyn_alpha\"});"}')" 2>&1); rc=$?
+    same "code-mcp emit_changed call exit 0" "$rc" 0
+    local lc_ok=0 i
+    for i in $(seq 1 100); do
+        genA2=$(sq "$d/p3/kb.db" "SELECT meta_gen FROM code_catalogs WHERE reg_id='$reg_iso' AND owner_project='$projA'")
+        if [ "${genA2:-0}" -gt "${genA1:-0}" ]; then lc_ok=1; break; fi
+        sleep 0.02
+    done
+    same "code-mcp list_changed bumps projA meta_gen on control queue" "$lc_ok" 1
+    catA=$(CNTCTR_DB="$d/p3/kb.db" "$BIN" _test-code-kb catalog-get "$reg_iso" "$projA")
+    genB2=$(sq "$d/p3/kb.db" "SELECT meta_gen FROM code_catalogs WHERE reg_id='$reg_iso' AND owner_project='$projB'")
+    check "code-mcp list_changed added dyn_alpha to projA catalog" "$catA" "dyn_alpha"
+    same "code-mcp list_changed did not bump or overwrite projB catalog" "$genB2" "$genB1"
+    _cm_stop "$d/p3/kb.db"
+
+    # 4. Lazy cold-start discovery off run thread + zero-spawn denials (ungranted, scope-excluded, static deny)
+    mkdir -p "$d/p4/projA"
+    projA=$(CNTCTR_DB="$d/p4/kb.db" "$BIN" _test-code-kb resolve-cwd "$d/p4/projA")
+    _cm_add "$d/p4/kb.db" "$d/p4/projA" ungranted --cmd "$py" --arg "$fixture" --trust annotations >/dev/null 2>&1
+    _cm_add "$d/p4/kb.db" "$d/p4/projA" lazy --cmd "$py" --arg "$fixture" --trust annotations >/dev/null 2>&1
+    reg=$(CNTCTR_DB="$d/p4/kb.db" "$BIN" _test-code-kb server-get "$projA" lazy | jq -r '.reg_id')
+    CNTCTR_DB="$d/p4/kb.db" "$BIN" _test-code-kb grant-put "$projA" "$reg" lazy "*" access read "" orch "seed" 0 >/dev/null
+    CNTCTR_DB="$d/p4/kb.db" "$BIN" _test-code-kb grant-put "$projA" "$reg" lazy "echo" access deny "" human "no echo" 0 >/dev/null
+
+    # Ungranted server -> denied, 0 servers spawned
+    out=$(_cm_rpc "$d/p4/kb.db" "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"return await tools.ungranted.ping();"}')" 2>&1)
+    same "code-mcp ungranted server denied" "$(printf '%s' "$out" | jq -r '.is_error' 2>/dev/null)" "true"
+    check "code-mcp ungranted server recorded in denied" "$(printf '%s' "$out" | jq -r '.denied // ""' 2>/dev/null)" "ungranted.ping"
+    same "code-mcp ungranted denial spawned 0 servers" "$(_cm_rpc "$d/p4/kb.db" '{"method":"status"}' | jq -r '.server_count')" "0"
+
+    # Uncatalogued granted server excluded by scope -> denied, 0 servers spawned
+    out=$(_cm_rpc "$d/p4/kb.db" "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",scope:["other.*"],script:"return await tools.lazy.ping();"}')" 2>&1)
+    same "code-mcp scope-excluded uncatalogued denied" "$(printf '%s' "$out" | jq -r '.is_error' 2>/dev/null)" "true"
+    check "code-mcp scope-excluded recorded in denied" "$(printf '%s' "$out" | jq -r '.denied // ""' 2>/dev/null)" "outside run scope"
+    same "code-mcp scope-excluded spawned 0 servers" "$(_cm_rpc "$d/p4/kb.db" '{"method":"status"}' | jq -r '.server_count')" "0"
+
+    # Uncatalogued granted server matched by static deny -> denied, 0 servers spawned
+    out=$(_cm_rpc "$d/p4/kb.db" "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"return await tools.lazy.echo({msg:\"hi\"});"}')" 2>&1)
+    same "code-mcp static-deny uncatalogued denied" "$(printf '%s' "$out" | jq -r '.is_error' 2>/dev/null)" "true"
+    check "code-mcp static-deny recorded in denied" "$(printf '%s' "$out" | jq -r '.denied // ""' 2>/dev/null)" "no echo"
+    same "code-mcp static-deny spawned 0 servers" "$(_cm_rpc "$d/p4/kb.db" '{"method":"status"}' | jq -r '.server_count')" "0"
+
+    # Now call permitted tool on uncatalogued server -> lazy-discovers off run thread and succeeds!
+    out=$(_cm_rpc "$d/p4/kb.db" "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"return await tools.lazy.ping();"}')" 2>&1); rc=$?
+    same "code-mcp lazy cold-start discovery exit 0" "$rc" 0
+    same "code-mcp lazy cold-start is_error=false" "$(printf '%s' "$out" | jq -r '.is_error' 2>/dev/null)" "false"
+    same "code-mcp lazy cold-start result ok=true" "$(printf '%s' "$out" | jq -r '.result | fromjson | .ok' 2>/dev/null)" "true"
+    same "code-mcp lazy cold-start persisted catalog" "$(sq "$d/p4/kb.db" "SELECT count(*) FROM code_catalogs WHERE reg_id='$reg' AND owner_project=''")" "1"
+    _cm_stop "$d/p4/kb.db"
+
+    # 5. Atomic live recheck: class change on restart, same-class schema change on restart, mid-queue revocation
+    mkdir -p "$d/p5/projA"
+    projA=$(CNTCTR_DB="$d/p5/kb.db" "$BIN" _test-code-kb resolve-cwd "$d/p5/projA")
+
+    # 5a. --mutate-class-on-restart: ping flips from read to destructive on 2nd start
+    _cm_add "$d/p5/kb.db" "$d/p5/projA" mcls --cmd "$py" --arg "$fixture" --arg "--mutate-class-on-restart" --arg "$d/p5/cls.state" --trust annotations >/dev/null 2>&1
+    reg=$(CNTCTR_DB="$d/p5/kb.db" "$BIN" _test-code-kb server-get "$projA" mcls | jq -r '.reg_id')
+    CNTCTR_DB="$d/p5/kb.db" "$BIN" _test-code-kb grant-put "$projA" "$reg" mcls "ping" access allow "read" orch "seed" 0 >/dev/null
+    CNTCTR_DB="$d/p5/kb.db" "$BIN" _test-code-kb grant-put "$projA" "$reg" mcls "crash_now" access allow "read" orch "seed" 0 >/dev/null
+    _cm_rpc "$d/p5/kb.db" "$(jq -nc --arg p "$projA" '{method:"discover",project:$p,server:"mcls"}')" >/dev/null 2>&1
+    out=$(_cm_rpc "$d/p5/kb.db" "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"return await tools.mcls.ping();"}')" 2>&1)
+    same "code-mcp mutate-class 1st start ping ok" "$(printf '%s' "$out" | jq -r '.is_error' 2>/dev/null)" "false"
+    # Crash server so next call restarts it (2nd start flips ping -> destructive; cached DB catalog still has ping=read!)
+    _cm_rpc "$d/p5/kb.db" "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"try { await tools.mcls.crash_now(); } catch(e) { return e.message; }"}')" >/dev/null 2>&1
+    out=$(_cm_rpc "$d/p5/kb.db" "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"return await tools.mcls.ping();"}')" 2>&1)
+    same "code-mcp mutate-class 2nd start ping denied" "$(printf '%s' "$out" | jq -r '.is_error' 2>/dev/null)" "true"
+    check "code-mcp mutate-class recorded in denied" "$(printf '%s' "$out" | jq -r '.denied // ""' 2>/dev/null)" "mcls.ping"
+    check "code-mcp mutate-class recorded in calls as denied" "$(printf '%s' "$out" | jq -r '.calls // ""' 2>/dev/null)" "denied"
+
+    # 5b. --mutate-schema-on-restart: echo stays read, msg changes from string to integer
+    _cm_add "$d/p5/kb.db" "$d/p5/projA" msch --cmd "$py" --arg "$fixture" --arg "--mutate-schema-on-restart" --arg "$d/p5/sch.state" --arg "--call-log" --arg "$d/p5/sch.calls" --trust annotations >/dev/null 2>&1
+    reg2=$(CNTCTR_DB="$d/p5/kb.db" "$BIN" _test-code-kb server-get "$projA" msch | jq -r '.reg_id')
+    CNTCTR_DB="$d/p5/kb.db" "$BIN" _test-code-kb grant-put "$projA" "$reg2" msch "*" access read "" orch "seed" 0 >/dev/null
+    _cm_rpc "$d/p5/kb.db" "$(jq -nc --arg p "$projA" '{method:"discover",project:$p,server:"msch"}')" >/dev/null 2>&1
+    out=$(_cm_rpc "$d/p5/kb.db" "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"return await tools.msch.echo({msg:\"hi\"});"}')" 2>&1)
+    same "code-mcp mutate-schema 1st start echo(string) ok" "$(printf '%s' "$out" | jq -r '.is_error' 2>/dev/null)" "false"
+    _cm_rpc "$d/p5/kb.db" "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"try { await tools.msch.crash_now(); } catch(e) { return e.message; }"}')" >/dev/null 2>&1
+    : > "$d/p5/sch.calls"
+    # Old cached catalog still says msg:string; live recheck on restart must reject before stdio write!
+    out=$(_cm_rpc "$d/p5/kb.db" "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"return await tools.msch.echo({msg:\"hi\"});"}')" 2>&1)
+    same "code-mcp mutate-schema 2nd start echo(string) rejected" "$(printf '%s' "$out" | jq -r '.is_error' 2>/dev/null)" "true"
+    check "code-mcp mutate-schema error mentions invalid arguments/integer" "$(printf '%s' "$out" | jq -r '.result // ""' 2>/dev/null)" "integer"
+    same "code-mcp mutate-schema rejected before reaching server" "$(grep -c '^echo$' "$d/p5/sch.calls" 2>/dev/null || true)" "0"
+
+    # 5c. Mid-queue grant revocation: barrier pauses init while call is queued, grant revoked before stdio write
+    : > "$d/p5/rev.calls"
+    _cm_add "$d/p5/kb.db" "$d/p5/projA" mrev --cmd "$py" --arg "$fixture" --arg "--init-barrier" --arg "$d/p5/revbar" --arg "--call-log" --arg "$d/p5/rev.calls" --trust annotations >/dev/null 2>&1
+    local reg_rev
+    reg_rev=$(CNTCTR_DB="$d/p5/kb.db" "$BIN" _test-code-kb server-get "$projA" mrev | jq -r '.reg_id')
+    CNTCTR_DB="$d/p5/kb.db" "$BIN" _test-code-kb grant-put "$projA" "$reg_rev" mrev "*" access read "" orch "seed" 0 >/dev/null
+    _cm_rpc "$d/p5/kb.db" "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"return await tools.mrev.ping();"}')" > "$d/p5/rev.out" 2>&1 &
+    local rev_job=$!
+    same "code-mcp mid-queue revocation reached init barrier" "$(_cm_wait_file "$d/p5/revbar.ready" && echo yes || echo no)" "yes"
+    CNTCTR_DB="$d/p5/kb.db" "$BIN" _test-code-kb grant-del "$projA" "$reg_rev" "*" access 0 >/dev/null
+    : > "$d/p5/revbar.go"
+    wait "$rev_job" || true
+    out=$(/bin/cat "$d/p5/rev.out")
+    same "code-mcp mid-queue revocation denied call" "$(printf '%s' "$out" | jq -r '.is_error' 2>/dev/null)" "true"
+    check "code-mcp mid-queue revocation recorded in denied" "$(printf '%s' "$out" | jq -r '.denied // ""' 2>/dev/null)" "mrev.ping"
+    same "code-mcp mid-queue revocation never sent tools/call to server" "$(grep -c '^ping$' "$d/p5/rev.calls" 2>/dev/null || true)" "0"
+    _cm_stop "$d/p5/kb.db"
+
+    # 6. Crash & circuit breaker (3 crashes in 5 min opens breaker; restart resets it; concurrent timeout+crash zero ASan UAF)
+    mkdir -p "$d/p6/projA"
+    projA=$(CNTCTR_DB="$d/p6/kb.db" "$BIN" _test-code-kb resolve-cwd "$d/p6/projA")
+    _cm_add "$d/p6/kb.db" "$d/p6/projA" flaky --cmd "$py" --arg "$fixture" --trust annotations >/dev/null 2>&1
+    reg=$(CNTCTR_DB="$d/p6/kb.db" "$BIN" _test-code-kb server-get "$projA" flaky | jq -r '.reg_id')
+    CNTCTR_DB="$d/p6/kb.db" "$BIN" _test-code-kb grant-put "$projA" "$reg" flaky "*" access read "" orch "seed" 0 >/dev/null
+
+    out=$(_cm_rpc "$d/p6/kb.db" "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"return await tools.flaky.ping();"}')" 2>&1)
+    pid1=$(printf '%s' "$out" | jq -r '.result | fromjson | .pid // 0' 2>/dev/null)
+    # Crash #1 (with concurrent sleep_tool + short call timeout race to stress ASan refcounting)
+    out=$(_cm_rpc "$d/p6/kb.db" "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",call_sec:1,script:"const rs = await Promise.allSettled([tools.flaky.sleep_tool({ms:5000}), tools.flaky.crash_now({delay_ms:100})]); return rs.map(r => r.status === \"rejected\" ? r.reason.message : \"ok\");"}')" 2>&1)
+    same "code-mcp crash #1 Promise.allSettled completed without ASan error" "$(printf '%s' "$out" | jq -r '.is_error' 2>/dev/null)" "false"
+    check "code-mcp crash #1 reports server crashed" "$out" "server crashed"
+    refute "code-mcp crash #1 no AddressSanitizer" "$out" "AddressSanitizer"
+
+    # Relaunches with new PID
+    out=$(_cm_rpc "$d/p6/kb.db" "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"return await tools.flaky.ping();"}')" 2>&1)
+    pid2=$(printf '%s' "$out" | jq -r '.result | fromjson | .pid // 0' 2>/dev/null)
+    same "code-mcp relaunched after crash #1 with new PID" "$((pid2 > 1 && pid2 != pid1))" 1
+
+    # Crash #2 & Crash #3 -> breaker opens
+    _cm_rpc "$d/p6/kb.db" "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"try { await tools.flaky.crash_now(); } catch(e) { return e.message; }"}')" >/dev/null 2>&1
+    _cm_rpc "$d/p6/kb.db" "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"try { await tools.flaky.crash_now(); } catch(e) { return e.message; }"}')" >/dev/null 2>&1
+    out=$(_cm_rpc "$d/p6/kb.db" "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"return await tools.flaky.ping();"}')" 2>&1)
+    same "code-mcp circuit breaker opens after 3 crashes" "$(printf '%s' "$out" | jq -r '.is_error' 2>/dev/null)" "true"
+    check "code-mcp circuit breaker error mentions 3 crashes / stays down" "$(printf '%s' "$out" | jq -r '.result // ""' 2>/dev/null)" "3 crashes"
+    same "code-mcp circuit breaker does not spawn server" "$(_cm_rpc "$d/p6/kb.db" '{"method":"status"}' | jq -r '.server_count')" "0"
+
+    # restart RPC resets breaker -> next call succeeds
+    out=$(_cm_rpc "$d/p6/kb.db" "$(jq -nc --arg p "$projA" '{method:"restart",project:$p,server:"flaky"}')" 2>&1); rc=$?
+    same "code-mcp restart RPC exit 0" "$rc" 0
+    out=$(_cm_rpc "$d/p6/kb.db" "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"return await tools.flaky.ping();"}')" 2>&1)
+    same "code-mcp ping succeeds after restart resets breaker" "$(printf '%s' "$out" | jq -r '.is_error' 2>/dev/null)" "false"
+    _cm_stop "$d/p6/kb.db"
+
+    # 7. Global cap & LRU eviction (CNTCTR_CODE_MAX_SERVERS=2; all busy names CNTCTR_CODE_MAX_SERVERS)
+    mkdir -p "$d/p7/projA"
+    projA=$(CNTCTR_DB="$d/p7/kb.db" "$BIN" _test-code-kb resolve-cwd "$d/p7/projA")
+    local s
+    for s in s1 s2 s3; do
+        _cm_add "$d/p7/kb.db" "$d/p7/projA" "$s" --cmd "$py" --arg "$fixture" --trust annotations >/dev/null 2>&1
+        reg=$(CNTCTR_DB="$d/p7/kb.db" "$BIN" _test-code-kb server-get "$projA" "$s" | jq -r '.reg_id')
+        CNTCTR_DB="$d/p7/kb.db" "$BIN" _test-code-kb grant-put "$projA" "$reg" "$s" "*" access read "" orch "seed" 0 >/dev/null
+    done
+    out=$(CNTCTR_CODE_MAX_SERVERS=2 _cm_rpc "$d/p7/kb.db" "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"return await tools.s1.ping();"}')" 2>&1)
+    pid1=$(printf '%s' "$out" | jq -r '.result | fromjson | .pid // 0' 2>/dev/null)
+    out=$(CNTCTR_CODE_MAX_SERVERS=2 _cm_rpc "$d/p7/kb.db" "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"return await tools.s2.ping();"}')" 2>&1)
+    pid2=$(printf '%s' "$out" | jq -r '.result | fromjson | .pid // 0' 2>/dev/null)
+    local lru_status
+    lru_status=$(_cm_rpc "$d/p7/kb.db" '{"method":"status"}')
+    same "code-mcp LRU setup has 2 servers" "$(printf '%s' "$lru_status" | jq -r '.server_count')" "2"
+    [ "$(printf '%s' "$lru_status" | jq -r '.server_count')" = 2 ] || printf 'DIAG LRU status: %s\n' "$lru_status" >&2
+
+    # Calling s3 evicts LRU idle s1 (pid1 dies), keeps s2 (pid2 stays alive), server_count stays 2
+    out=$(_cm_rpc "$d/p7/kb.db" "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"return await tools.s3.ping();"}')" 2>&1)
+    same "code-mcp s3 call succeeds after evicting LRU s1" "$(printf '%s' "$out" | jq -r '.is_error' 2>/dev/null)" "false"
+    same "code-mcp evicted LRU s1 process exited (reaped)" "$(_cm_wait_dead "$pid1" && echo yes || echo no)" "yes"
+    same "code-mcp MRU s2 stayed alive" "$(kill -0 "$pid2" 2>/dev/null && echo yes || echo no)" "yes"
+    same "code-mcp server_count stays at cap 2" "$(_cm_rpc "$d/p7/kb.db" '{"method":"status"}' | jq -r '.server_count')" "2"
+
+    # All busy (s2 & s3 held by sleep_tool barriers) -> s1 fails naming CNTCTR_CODE_MAX_SERVERS
+    local req_b2 req_b3
+    req_b2=$(jq -nc --arg p "$projA" --arg rf "$d/p7/b2.ready" --arg gf "$d/p7/b.go" \
+        '{method:"run",project:$p,caller:"t",script:("return await tools.s2.sleep_tool({ms:15000,ready_file:" + ($rf|tojson) + ",go_file:" + ($gf|tojson) + "});")}')
+    req_b3=$(jq -nc --arg p "$projA" --arg rf "$d/p7/b3.ready" --arg gf "$d/p7/b.go" \
+        '{method:"run",project:$p,caller:"t",script:("return await tools.s3.sleep_tool({ms:15000,ready_file:" + ($rf|tojson) + ",go_file:" + ($gf|tojson) + "});")}')
+    _cm_rpc "$d/p7/kb.db" "$req_b2" > "$d/p7/b2.out" 2>&1 &
+    local b2_job=$!
+    _cm_rpc "$d/p7/kb.db" "$req_b3" > "$d/p7/b3.out" 2>&1 &
+    local b3_job=$!
+    same "code-mcp all-busy s2 barrier ready" "$(_cm_wait_file "$d/p7/b2.ready" && echo yes || echo no)" "yes"
+    same "code-mcp all-busy s3 barrier ready" "$(_cm_wait_file "$d/p7/b3.ready" && echo yes || echo no)" "yes"
+
+    out=$(_cm_rpc "$d/p7/kb.db" "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"return await tools.s1.ping();"}')" 2>&1)
+    same "code-mcp all-busy s1 fails" "$(printf '%s' "$out" | jq -r '.is_error' 2>/dev/null)" "true"
+    check "code-mcp all-busy error names CNTCTR_CODE_MAX_SERVERS" "$(printf '%s' "$out" | jq -r '.result // ""' 2>/dev/null)" "CNTCTR_CODE_MAX_SERVERS"
+    : > "$d/p7/b.go"
+    wait "$b2_job" "$b3_job"
+    _cm_stop "$d/p7/kb.db"
+
+    # 8. Idle eviction (CNTCTR_CODE_IDLE_SEC=1), concurrent run cap (CNTCTR_CODE_MAX_RUNS=2), daemon queue cap (CNTCTR_CODE_DAEMON_QUEUE_BYTES)
+    mkdir -p "$d/p8/projA"
+    projA=$(CNTCTR_DB="$d/p8/kb.db" "$BIN" _test-code-kb resolve-cwd "$d/p8/projA")
+    _cm_add "$d/p8/kb.db" "$d/p8/projA" idle1 --cmd "$py" --arg "$fixture" --trust annotations >/dev/null 2>&1
+    reg=$(CNTCTR_DB="$d/p8/kb.db" "$BIN" _test-code-kb server-get "$projA" idle1 | jq -r '.reg_id')
+    CNTCTR_DB="$d/p8/kb.db" "$BIN" _test-code-kb grant-put "$projA" "$reg" idle1 "*" access read "" orch "seed" 0 >/dev/null
+
+    out=$(CNTCTR_CODE_IDLE_SEC=1 CNTCTR_CODE_DAEMON_IDLE_SEC=15 CNTCTR_CODE_MAX_RUNS=2 \
+        _cm_rpc "$d/p8/kb.db" "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"return await tools.idle1.ping();"}')" 2>&1)
+    pid1=$(printf '%s' "$out" | jq -r '.result | fromjson | .pid // 0' 2>/dev/null)
+    same "code-mcp idle-evict server started" "$((pid1 > 1))" 1
+    local idle_evicted=0
+    for i in $(seq 1 150); do
+        if [ "$(_cm_rpc "$d/p8/kb.db" --no-autostart '{"method":"status"}' | jq -r '.server_count // -1' 2>/dev/null)" = "0" ]; then
+            idle_evicted=1; break
+        fi
+        sleep 0.05
+    done
+    same "code-mcp idle eviction stops server after CNTCTR_CODE_IDLE_SEC=1" "$idle_evicted" 1
+    same "code-mcp idle evicted server process reaped" "$(_cm_wait_dead "$pid1" && echo yes || echo no)" "yes"
+
+    # Concurrent run cap: CNTCTR_CODE_MAX_RUNS=2
+    local req_r1 req_r2
+    req_r1=$(jq -nc --arg p "$projA" --arg rf "$d/p8/r1.ready" --arg gf "$d/p8/r.go" \
+        '{method:"run",project:$p,caller:"t",script:("return await tools.idle1.sleep_tool({ms:15000,ready_file:" + ($rf|tojson) + ",go_file:" + ($gf|tojson) + "});")}')
+    req_r2=$(jq -nc --arg p "$projA" --arg rf "$d/p8/r2.ready" --arg gf "$d/p8/r.go" \
+        '{method:"run",project:$p,caller:"t",script:("return await tools.idle1.sleep_tool({ms:15000,ready_file:" + ($rf|tojson) + ",go_file:" + ($gf|tojson) + "});")}')
+    _cm_rpc "$d/p8/kb.db" "$req_r1" > "$d/p8/r1.out" 2>&1 &
+    local r1_job=$!
+    _cm_rpc "$d/p8/kb.db" "$req_r2" > "$d/p8/r2.out" 2>&1 &
+    local r2_job=$!
+    same "code-mcp max-runs slot 1 ready" "$(_cm_wait_file "$d/p8/r1.ready" && echo yes || echo no)" "yes"
+    same "code-mcp max-runs slot 2 ready" "$(_cm_wait_file "$d/p8/r2.ready" && echo yes || echo no)" "yes"
+    out=$(_cm_rpc "$d/p8/kb.db" "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"return 1;"}')" 2>&1); rc=$?
+    same "code-mcp 3rd concurrent run rejected under CNTCTR_CODE_MAX_RUNS=2" "$((rc != 0))" 1
+    check "code-mcp max-runs error names CNTCTR_CODE_MAX_RUNS" "$out" "CNTCTR_CODE_MAX_RUNS"
+    : > "$d/p8/r.go"
+    wait "$r1_job" "$r2_job"
+    _cm_stop "$d/p8/kb.db"
+
+    # Daemon-wide reply queue cap: CNTCTR_CODE_DAEMON_QUEUE_BYTES=65536
+    mkdir -p "$d/p8q/projA"
+    projA=$(CNTCTR_DB="$d/p8q/kb.db" "$BIN" _test-code-kb resolve-cwd "$d/p8q/projA")
+    _cm_add "$d/p8q/kb.db" "$d/p8q/projA" qsrv --cmd "$py" --arg "$fixture" --trust annotations >/dev/null 2>&1
+    reg=$(CNTCTR_DB="$d/p8q/kb.db" "$BIN" _test-code-kb server-get "$projA" qsrv | jq -r '.reg_id')
+    CNTCTR_DB="$d/p8q/kb.db" "$BIN" _test-code-kb grant-put "$projA" "$reg" qsrv "*" access read "" orch "seed" 0 >/dev/null
+    out=$(CNTCTR_CODE_DAEMON_QUEUE_BYTES=65536 _cm_rpc "$d/p8q/kb.db" \
+        "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"return await tools.qsrv.big_result({bytes:80000});"}')" 2>&1)
+    same "code-mcp daemon queue cap rejects oversized reply" "$(printf '%s' "$out" | jq -r '.is_error' 2>/dev/null)" "true"
+    check "code-mcp daemon queue cap error names CNTCTR_CODE_DAEMON_QUEUE_BYTES" "$(printf '%s' "$out" | jq -r '.result // ""' 2>/dev/null)" "CNTCTR_CODE_DAEMON_QUEUE_BYTES"
+    out=$(_cm_rpc "$d/p8q/kb.db" "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"return await tools.qsrv.ping();"}')" 2>&1)
+    same "code-mcp server stays healthy after daemon queue cap rejection" "$(printf '%s' "$out" | jq -r '.is_error' 2>/dev/null)" "false"
+    _cm_stop "$d/p8q/kb.db"
+
+    # 9. Review Focus #3: misbehaving servers (--banner, --spam-stderr, --hang-init) & reader line cap (big_result)
+    mkdir -p "$d/p9/projA"
+    projA=$(CNTCTR_DB="$d/p9/kb.db" "$BIN" _test-code-kb resolve-cwd "$d/p9/projA")
+    _cm_add "$d/p9/kb.db" "$d/p9/projA" noisy --cmd "$py" --arg "$fixture" --arg "--banner" --arg "--spam-stderr" --trust annotations >/dev/null 2>&1
+    _cm_add "$d/p9/kb.db" "$d/p9/projA" hung --cmd "$py" --arg "$fixture" --arg "--hang-init" --arg "--pid-file" --arg "$d/p9/hung.pid" --trust annotations >/dev/null 2>&1
+    local reg_noisy reg_hung
+    reg_noisy=$(CNTCTR_DB="$d/p9/kb.db" "$BIN" _test-code-kb server-get "$projA" noisy | jq -r '.reg_id')
+    reg_hung=$(CNTCTR_DB="$d/p9/kb.db" "$BIN" _test-code-kb server-get "$projA" hung | jq -r '.reg_id')
+    CNTCTR_DB="$d/p9/kb.db" "$BIN" _test-code-kb grant-put "$projA" "$reg_noisy" noisy "*" access read "" orch "seed" 0 >/dev/null
+    CNTCTR_DB="$d/p9/kb.db" "$BIN" _test-code-kb grant-put "$projA" "$reg_hung" hung "*" access read "" orch "seed" 0 >/dev/null
+
+    # Start daemon with CNTCTR_CODE_MAX_MB=4 (line_cap = 1 MiB)
+    out=$(CNTCTR_CODE_MAX_MB=4 _cm_rpc "$d/p9/kb.db" \
+        "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"return await tools.noisy.ping();"}')" 2>&1); rc=$?
+    same "code-mcp --banner and --spam-stderr succeed exit 0" "$rc" 0
+    same "code-mcp --banner and --spam-stderr ping ok" "$(printf '%s' "$out" | jq -r '.result | fromjson | .ok' 2>/dev/null)" "true"
+
+    # big_result exceeding min(max_mb/4, 16 MiB) = 1 MiB fails with "result too large"
+    out=$(_cm_rpc "$d/p9/kb.db" \
+        "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"return await tools.noisy.big_result({bytes:1200000});"}')" 2>&1)
+    same "code-mcp big_result exceeding line cap fails" "$(printf '%s' "$out" | jq -r '.is_error' 2>/dev/null)" "true"
+    check "code-mcp big_result error says result too large" "$(printf '%s' "$out" | jq -r '.result // ""' 2>/dev/null)" "result too large"
+    # Server stays alive for subsequent call
+    out=$(_cm_rpc "$d/p9/kb.db" \
+        "$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"return await tools.noisy.ping();"}')" 2>&1)
+    same "code-mcp server survives big_result rejection" "$(printf '%s' "$out" | jq -r '.is_error' 2>/dev/null)" "false"
+
+    # --hang-init times out cleanly without blocking the QuickJS run thread (noisy.ping completes in parallel!) or leaving a zombie
+    local req_hung
+    req_hung=$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",call_sec:1,script:"const pHung = tools.hung.ping().then(() => \"hung_ok\", e => \"hung_err:\" + e.message); const fast = await tools.noisy.ping(); const hres = await pHung; return {fast_ok: fast.ok, hres};"}')
+    out=$(_cm_rpc "$d/p9/kb.db" "$req_hung" 2>&1)
+    same "code-mcp --hang-init does not block run thread or other servers" "$(printf '%s' "$out" | jq -r '.is_error' 2>/dev/null)" "false"
+    same "code-mcp --hang-init fast sibling call succeeded" "$(printf '%s' "$out" | jq -r '.result | fromjson | .fast_ok' 2>/dev/null)" "true"
+    check "code-mcp --hang-init timed out cleanly" "$(printf '%s' "$out" | jq -r '.result | fromjson | .hres' 2>/dev/null)" "hung_err:"
+    if [ -f "$d/p9/hung.pid" ]; then
+        local hpid
+        hpid=$(/bin/cat "$d/p9/hung.pid" | tr -d '[:space:]')
+        same "code-mcp --hang-init child killed and reaped (no zombie)" "$(_cm_wait_dead "$hpid" && echo yes || echo no)" "yes"
+    else
+        bad "code-mcp --hang-init pid file missing"
+    fi
+    _cm_stop "$d/p9/kb.db"
+
+    # 10. Phase 5 review fixes: CODE-MCP-01 (expected_meta_gen + list_changed between enqueue and send),
+    #     CODE-MCP-02 (server-initiated ping + unknown method -32601), CODE-MCP-03 (unsupported protocolVersion)
+    mkdir -p "$d/p10/projA"
+    projA=$(CNTCTR_DB="$d/p10/kb.db" "$BIN" _test-code-kb resolve-cwd "$d/p10/projA")
+
+    # 10a. CODE-MCP-03: unsupported protocolVersion rejected BEFORE notifications/initialized or tools/list
+    : > "$d/p10/badproto.methods"
+    _cm_add "$d/p10/kb.db" "$d/p10/projA" badproto --cmd "$py" --arg "$fixture" \
+        --arg "--proto-version" --arg "1999-01-01" \
+        --arg "--method-log" --arg "$d/p10/badproto.methods" --trust annotations >/dev/null 2>&1
+    local reg_bp
+    reg_bp=$(CNTCTR_DB="$d/p10/kb.db" "$BIN" _test-code-kb server-get "$projA" badproto | jq -r '.reg_id')
+    CNTCTR_DB="$d/p10/kb.db" "$BIN" _test-code-kb grant-put "$projA" "$reg_bp" badproto "*" access read "" orch "seed" 0 >/dev/null
+
+    local req_bp
+    req_bp=$(jq -nc --arg p "$projA" '{method:"discover",project:$p,server:"badproto"}')
+    out=$(_cm_rpc "$d/p10/kb.db" "$req_bp" 2>&1); rc=$?
+    same "code-mcp CODE-MCP-03 discover rejects unsupported protocolVersion" "$((rc != 0))" 1
+    check "code-mcp CODE-MCP-03 error mentions unsupported protocolVersion" "$out" "unsupported protocolVersion"
+    check "code-mcp CODE-MCP-03 error names bad version 1999-01-01" "$out" "1999-01-01"
+    same "code-mcp CODE-MCP-03 server received initialize" "$(grep -c '^initialize$' "$d/p10/badproto.methods" 2>/dev/null || true)" "1"
+    same "code-mcp CODE-MCP-03 did NOT send notifications/initialized" "$(grep -c '^notifications/initialized$' "$d/p10/badproto.methods" 2>/dev/null || true)" "0"
+    same "code-mcp CODE-MCP-03 did NOT send tools/list" "$(grep -c '^tools/list$' "$d/p10/badproto.methods" 2>/dev/null || true)" "0"
+
+    # 10b. CODE-MCP-02: server-initiated ping (empty result) and unknown method (-32601), serialized with child-stdin writes
+    : > "$d/p10/sreq.replies"
+    _cm_add "$d/p10/kb.db" "$d/p10/projA" sreq --cmd "$py" --arg "$fixture" \
+        --arg "--server-requests" --arg "$d/p10/sreq.replies" --trust annotations >/dev/null 2>&1
+    local reg_sr
+    reg_sr=$(CNTCTR_DB="$d/p10/kb.db" "$BIN" _test-code-kb server-get "$projA" sreq | jq -r '.reg_id')
+    CNTCTR_DB="$d/p10/kb.db" "$BIN" _test-code-kb grant-put "$projA" "$reg_sr" sreq "*" access read "" orch "seed" 0 >/dev/null
+
+    local req_sr
+    req_sr=$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"const [p, e] = await Promise.all([tools.sreq.ping(), tools.sreq.echo({msg:\"concurrent\"})]); return {p, e};"}')
+    out=$(_cm_rpc "$d/p10/kb.db" "$req_sr" 2>&1); rc=$?
+    same "code-mcp CODE-MCP-02 run with server-initiated requests exit 0" "$rc" 0
+    same "code-mcp CODE-MCP-02 run is_error=false" "$(printf '%s' "$out" | jq -r '.is_error' 2>/dev/null)" "false"
+    same "code-mcp CODE-MCP-02 concurrent echo succeeded" "$(printf '%s' "$out" | jq -r '.result | fromjson | .e.msg // ""' 2>/dev/null)" "concurrent"
+    same "code-mcp CODE-MCP-02 ping reply has empty object result" "$(printf '%s' "$out" | jq -c '.result | fromjson | .p.srv_ping_reply.result' 2>/dev/null)" "{}"
+    same "code-mcp CODE-MCP-02 ping reply has no error" "$(printf '%s' "$out" | jq -r '.result | fromjson | .p.srv_ping_reply | has("error")' 2>/dev/null)" "false"
+    same "code-mcp CODE-MCP-02 unknown method reply has id srv-req-2" "$(printf '%s' "$out" | jq -r '.result | fromjson | .p.srv_unknown_reply.id // ""' 2>/dev/null)" "srv-req-2"
+    same "code-mcp CODE-MCP-02 unknown method reply has code -32601" "$(printf '%s' "$out" | jq -r '.result | fromjson | .p.srv_unknown_reply.error.code // 0' 2>/dev/null)" "-32601"
+    same "code-mcp CODE-MCP-02 tools/list server-initiated ping 9000 replied with empty result" \
+        "$(jq -sc 'map(select(.id == 9000)) | .[0].result' "$d/p10/sreq.replies" 2>/dev/null)" "{}"
+
+    # 10c. CODE-MCP-01: list_changed between enqueue and send (CTRL_CALL queued ahead of CTRL_REFRESH)
+    #      AND expected_meta_gen recheck rejects mutated schema before stdio write
+    : > "$d/p10/lc.calls"
+    : > "$d/p10/gate.calls"
+    _cm_add "$d/p10/kb.db" "$d/p10/projA" lc --cmd "$py" --arg "$fixture" \
+        --arg "--mutate-on-list-barrier" --arg "$d/p10/lcbar" \
+        --arg "--call-log" --arg "$d/p10/lc.calls" --trust annotations >/dev/null 2>&1
+    _cm_add "$d/p10/kb.db" "$d/p10/projA" gate --cmd "$py" --arg "$fixture" \
+        --arg "--call-log" --arg "$d/p10/gate.calls" --trust annotations >/dev/null 2>&1
+    local reg_lc reg_gate
+    reg_lc=$(CNTCTR_DB="$d/p10/kb.db" "$BIN" _test-code-kb server-get "$projA" lc | jq -r '.reg_id')
+    reg_gate=$(CNTCTR_DB="$d/p10/kb.db" "$BIN" _test-code-kb server-get "$projA" gate | jq -r '.reg_id')
+    CNTCTR_DB="$d/p10/kb.db" "$BIN" _test-code-kb grant-put "$projA" "$reg_lc" lc "*" access read "" orch "seed" 0 >/dev/null
+    CNTCTR_DB="$d/p10/kb.db" "$BIN" _test-code-kb grant-put "$projA" "$reg_gate" gate "*" access read "" orch "seed" 0 >/dev/null
+
+    # Initial discover (1st tools/list -> meta_gen=1, echo.msg=string) + warm gate server
+    local req_lc_disc req_gate_warm
+    req_lc_disc=$(jq -nc --arg p "$projA" '{method:"discover",project:$p,server:"lc"}')
+    _cm_rpc "$d/p10/kb.db" "$req_lc_disc" >/dev/null 2>&1
+    req_gate_warm=$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"return await tools.gate.ping();"}')
+    _cm_rpc "$d/p10/kb.db" "$req_gate_warm" >/dev/null 2>&1
+    : > "$d/p10/lc.calls"
+    : > "$d/p10/gate.calls"
+
+    # Pause lc's ctrl_thread inside 2nd discover (tools/list barrier)
+    _cm_rpc "$d/p10/kb.db" "$req_lc_disc" > "$d/p10/lc_disc.out" 2>&1 &
+    local lc_disc_job=$!
+    same "code-mcp CODE-MCP-01 list barrier reached" "$(_cm_wait_file "$d/p10/lcbar.ready" && echo yes || echo no)" "yes"
+
+    # Enqueue CTRL_CALL(lc.echo({msg:"stale"})) with expected_meta_gen=1 while ctrl_thread is paused;
+    # gate.ping() confirms JS already called tools.lc.echo(...) before we release lcbar.go!
+    local req_lc_call
+    req_lc_call=$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"const pEcho = tools.lc.echo({msg:\"stale\"}); await tools.gate.ping(); return await pEcho;"}')
+    _cm_rpc "$d/p10/kb.db" "$req_lc_call" > "$d/p10/lc_call.out" 2>&1 &
+    local lc_call_job=$!
+    local gate_seen=0
+    for i in $(seq 1 150); do
+        if grep -q '^ping$' "$d/p10/gate.calls" 2>/dev/null; then gate_seen=1; break; fi
+        sleep 0.02
+    done
+    same "code-mcp CODE-MCP-01 echo call enqueued behind paused ctrl_thread" "$gate_seen" 1
+    # Release barrier: fake-mcp mutates echo.msg -> integer, emits notifications/tools/list_changed,
+    # and returns old tools/list (echo.msg=string) so CTRL_CALL runs ahead of CTRL_REFRESH!
+    : > "$d/p10/lcbar.go"
+    wait "$lc_disc_job" || true
+    wait "$lc_call_job" || true
+    out=$(/bin/cat "$d/p10/lc_call.out")
+    same "code-mcp CODE-MCP-01 list_changed between enqueue and send rejected stale echo" "$(printf '%s' "$out" | jq -r '.is_error' 2>/dev/null)" "true"
+    check "code-mcp CODE-MCP-01 stale echo error mentions integer schema" "$(printf '%s' "$out" | jq -r '.result // ""' 2>/dev/null)" "integer"
+    same "code-mcp CODE-MCP-01 stale echo never reached server stdin" "$(grep -c '^echo$' "$d/p10/lc.calls" 2>/dev/null || true)" "0"
+
+    # Also verify a call with the new integer schema succeeds now!
+    local req_lc_ok
+    req_lc_ok=$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"return await tools.lc.echo({msg:42});"}')
+    out=$(_cm_rpc "$d/p10/kb.db" "$req_lc_ok" 2>&1)
+    same "code-mcp CODE-MCP-01 fresh echo(integer) succeeds after list_changed refresh" "$(printf '%s' "$out" | jq -r '.is_error' 2>/dev/null)" "false"
+    same "code-mcp CODE-MCP-01 fresh echo(integer) returned 42" "$(printf '%s' "$out" | jq -r '.result | fromjson | .msg // 0' 2>/dev/null)" "42"
+
+    # 10d. CODE-MCP-01 single-run emit_changed({mutate_echo_int:true}) followed immediately by echo({msg:"stale"})
+    : > "$d/p10/lc2.calls"
+    _cm_add "$d/p10/kb.db" "$d/p10/projA" lc2 --cmd "$py" --arg "$fixture" \
+        --arg "--call-log" --arg "$d/p10/lc2.calls" --trust annotations >/dev/null 2>&1
+    local reg_lc2
+    reg_lc2=$(CNTCTR_DB="$d/p10/kb.db" "$BIN" _test-code-kb server-get "$projA" lc2 | jq -r '.reg_id')
+    CNTCTR_DB="$d/p10/kb.db" "$BIN" _test-code-kb grant-put "$projA" "$reg_lc2" lc2 "*" access read "" orch "seed" 0 >/dev/null
+    local req_lc2_disc req_lc2_run
+    req_lc2_disc=$(jq -nc --arg p "$projA" '{method:"discover",project:$p,server:"lc2"}')
+    _cm_rpc "$d/p10/kb.db" "$req_lc2_disc" >/dev/null 2>&1
+    : > "$d/p10/lc2.calls"
+    req_lc2_run=$(jq -nc --arg p "$projA" '{method:"run",project:$p,caller:"t",script:"await tools.lc2.emit_changed({mutate_echo_int:true}); return await tools.lc2.echo({msg:\"stale\"});"}')
+    out=$(_cm_rpc "$d/p10/kb.db" "$req_lc2_run" 2>&1)
+    same "code-mcp CODE-MCP-01 in-run emit_changed+echo rejects stale string arg" "$(printf '%s' "$out" | jq -r '.is_error' 2>/dev/null)" "true"
+    check "code-mcp CODE-MCP-01 in-run emit_changed+echo error mentions integer" "$(printf '%s' "$out" | jq -r '.result // ""' 2>/dev/null)" "integer"
+    same "code-mcp CODE-MCP-01 in-run emit_changed+echo never sent echo to server" "$(grep -c '^echo$' "$d/p10/lc2.calls" 2>/dev/null || true)" "0"
+
+    # 10e-g. CODE-MCP-04: a failed catalog refresh keeps the instance stale (no lost invalidation).
+    #        fake-mcp --fail-list-after-changed N fails the next N tools/list after emit_changed;
+    #        the per-process tools/list log gives deterministic refresh counts (no sleeps).
+    local rn reg_rn req_disc req_emit req_stale req_ok req_ping tl
+    for rn in rf rs rb; do
+        : > "$d/p10/$rn.calls"; : > "$d/p10/$rn.methods"
+    done
+    _cm_add "$d/p10/kb.db" "$d/p10/projA" rf --cmd "$py" --arg "$fixture" --arg "--fail-list-after-changed" --arg 1 \
+        --arg "--call-log" --arg "$d/p10/rf.calls" --arg "--method-log" --arg "$d/p10/rf.methods" --trust annotations >/dev/null 2>&1
+    _cm_add "$d/p10/kb.db" "$d/p10/projA" rs --cmd "$py" --arg "$fixture" --arg "--fail-list-after-changed" --arg 2 \
+        --arg "--call-log" --arg "$d/p10/rs.calls" --arg "--method-log" --arg "$d/p10/rs.methods" --trust annotations >/dev/null 2>&1
+    _cm_add "$d/p10/kb.db" "$d/p10/projA" rb --cmd "$py" --arg "$fixture" --arg "--fail-list-after-changed" --arg 99 \
+        --arg "--call-log" --arg "$d/p10/rb.calls" --arg "--method-log" --arg "$d/p10/rb.methods" --trust annotations >/dev/null 2>&1
+    for rn in rf rs rb; do
+        reg_rn=$(CNTCTR_DB="$d/p10/kb.db" "$BIN" _test-code-kb server-get "$projA" $rn | jq -r '.reg_id')
+        CNTCTR_DB="$d/p10/kb.db" "$BIN" _test-code-kb grant-put "$projA" "$reg_rn" $rn "*" access read "" orch "seed" 0 >/dev/null
+        req_disc=$(jq -nc --arg p "$projA" --arg s "$rn" '{method:"discover",project:$p,server:$s}')
+        _cm_rpc "$d/p10/kb.db" "$req_disc" >/dev/null 2>&1
+    done
+    _cm_tl() { grep -c '^tools/list$' "$d/p10/$1.methods" 2>/dev/null || true; }
+    _cm_js() { _cm_rpc "$d/p10/kb.db" "$(jq -nc --arg p "$projA" --arg s "$1" '{method:"run",project:$p,caller:"t",script:$s}')" 2>&1; }
+
+    # 10e. one failed refresh: the next call must refresh again (not dispatch on old metadata)
+    _cm_js 'return await tools.rf.emit_changed({mutate_echo_int:true});' >/dev/null
+    out=$(_cm_js 'return await tools.rf.echo({msg:"stale"});')
+    same "code-mcp CODE-MCP-04 failed refresh then call is rejected on refreshed schema" "$(printf '%s' "$out" | jq -r '.is_error' 2>/dev/null)" "true"
+    check "code-mcp CODE-MCP-04 rejection mentions integer schema" "$(printf '%s' "$out" | jq -r '.result // ""' 2>/dev/null)" "integer"
+    same "code-mcp CODE-MCP-04 stale echo never reached server" "$(grep -c '^echo$' "$d/p10/rf.calls" 2>/dev/null || true)" "0"
+    same "code-mcp CODE-MCP-04 tools/list: initial + 1 failure + 1 retry" "$(_cm_tl rf)" "3"
+
+    # 10f. refresh keeps failing: call denied as stale; recovery after a successful retry
+    _cm_js 'return await tools.rs.emit_changed({mutate_echo_int:true});' >/dev/null
+    out=$(_cm_js 'return await tools.rs.echo({msg:"stale"});')
+    same "code-mcp CODE-MCP-04 persistent refresh failure denies the call" "$(printf '%s' "$out" | jq -r '.is_error' 2>/dev/null)" "true"
+    check "code-mcp CODE-MCP-04 denial says stale catalog" "$(printf '%s' "$out" | jq -r '.result // ""' 2>/dev/null)" "stale catalog"
+    same "code-mcp CODE-MCP-04 denied call never reached server" "$(grep -c '^echo$' "$d/p10/rs.calls" 2>/dev/null || true)" "0"
+    # ping is valid under old and new schema: it drives the successful retry; echo(42) then proves the new schema is live
+    out=$(_cm_js 'return await tools.rs.ping();')
+    same "code-mcp CODE-MCP-04 retry call (ping) succeeds once refresh recovers" "$(printf '%s' "$out" | jq -r '.is_error' 2>/dev/null)" "false"
+    out=$(_cm_js 'return await tools.rs.echo({msg:42});')
+    same "code-mcp CODE-MCP-04 recovers after successful retry" "$(printf '%s' "$out" | jq -r '.is_error' 2>/dev/null)" "false"
+    same "code-mcp CODE-MCP-04 recovered echo returned 42" "$(printf '%s' "$out" | jq -r '.result | fromjson | .msg // 0' 2>/dev/null)" "42"
+    same "code-mcp CODE-MCP-04 tools/list: initial + 2 failures + 1 success" "$(_cm_tl rs)" "4"
+
+    # 10g. bounded budget: 3 failed refreshes fail the instance closed (restart), never retry forever
+    out=$(_cm_js 'return await tools.rb.ping();')
+    local pid_rb1 pid_rb2
+    pid_rb1=$(printf '%s' "$out" | jq -r '.result | fromjson | .pid // 0' 2>/dev/null)
+    _cm_js 'return await tools.rb.emit_changed({mutate_echo_int:true});' >/dev/null
+    out=$(_cm_js 'return await tools.rb.echo({msg:"stale"});')
+    check "code-mcp CODE-MCP-04 budget call 1 denied as stale" "$(printf '%s' "$out" | jq -r '.result // ""' 2>/dev/null)" "stale catalog"
+    out=$(_cm_js 'return await tools.rb.echo({msg:"stale"});')
+    check "code-mcp CODE-MCP-04 budget call 2 denied as stale" "$(printf '%s' "$out" | jq -r '.result // ""' 2>/dev/null)" "stale catalog"
+    same "code-mcp CODE-MCP-04 budget spent after 3 failed refreshes (no 4th attempt)" "$(_cm_tl rb)" "4"
+    same "code-mcp CODE-MCP-04 stale server killed when budget spent" "$(_cm_wait_dead "$pid_rb1" && echo yes || echo no)" "yes"
+    out=$(_cm_js 'return await tools.rb.ping();')
+    pid_rb2=$(printf '%s' "$out" | jq -r '.result | fromjson | .pid // 0' 2>/dev/null)
+    same "code-mcp CODE-MCP-04 next call restarts a fresh server" "$([ "$pid_rb2" != 0 ] && [ "$pid_rb2" != "$pid_rb1" ] && echo yes || echo no)" "yes"
+    same "code-mcp CODE-MCP-04 restart did one fresh tools/list" "$(_cm_tl rb)" "5"
+    same "code-mcp CODE-MCP-04 stale echo never reached any rb server" "$(grep -c '^echo$' "$d/p10/rb.calls" 2>/dev/null || true)" "0"
+
+    _cm_stop "$d/p10/kb.db"
+}
+if [ "${ONLY:-}" = code-mcp ]; then
+    code_mcp_run
+    printf '%d passed, %d failed\n' "$pass" "$fail"
+    [ "$fail" -eq 0 ]; exit $?
+fi
+
+# ---- Code Mode Phase 6: admin MCP tools, full `cntctr code` CLI, human-rule & orchestrator guardrails ----
+code_admin_run() {
+    local d="$TMPD/code_admin" db out rc projA projC projQ fixture py orch workr orchQ cmdline reg_fk reg_fake
+    mkdir -p "$d/projA" "$d/projC" "$d/proj's dir" "$d/nosess"
+    db="$d/kb.db"
+    fixture="$(pwd)/fixtures/fake-mcp.py"
+    py="$(command -v python3)"
+    printf '#!/bin/sh\nexec "%s" "$@"\n' "$BIN" > "$TMPD/bin/cntctr"; chmod +x "$TMPD/bin/cntctr"
+    local r
+    for r in "$d/projA" "$d/projC" "$d/proj's dir"; do
+        git -C "$r" init -q
+        git -C "$r" -c user.name=T -c user.email=t@example.invalid commit --allow-empty -qm init
+    done
+    projA=$(CNTCTR_DB="$db" "$BIN" _test-code-kb resolve-cwd "$d/projA")
+    projC=$(CNTCTR_DB="$db" "$BIN" _test-code-kb resolve-cwd "$d/projC")
+    projQ=$(CNTCTR_DB="$db" "$BIN" _test-code-kb resolve-cwd "$d/proj's dir")
+    local projQs=${projQ//\'/\'\'}   # SQL-quoted
+
+    _ca_cli() { local dir=$1; shift; (cd "$dir" && CNTCTR_DB="$db" CNTCTR_TEST_ANCESTOR_STOP_PID=$$ env -u TMUX_PANE -u CNTCTR_PANE -u CNTCTR_ROOT -u CNTCTR_CODE_SOCK "$BIN" code "$@" 2>&1); }
+    _ca_pty() { local ans=$1 dir=$2; shift 2; python3 tests/pty_answer.py "$ans" "$dir" "$db" "$$" "$@"; }
+    _ca_pane() {
+        local p
+        p=$(t new-window -d -P -F '#{pane_id}' -c "$2" cat)
+        t set -p -t "$p" @cntctr_name "$1"; t set -p -t "$p" @cntctr_harness test; t set -p -t "$p" @cntctr_srv $$
+        [ -n "${3:-}" ] && t set -p -t "$p" @cntctr_parent "$3"
+        echo "$p"
+    }
+    # the MCP process is a child of this shell, not of the pane: tell cntctr the pane's root process is us (test hook)
+    _ca_mcp() { CNTCTR_TEST_PANE_ROOT_PID=$$ CNTCTR_DB="$db" call "$@"; }
+    _ca_wait_file() { local f=$1 i=0; while [ ! -f "$f" ] && [ "$i" -lt 500 ]; do sleep 0.02; i=$((i + 1)); done; [ -f "$f" ]; }
+    _ca_pcount() { pgrep -f -- "$1" 2>/dev/null | wc -l | tr -d ' '; }
+    _ca_isc() { [ "$(iserr "$1")" = true ] && echo err || echo ok; }
+    _ca_stop() { CNTCTR_DB="$db" env -u CNTCTR_CODE_SOCK -u CNTCTR_ROOT "$BIN" code stop >/dev/null 2>&1 || true; }
+    _ca_q() { sq "$db" "$1"; }
+
+    orch=$(_ca_pane orch1 "$d/projA")
+    workr=$(_ca_pane worker1 "$d/projA" "$orch")
+    orchQ=$(_ca_pane orchq "$d/proj's dir")
+
+    # 0. Tool schemas: three admin tools, each carries KFROM; listed only to an orchestrator (a worker or a paneless server never sees them)
+    _ca_list() { CNTCTR_TEST_PANE_ROOT_PID=$$ CNTCTR_DB="$db" SKIP=1 session "$1" 2 "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | tail -n 1; }
+    same "code-admin a plain (paneless) tools/list has no admin tool" "$(rpc "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | tail -n 1 | jq -r '[.result.tools[].name | select(. == "code_server" or . == "code_grant" or . == "code_revoke")] | length')" 0
+    same "code-admin a spawned worker's tools/list has no admin tool" "$(_ca_list "$workr" | jq -r '[.result.tools[].name | select(. == "code_server" or . == "code_grant" or . == "code_revoke")] | length')" 0
+    out=$(_ca_list "$orch")
+    for r in code_server code_grant code_revoke; do
+        same "code-admin tools/list has $r with from" "$(printf '%s' "$out" | jq -r --arg n "$r" '[.result.tools[] | select(.name == $n) | .inputSchema.properties | has("from")] | first // false')" "true"
+    done
+
+    # 1. Human setup: project-local `fake` + human rules; user-scoped `fk`
+    out=$(_ca_cli "$d/projA" server add fake --project --cmd "$py" --arg "$fixture" --arg --pid-file --arg "$d/fake.pid" --trust annotations)
+    check "code-admin human adds project-local fake" "$out" "added server fake"
+    out=$(_ca_cli "$d/projA" grant fake.write_item deny --reason "no writes"); rc=$?
+    same "code-admin human deny write_item (no prompt, new rule)" "$rc" 0
+    out=$(_ca_cli "$d/projA" grant fake.ping class:destructive); rc=$?
+    same "code-admin human class:destructive ping (new rule)" "$rc" 0
+    same "code-admin human rows carry granted_by=human" "$(_ca_q "SELECT group_concat(granted_by) FROM code_grants WHERE tool_pattern IN ('write_item','ping')")" "human,human"
+    reg_fake=$(_ca_q "SELECT reg_id FROM code_servers WHERE name='fake'")
+    _ca_cli "$d/projA" server add fk --cmd "$py" --arg "$fixture" --arg --pid-file --arg "$d/fk.pid" --arg --call-log --arg "$d/fk.calls" --trust annotations >/dev/null
+
+    # 2. CLI before any daemon: destructive allow needs a TTY, an agent ancestor is refused, probe failure fails closed
+    out=$(_ca_cli "$d/projC" grant fk.nuke allow); rc=$?
+    same "code-admin CLI destructive grant without TTY refused" "$((rc != 0))" 1
+    same "code-admin CLI refused destructive grant stored nothing" "$(_ca_q "SELECT count(*) FROM code_grants WHERE project='$projC'")" 0
+    cat > "$d/wrap.c" <<'EOF'
+#include <stdlib.h>
+#include <sys/wait.h>
+int main(int argc, char **argv) {
+    if (argc < 2) return 1;
+    int s = system(argv[1]);
+    return WIFEXITED(s) ? WEXITSTATUS(s) : 1;
+}
+EOF
+    cc -o "$d/claude" "$d/wrap.c"
+    out=$(_ca_pty y "$d/projC" "$d/claude" "'$BIN' code grant fk.nuke allow")
+    check "code-admin fake claude ancestor refused even with a PTY" "$out" "ancestor process 'claude'"
+    same "code-admin claude ancestor stored nothing" "$(_ca_q "SELECT count(*) FROM code_grants WHERE project='$projC'")" 0
+    _ca_cli "$d/projC" server add ghost --project --cmd /nonexistent/ghost-bin >/dev/null
+    out=$(_ca_pty y "$d/projC" "$BIN" code grant ghost.anything allow)
+    refute "code-admin unprobeable server grant fails closed" "$out" "RC=0"
+    same "code-admin unprobeable server stored nothing" "$(_ca_q "SELECT count(*) FROM code_grants WHERE server='ghost'")" 0
+    out=$(_ca_pty n "$d/projC" "$BIN" code grant fk.nuke allow)
+    check "code-admin PTY n aborts destructive grant" "$out" "PROMPTED=1"
+    refute "code-admin PTY n exit status nonzero" "$out" "RC=0"
+    same "code-admin PTY n stored nothing" "$(_ca_q "SELECT count(*) FROM code_grants WHERE project='$projC'")" 0
+    out=$(_ca_pty y "$d/projC" "$BIN" code grant fk.nuke allow)
+    check "code-admin PTY y grants destructive nuke" "$out" "RC=0"
+    same "code-admin CLI grant is human, destructive, bound to reg_id" "$(_ca_q "SELECT granted_by||'|'||class_at_grant||'|'||(reg_id=(SELECT reg_id FROM code_servers WHERE name='fk')) FROM code_grants WHERE project='$projC' AND tool_pattern='nuke'")" "human|destructive|1"
+    same "code-admin CLI never autostarted the daemon" "$([ -S "$d/code.sock" ] && echo yes || echo no)" "no"
+    check "code-admin CLI probe discovered fk catalog" "$(_ca_cli "$d/projC" grants fk)" "nuke"
+    out=$(_ca_cli "$d/projC" revoke fk.nuke); rc=$?
+    same "code-admin CLI revokes a human allow row" "$rc" 0
+    same "code-admin revoke removed the row" "$(_ca_q "SELECT count(*) FROM code_grants WHERE project='$projC'")" 0
+
+    # 2b. all-projects policy through the CLI: read or deny, user-scoped servers, human only
+    mkdir -p "$d/projD"; git -C "$d/projD" init -q; git -C "$d/projD" -c user.name=T -c user.email=t@example.invalid commit --allow-empty -qm init
+    out=$(_ca_cli "$d/projD" grant fk.echo allow --all-projects); rc=$?
+    same "code-admin all-projects allow is refused" "$((rc != 0))" 1
+    check "code-admin all-projects allow refusal says read or deny only" "$out" "read or deny only"
+    out=$(_ca_cli "$d/projD" grant 'fk.*' class:write --all-projects); rc=$?
+    same "code-admin all-projects class rule is refused" "$((rc != 0))" 1
+    out=$(_ca_cli "$d/projD" grant 'cntctr.*' read --all-projects); rc=$?
+    same "code-admin all-projects cntctr server is refused" "$((rc != 0))" 1
+    out=$(_ca_cli "$d/projA" grant 'fake.*' read --all-projects); rc=$?
+    same "code-admin all-projects project-local-only server is refused" "$((rc != 0))" 1
+    out=$(_ca_cli "$d/projD" revoke 'cntctr.*' --all-projects); rc=$?
+    same "code-admin revoke --all-projects of the cntctr server is refused" "$((rc != 0))" 1
+    check "code-admin ...with the same explicit message as grant" "$out" "built-in cntctr server is granted per project"
+    same "code-admin refused all-projects grants stored nothing" "$(_ca_q "SELECT count(*) FROM code_grants WHERE project='*'")" 0
+    out=$(_ca_cli "$d/projD" grant 'fk.*' read --all-projects --reason "everywhere"); rc=$?
+    same "code-admin all-projects read grant succeeds" "$rc" 0
+    check "code-admin all-projects grant says all projects" "$out" "in all projects"
+    same "code-admin all-projects row is human, project '*', bound to the user-scoped fk" "$(_ca_q "SELECT project||'|'||granted_by||'|'||level||'|'||(reg_id=(SELECT reg_id FROM code_servers WHERE name='fk' AND scope_project='')) FROM code_grants WHERE project='*'")" "*|human|read|1"
+    check "code-admin grants lists the all-projects rule, marked, from another project" "$(_ca_cli "$d/projA" grants fk)" "fk.* access read by=human reason=everywhere [all-projects]"
+    check "code-admin code_status shows the all-projects rule, marked" "$(txt "$(_ca_mcp "$orch" code_status '{}')")" "[all-projects]"
+    out=$(_ca_mcp "$orch" code_revoke '{"server":"fk","tool_pattern":"*"}')
+    same "code-admin MCP revoke cannot remove the all-projects rule" "$(_ca_isc "$out")" err
+    check "code-admin MCP revoke names the human all-projects rule" "$(txt "$out")" "all-projects rule a human set"
+    same "code-admin the all-projects rule survived the MCP revoke" "$(_ca_q "SELECT count(*) FROM code_grants WHERE project='*'")" 1
+    out=$(_ca_cli "$d/projD" revoke 'fk.*'); rc=$?
+    same "code-admin revoke without --all-projects does not touch it" "$((rc != 0))" 1
+    check "code-admin revoke without the flag points at --all-projects" "$out" "--all-projects"
+    out=$(_ca_cli "$d/projD" revoke 'fk.*' --all-projects); rc=$?
+    same "code-admin revoke --all-projects removes it" "$rc" 0
+    same "code-admin all-projects rule is gone" "$(_ca_q "SELECT count(*) FROM code_grants WHERE project='*'")" 0
+
+    # 3. Authority: workers, paneless from=<orchestrator>
+    out=$(_ca_mcp "$orch" code_server '{"action":"list"}')
+    same "code-admin orchestrator code_server list ok" "$(_ca_isc "$out")" ok
+    out=$(_ca_mcp "$workr" code_server '{"action":"list"}')
+    same "code-admin worker code_server list denied" "$(_ca_isc "$out")" err
+    check "code-admin worker denial names orchestrator" "$(txt "$out")" "orchestrator"
+    out=$(_ca_mcp "$workr" code_server '{"action":"discover","name":"fake"}')
+    same "code-admin worker code_server discover denied" "$(_ca_isc "$out")" err
+    same "code-admin worker discover started no fake-mcp process" "$([ -e "$d/fake.pid" ] && echo started || echo none)" "none"
+    same "code-admin worker discover did not autostart the daemon" "$([ -S "$d/code.sock" ] && echo yes || echo no)" "no"
+    out=$(_ca_mcp "$workr" code_grant '{"server":"fake","tool_pattern":"ping","level":"read"}')
+    same "code-admin worker code_grant denied" "$(_ca_isc "$out")" err
+    out=$(_ca_mcp "$workr" code_revoke '{"server":"fake","tool_pattern":"ping"}')
+    same "code-admin worker code_revoke denied" "$(_ca_isc "$out")" err
+    out=$(printf '%s\n' "$INIT" "$(jq -nc '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"code_server",arguments:{action:"list",from:"orch1"}}}')" |
+        CNTCTR_DB="$db" CNTCTR_CLAUDE_SESSIONS_DIR="$d/nosess" env -u TMUX_PANE -u CNTCTR_PANE "$BIN" | tail -n 1)
+    same "code-admin paneless from=<orchestrator> code_server denied" "$(_ca_isc "$out")" err
+    check "code-admin paneless code_server denial says the process has no pane of its own" "$(txt "$out")" "no agent pane of its own"
+    out=$(printf '%s\n' "$INIT" "$(jq -nc '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"code_grant",arguments:{server:"fake",tool_pattern:"ping",level:"read",from:"orch1"}}}')" |
+        CNTCTR_DB="$db" CNTCTR_CLAUDE_SESSIONS_DIR="$d/nosess" env -u TMUX_PANE -u CNTCTR_PANE "$BIN" | tail -n 1)
+    same "code-admin paneless from=<orchestrator> code_grant denied" "$(_ca_isc "$out")" err
+    check "code-admin paneless code_grant denial says the process has no pane of its own" "$(txt "$out")" "no agent pane of its own"
+    same "code-admin paneless attempt granted nothing" "$(_ca_q "SELECT count(*) FROM code_grants WHERE level='read'")" 0
+
+    # a reviewer pane with no @cntctr_parent is still not an orchestrator
+    local revp
+    revp=$(_ca_pane revr "$d/projA")
+    _ca_q "INSERT INTO tools(project,name,version,status,author,description,input_schema,interpreter,script,reviewer_pane) VALUES ('rev-proj','rev_tool',1,'pending','a','d','{}','sh','true','$revp')"
+    out=$(_ca_mcp "$revp" code_server '{"action":"list"}')
+    same "code-admin reviewer pane without a parent denied" "$(_ca_isc "$out")" err
+    check "code-admin reviewer denial names the reviewer" "$(txt "$out")" "reviewer"
+    _ca_q "DELETE FROM tools WHERE project='rev-proj'"
+
+    # 3b. CODE-ADMIN-01: the env pane is only a hint; the MCP process must descend from that pane's root process
+    out=$(CNTCTR_DB="$db" call "$orch" code_server '{"action":"list"}')
+    same "code-admin pane env without process-to-pane evidence denied" "$(_ca_isc "$out")" err
+    check "code-admin unverified pane denial says not a descendant" "$(txt "$out")" "not a descendant"
+    out=$(CNTCTR_TEST_PANE_ROOT_PID=1 CNTCTR_DB="$db" call "$orch" code_server '{"action":"list"}')
+    same "code-admin wrong pane root pid denied" "$(_ca_isc "$out")" err
+    out=$(printf '%s\n' "$INIT" "$(jq -nc '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:"code_server",arguments:{action:"list"}}}')" |
+        CNTCTR_DB="$db" CNTCTR_PANE="$orch" env -u TMUX_PANE "$BIN" | tail -n 1)
+    same "code-admin CNTCTR_PANE=<orchestrator> from a non-descendant denied" "$(_ca_isc "$out")" err
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb resolve-project %999999 2>&1); rc=$?
+    same "code-admin project path query failure is an error, not the process cwd" "$((rc != 0))" 1
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb resolve-project "$orch" 2>&1); rc=$?
+    same "code-admin project path of a live pane resolves" "$rc" 0
+    check "code-admin pane project is the pane's repo" "$out" "projA"
+
+    # 4. Human rules are immutable to the orchestrator
+    out=$(_ca_mcp "$orch" code_grant '{"server":"fake","tool_pattern":"write_item","level":"allow"}')
+    same "code-admin MCP allow over human deny refused" "$(_ca_isc "$out")" err
+    check "code-admin refusal says a human set the rule" "$(txt "$out")" "human"
+    same "code-admin human deny row unchanged" "$(_ca_q "SELECT level||granted_by FROM code_grants WHERE tool_pattern='write_item'")" "denyhuman"
+    out=$(_ca_mcp "$orch" code_grant '{"server":"fake","tool_pattern":"ping","level":"class:write"}')
+    same "code-admin MCP class rule over human class rule refused" "$(_ca_isc "$out")" err
+    same "code-admin human class row unchanged" "$(_ca_q "SELECT level||granted_by FROM code_grants WHERE tool_pattern='ping'")" "class:destructivehuman"
+    out=$(_ca_mcp "$orch" code_revoke '{"server":"fake","tool_pattern":"write_item"}')
+    same "code-admin MCP revoke of human deny refused" "$(_ca_isc "$out")" err
+    out=$(_ca_mcp "$orch" code_revoke '{"server":"fake","tool_pattern":"ping","kind":"class"}')
+    same "code-admin MCP revoke of human class rule refused" "$(_ca_isc "$out")" err
+    same "code-admin both human rows survive" "$(_ca_q "SELECT count(*) FROM code_grants WHERE granted_by='human' AND server='fake'")" 2
+    out=$(_ca_mcp "$orch" code_server "$(jq -nc --arg py "$py" --arg fx "$fixture" '{action:"add",name:"fake",command:$py,args:[$fx]}')")
+    same "code-admin MCP replace of server with human rules refused" "$(_ca_isc "$out")" err
+    check "code-admin replace refusal says ask the user" "$(txt "$out")" "a human set rules on this server; ask the user"
+    out=$(_ca_mcp "$orch" code_server '{"action":"remove","name":"fake"}')
+    same "code-admin MCP remove of server with human rules refused" "$(_ca_isc "$out")" err
+    same "code-admin server row unchanged after refusals" "$(_ca_q "SELECT reg_id FROM code_servers WHERE name='fake'")" "$reg_fake"
+    same "code-admin refusals never started fake-mcp" "$([ -e "$d/fake.pid" ] && echo started || echo none)" "none"
+
+    # 4b. CODE-ADMIN-09: a human ALLOW row is as immutable as a deny; revoke commits are guarded too
+    _ca_cli "$d/projA" server add fkh --project --cmd "$py" --arg "$fixture" --arg --tag --arg fkh --trust annotations >/dev/null
+    _ca_cli "$d/projA" grant fkh.echo allow >/dev/null
+    same "code-admin human allow row recorded" "$(_ca_q "SELECT level||'|'||granted_by FROM code_grants WHERE server='fkh' AND tool_pattern='echo'")" "allow|human"
+    out=$(_ca_mcp "$orch" code_grant '{"server":"fkh","tool_pattern":"echo","level":"allow","reason":"overwrite"}')
+    same "code-admin MCP cannot overwrite a human allow row" "$(_ca_isc "$out")" err
+    check "code-admin overwrite refusal says a human set the rule" "$(txt "$out")" "a human set this rule"
+    out=$(_ca_mcp "$orch" code_revoke '{"server":"fkh","tool_pattern":"echo"}')
+    same "code-admin MCP cannot revoke a human allow row" "$(_ca_isc "$out")" err
+    same "code-admin human allow row unchanged" "$(_ca_q "SELECT level||'|'||granted_by||'|'||reason FROM code_grants WHERE server='fkh' AND tool_pattern='echo'")" "allow|human|"
+    _ca_mcp "$orch" code_grant '{"server":"fkh","tool_pattern":"ping","level":"read"}' >/dev/null
+    (CNTCTR_TEST_BARRIER="$d/br" CNTCTR_TEST_BARRIER_AT=revoke-precommit _ca_mcp "$orch" code_revoke '{"server":"fkh","tool_pattern":"ping"}' > "$d/br.out") &
+    local br_job=$!
+    same "code-admin revoke barrier reached" "$(_ca_wait_file "$d/br.ready" && echo yes || echo no)" yes
+    _ca_q "UPDATE code_grants SET granted_by='human' WHERE server='fkh' AND tool_pattern='ping'" >/dev/null
+    : > "$d/br.go"
+    wait "$br_job"
+    same "code-admin revoke of a rule that turned human before commit is refused" "$(_ca_isc "$(cat "$d/br.out")")" err
+    check "code-admin revoke refusal says a human set the rule" "$(txt "$(cat "$d/br.out")")" "a human set this rule"
+    same "code-admin the now-human rule survived the racing revoke" "$(_ca_q "SELECT count(*) FROM code_grants WHERE server='fkh' AND tool_pattern='ping'")" 1
+    _ca_cli "$d/projA" grant fkh.ping deny >/dev/null 2>&1 || true
+    (CNTCTR_TEST_BARRIER="$d/bcr" CNTCTR_TEST_BARRIER_AT=revoke-precommit _ca_pty y "$d/projA" "$BIN" code revoke fkh.ping > "$d/bcr.out") &
+    local bcr_job=$!
+    same "code-admin CLI revoke barrier reached after confirmation" "$(_ca_wait_file "$d/bcr.ready" && echo yes || echo no)" yes
+    _ca_q "UPDATE code_grants SET reason='edited meanwhile' WHERE server='fkh' AND tool_pattern='ping'" >/dev/null
+    : > "$d/bcr.go"
+    wait "$bcr_job"
+    check "code-admin CLI revoke of a protected rule edited after confirm: re-confirmed" "$(cat "$d/bcr.out")" "PROMPTED=2"
+    same "code-admin re-confirmed revoke removed the rule" "$(_ca_q "SELECT count(*) FROM code_grants WHERE server='fkh' AND tool_pattern='ping'")" 0
+    _ca_pty y "$d/projA" "$BIN" code server remove --project fkh >/dev/null
+
+    # 4c. CODE-ADMIN-06: control characters in tool names never reach catalogs, grants or prose
+    out=$(_ca_mcp "$orch" code_server "$(jq -nc --arg py "$py" --arg fx "$fixture" '{action:"add",name:"ev",command:$py,args:[$fx,"--evil-tool-names"],trust:"annotations"}')")
+    same "code-admin MCP add ev" "$(_ca_isc "$out")" ok
+    out=$(_ca_mcp "$orch" code_server '{"action":"discover","name":"ev"}')
+    same "code-admin discover of a server with hostile tool names ok" "$(_ca_isc "$out")" ok
+    refute "code-admin discover output has no control-character tool name" "$(txt "$out")" "bad"
+    same "code-admin catalog skipped hostile and over-long tool names" "$(_ca_q "SELECT count(*) FROM code_catalogs WHERE tools_json LIKE '%bad%' OR tools_json LIKE '%ctl%' OR tools_json LIKE '%xxxxxxxxxxxxxxxxxxxxxxxx%'")" 0
+    out=$(_ca_mcp "$orch" code_grant "$(jq -nc '{server:"ev",tool_pattern:"bad\ntool",level:"allow"}')")
+    same "code-admin grant pattern with a newline rejected" "$(_ca_isc "$out")" err
+    out=$(_ca_mcp "$orch" code_grant "$(jq -nc '{server:"ev",tool_pattern:"a\u007fb*",level:"read"}')")
+    same "code-admin grant pattern with DEL rejected" "$(_ca_isc "$out")" err
+    same "code-admin hostile patterns stored nothing" "$(_ca_q "SELECT count(*) FROM code_grants WHERE server='ev'")" 0
+    _ca_mcp "$orch" code_server '{"action":"remove","name":"ev"}' >/dev/null
+
+    # 4d. CODE-ADMIN-08: a failed grant lookup is a distinct error, not an ordinary denial
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-check "" reg-x tool read)
+    check "code-admin grant check with invalid parameters returns -1" "$out" "rc=-1 "
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-check no-such-project reg-x tool read)
+    check "code-admin an ordinary denial stays rc=1" "$out" "rc=1 "
+
+    # 5. Server scope & naming
+    out=$(_ca_mcp "$orch" code_server "$(jq -nc --arg py "$py" '{action:"add",name:"fk",command:$py}')")
+    same "code-admin MCP cannot shadow a user-scoped server" "$(_ca_isc "$out")" err
+    check "code-admin shadow refusal mentions user-scoped" "$(txt "$out")" "user-scoped"
+    same "code-admin shadow attempt left one fk row" "$(_ca_q "SELECT count(*)||'|'||min(scope_project) FROM code_servers WHERE name='fk'")" "1|"
+    out=$(_ca_mcp "$orch" code_server '{"action":"remove","name":"fk"}')
+    same "code-admin MCP cannot remove a user-scoped server" "$(_ca_isc "$out")" err
+    out=$(_ca_mcp "$orch" code_server '{"action":"restart","name":"fk"}')
+    same "code-admin MCP cannot restart a user-scoped server" "$(_ca_isc "$out")" err
+    same "code-admin user-scoped fk survives" "$(_ca_q "SELECT count(*) FROM code_servers WHERE name='fk' AND scope_project=''")" 1
+    for r in cntctr bad.name "has space"; do
+        out=$(_ca_mcp "$orch" code_server "$(jq -nc --arg n "$r" --arg py "$py" '{action:"add",name:$n,command:$py}')")
+        same "code-admin MCP add rejects name '$r'" "$(_ca_isc "$out")" err
+    done
+    out=$(_ca_mcp "$orch" code_server '{"action":"add","name":"spacey","command":"/bin/echo hi"}')
+    same "code-admin MCP add rejects whitespace in command" "$(_ca_isc "$out")" err
+    out=$(_ca_mcp "$orch" code_server "$(jq -nc --arg py "$py" '{action:"add",name:"loc",command:$py,env:{SECRET:"zzz-secret-value"}}')")
+    same "code-admin MCP add project-local server" "$(_ca_isc "$out")" ok
+    same "code-admin MCP add defaults trust=none and project scope" "$(_ca_q "SELECT trust||'|'||(scope_project='$projA') FROM code_servers WHERE name='loc'")" "none|1"
+    same "code-admin MCP add records created_by" "$(_ca_q "SELECT created_by FROM code_servers WHERE name='loc'")" "orch1"
+    out=$(_ca_mcp "$orch" code_server '{"action":"list"}')
+    check "code-admin list shows env key" "$(txt "$out")" "SECRET"
+    refute "code-admin list hides env value" "$(txt "$out")" "zzz-secret-value"
+    check "code-admin list shows loc" "$(txt "$out")" "loc"
+    local reg_loc1 reg_loc2
+    reg_loc1=$(_ca_q "SELECT reg_id FROM code_servers WHERE name='loc'")
+    _ca_mcp "$orch" code_server "$(jq -nc --arg py "$py" '{action:"add",name:"loc",command:$py,trust:"annotations"}')" >/dev/null
+    reg_loc2=$(_ca_q "SELECT reg_id FROM code_servers WHERE name='loc'")
+    same "code-admin MCP update of own project-local row replaces reg_id" "$([ "$reg_loc1" != "$reg_loc2" ] && echo yes || echo no)" "yes"
+    out=$(_ca_mcp "$orch" code_server '{"action":"remove","name":"loc"}')
+    same "code-admin MCP remove own project-local server" "$(_ca_isc "$out")" ok
+    same "code-admin loc removed" "$(_ca_q "SELECT count(*) FROM code_servers WHERE name='loc'")" 0
+    _ca_cli "$d/projC" server add shd2 --cmd /bin/echo >/dev/null
+    CNTCTR_DB="$db" "$BIN" _test-code-kb server-put "$projC" shd2 /bin/echo '[]' '{}' 0 none human 0 >/dev/null
+    out=$(_ca_mcp "$orch" code_server '{"action":"list"}')
+    check "code-admin MCP list counts other projects' shadows" "$(txt "$out")" "shadowed in 1 projects"
+    refute "code-admin MCP list hides other projects' roots" "$(txt "$out")" "$projC"
+    check "code-admin CLI list keeps the shadowing roots" "$(_ca_cli "$d/projA" server list)" "$projC"
+    _ca_cli "$d/projC" server remove --project shd2 >/dev/null
+    _ca_cli "$d/projC" server remove shd2 >/dev/null
+    _ca_cli "$d/projA" server add shdw --project --cmd /bin/echo >/dev/null
+    out=$(_ca_cli "$d/projC" server add shdw --cmd /bin/echo)
+    check "code-admin user-scoped add reports shadowed project rows" "$out" "shadowed in 1 project"
+    out=$(_ca_cli "$d/projA" server list)
+    check "code-admin server list shows shadowed rows" "$out" "shadowed"
+    _ca_cli "$d/projA" server remove --project shdw >/dev/null
+    _ca_cli "$d/projA" server remove shdw >/dev/null
+
+    # 6. Orchestrator grants: discovery, class_at_grant, typo suggestions, virtual cntctr
+    out=$(_ca_mcp "$orch" code_grant '{"server":"fk","tool_pattern":"write_item","level":"allow","reason":"needed"}')
+    same "code-admin MCP allow write_item discovers and grants" "$(_ca_isc "$out")" ok
+    same "code-admin MCP grant records class_at_grant, granter, reg_id" "$(_ca_q "SELECT class_at_grant||'|'||granted_by||'|'||(reg_id=(SELECT reg_id FROM code_servers WHERE name='fk')) FROM code_grants WHERE project='$projA' AND tool_pattern='write_item' AND server='fk'")" "write|orch1|1"
+    out=$(_ca_mcp "$orch" code_grant '{"server":"fk","tool_pattern":"wriet_item","level":"allow"}')
+    same "code-admin MCP unknown tool rejected" "$(_ca_isc "$out")" err
+    check "code-admin unknown tool suggests write_item" "$(txt "$out")" "write_item"
+    same "code-admin unknown tool stored nothing" "$(_ca_q "SELECT count(*) FROM code_grants WHERE tool_pattern='wriet_item'")" 0
+    out=$(_ca_mcp "$orch" code_grant '{"server":"fk","tool_pattern":"write_*","level":"allow"}')
+    same "code-admin MCP allow glob rejected (exact tool only)" "$(_ca_isc "$out")" err
+    out=$(_ca_mcp "$orch" code_grant '{"server":"fk","tool_pattern":"echo*","level":"read"}')
+    same "code-admin MCP read glob accepted" "$(_ca_isc "$out")" ok
+    out=$(_ca_mcp "$orch" code_grant '{"server":"cntctr","tool_pattern":"*","level":"read"}')
+    same "code-admin virtual cntctr read grant" "$(_ca_isc "$out")" ok
+    out=$(_ca_mcp "$orch" code_grant '{"server":"cntctr","tool_pattern":"note","level":"allow"}')
+    same "code-admin virtual cntctr allow note" "$(_ca_isc "$out")" ok
+    same "code-admin virtual cntctr rows bind reg_id cntctr" "$(_ca_q "SELECT group_concat(reg_id||':'||tool_pattern||':'||class_at_grant) FROM (SELECT * FROM code_grants WHERE server='cntctr' ORDER BY tool_pattern)")" "cntctr:*:,cntctr:note:write"
+    out=$(_ca_mcp "$orch" code_grant '{"server":"cntctr","tool_pattern":"nope","level":"allow"}')
+    same "code-admin virtual cntctr unknown tool rejected" "$(_ca_isc "$out")" err
+    out=$(_ca_mcp "$orch" code_grant '{"server":"nosuch","tool_pattern":"x","level":"read"}')
+    same "code-admin MCP unknown server rejected" "$(_ca_isc "$out")" err
+    out=$(_ca_mcp "$orch" code_server '{"action":"discover","name":"fk"}')
+    same "code-admin orchestrator discover ok" "$(_ca_isc "$out")" ok
+    check "code-admin discover lists tools with class" "$(txt "$out")" "nuke"
+    out=$(_ca_mcp "$orch" code_revoke '{"server":"fk","tool_pattern":"echo*"}')
+    same "code-admin MCP revokes its own rule" "$(_ca_isc "$out")" ok
+    same "code-admin revoked rule gone" "$(_ca_q "SELECT count(*) FROM code_grants WHERE tool_pattern='echo*'")" 0
+
+    # 6b. discover (CLI) and restart (MCP for project-local, CLI for user-scoped) stop the right process
+    out=$(_ca_cli "$d/projC" server discover fk)
+    check "code-admin CLI discover lists tools with classes" "$out" "nuke  destructive"
+    out=$(_ca_mcp "$orch" code_server "$(jq -nc --arg py "$py" --arg fx "$fixture" --arg pf "$d/rs1.pid" '{action:"add",name:"rs1",command:$py,args:[$fx,"--pid-file",$pf],trust:"annotations"}')")
+    same "code-admin MCP add rs1" "$(_ca_isc "$out")" ok
+    out=$(_ca_mcp "$orch" code_server '{"action":"discover","name":"rs1"}')
+    same "code-admin MCP discover rs1 starts it" "$(_ca_isc "$out")" ok
+    local pid_rs1 pid_fk i
+    pid_rs1=$(tr -d '[:space:]' < "$d/rs1.pid")
+    same "code-admin rs1 is running" "$(kill -0 "$pid_rs1" 2>/dev/null && echo yes || echo no)" "yes"
+    out=$(_ca_mcp "$workr" code_server '{"action":"restart","name":"rs1"}')
+    same "code-admin worker restart denied" "$(_ca_isc "$out")" err
+    same "code-admin denied restart left rs1 running" "$(kill -0 "$pid_rs1" 2>/dev/null && echo yes || echo no)" "yes"
+    out=$(_ca_mcp "$orch" code_server '{"action":"restart","name":"rs1"}')
+    same "code-admin MCP restart own project-local server" "$(_ca_isc "$out")" ok
+    for i in $(seq 100); do kill -0 "$pid_rs1" 2>/dev/null || break; sleep 0.05; done
+    same "code-admin restart stopped the rs1 process" "$(kill -0 "$pid_rs1" 2>/dev/null && echo yes || echo no)" "no"
+    pid_fk=$(tr -d '[:space:]' < "$d/fk.pid")
+    out=$(_ca_cli "$d/projA" server restart fk)
+    check "code-admin CLI restart reports restarted" "$out" "restarted server fk"
+    for i in $(seq 100); do kill -0 "$pid_fk" 2>/dev/null || break; sleep 0.05; done
+    same "code-admin CLI restart stopped the fk process" "$(kill -0 "$pid_fk" 2>/dev/null && echo yes || echo no)" "no"
+    _ca_mcp "$orch" code_server '{"action":"remove","name":"rs1"}' >/dev/null
+
+    # 6c. CODE-ADMIN-02: restart is bound to the checked registration and exact instance, never to name+scope
+    _ca_cli "$d/projA" server add iso --isolated --cmd "$py" --arg "$fixture" --arg --tag --arg isoU --trust annotations >/dev/null
+    _ca_mcp "$orch" code_server '{"action":"discover","name":"iso"}' >/dev/null
+    _ca_cli "$d/projC" server discover iso >/dev/null
+    same "code-admin two isolated user-scoped iso instances (projA, projC)" "$(_ca_pcount '--tag isoU')" 2
+    # insert the shadow straight into the store: one setup step, and no CLI/daemon traffic between the instances
+    # being started and the restart under test
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb server-put "$projA" iso "$py" "$(jq -nc --arg fx "$fixture" '[$fx,"--tag","isoL"]')" '{}' 0 annotations human 0)
+    check "code-admin project-local iso shadows the user-scoped one" "$out" "rc=0 "
+    _ca_mcp "$orch" code_server '{"action":"discover","name":"iso"}' >/dev/null
+    same "code-admin project-local iso instance running" "$(_ca_pcount '--tag isoL')" 1
+    same "code-admin user-scoped isolated iso instance of projA still running beside it" "$(_ca_pcount '--tag isoU')" 2
+    out=$(_ca_mcp "$orch" code_server '{"action":"restart","name":"iso"}')
+    same "code-admin restart of project-local iso ok" "$(_ca_isc "$out")" ok
+    for i in $(seq 100); do [ "$(_ca_pcount '--tag isoL')" = 0 ] && break; sleep 0.05; done
+    same "code-admin restart stopped the project-local instance" "$(_ca_pcount '--tag isoL')" 0
+    same "code-admin project-local restart left same-name user-scoped isolated instances alone" "$(_ca_pcount '--tag isoU')" 2
+    _ca_mcp "$orch" code_server '{"action":"discover","name":"iso"}' >/dev/null
+    same "code-admin project-local iso running again" "$(_ca_pcount '--tag isoL')" 1
+    out=$(_ca_cli "$d/projC" server restart iso)
+    check "code-admin CLI restart of user-scoped iso in projC" "$out" "restarted server iso"
+    for i in $(seq 100); do [ "$(_ca_pcount '--tag isoU')" = 1 ] && break; sleep 0.05; done
+    same "code-admin user-scoped restart stopped only that project's instance" "$(_ca_pcount '--tag isoU')" 1
+    same "code-admin user-scoped restart left the project-local instance alone" "$(_ca_pcount '--tag isoL')" 1
+
+    # 6d. CODE-ADMIN-05: remove's daemon reload carries the OLD reg_id and stops only that registration's instances
+    out=$(_ca_mcp "$orch" code_server '{"action":"remove","name":"iso"}')
+    same "code-admin MCP removes the project-local iso" "$(_ca_isc "$out")" ok
+    for i in $(seq 100); do [ "$(_ca_pcount '--tag isoL')" = 0 ] && break; sleep 0.05; done
+    same "code-admin project-local remove stopped its own instance" "$(_ca_pcount '--tag isoL')" 0
+    same "code-admin project-local remove left the same-name user-scoped isolated instance alone" "$(_ca_pcount '--tag isoU')" 1
+    out=$(CNTCTR_DB="$db" "$BIN" _test-code-kb server-put "$projA" iso "$py" "$(jq -nc --arg fx "$fixture" '[$fx,"--tag","isoL"]')" '{}' 0 annotations human 0)
+    check "code-admin project-local iso back (no reload)" "$out" "rc=0 "
+    _ca_mcp "$orch" code_server '{"action":"discover","name":"iso"}' >/dev/null
+    same "code-admin project-local iso running for the user-scoped remove" "$(_ca_pcount '--tag isoL')" 1
+    out=$(_ca_cli "$d/projC" server remove iso)
+    check "code-admin CLI removes the user-scoped iso" "$out" "removed server iso (user)"
+    for i in $(seq 100); do [ "$(_ca_pcount '--tag isoU')" = 0 ] && break; sleep 0.05; done
+    same "code-admin user-scoped remove stopped the user-scoped instances" "$(_ca_pcount '--tag isoU')" 0
+    same "code-admin user-scoped remove left the project-local instance alone" "$(_ca_pcount '--tag isoL')" 1
+    _ca_mcp "$orch" code_server '{"action":"remove","name":"iso"}' >/dev/null
+
+    # 6e. CODE-ADMIN-03 (round 2): the guard snapshot is injective for arbitrary stored text
+    local nl=$'\n' us=$'\x1f' snapA snapB snapB2 snapR
+    snapR="x${nl}p2${us}access${us}read${us}${us}orch${us}1000${us}y"   # a naive concatenation of {p1:"x"; p2:"y"} equals this single row
+    CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put snap-proj reg-snap srv p1 access read "" orch "$snapR" 0 >/dev/null
+    _ca_q "UPDATE code_grants SET granted_at=1000 WHERE project='snap-proj'"
+    snapA=$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-snapshot snap-proj reg-snap "")
+    _ca_q "DELETE FROM code_grants WHERE project='snap-proj'"
+    CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put snap-proj reg-snap srv p1 access read "" orch "x" 0 >/dev/null
+    CNTCTR_DB="$db" "$BIN" _test-code-kb grant-put snap-proj reg-snap srv p2 access read "" orch "y" 0 >/dev/null
+    _ca_q "UPDATE code_grants SET granted_at=1000 WHERE project='snap-proj'"
+    snapB=$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-snapshot snap-proj reg-snap "")
+    snapB2=$(CNTCTR_DB="$db" "$BIN" _test-code-kb grant-snapshot snap-proj reg-snap "")
+    same "code-admin snapshot of equal state is stable" "$([ -n "$snapB" ] && [ "$snapB" = "$snapB2" ] && echo yes || echo no)" yes
+    same "code-admin snapshots differ where naive delimiter concatenation would collide" "$([ -n "$snapA" ] && [ "$snapA" != "$snapB" ] && echo yes || echo no)" yes
+    _ca_q "DELETE FROM code_grants WHERE project='snap-proj'"
+
+    # 7. Destructive escalation with shell-quoted command (apostrophe path), then human runs it
+    out=$(_ca_mcp "$orchQ" code_grant '{"server":"fk","tool_pattern":"nuke","level":"allow"}')
+    same "code-admin destructive allow by orchestrator is not applied" "$(_ca_q "SELECT count(*) FROM code_grants WHERE tool_pattern='nuke' AND project='$projQs'")" 0
+    check "code-admin escalation names the human terminal" "$(txt "$out")" "Run in your own terminal"
+    cmdline=$(txt "$out" | sed -n 's/^  \(cd .*\)$/\1/p' | head -n 1)
+    check "code-admin escalation command is cd && cntctr code grant" "$cmdline" "cntctr code grant 'fk.nuke' allow"
+    check "code-admin escalation shell-quotes the apostrophe path" "$cmdline" "proj'\\''s dir"
+    check "code-admin escalation posted to the board" "$(txt "$(_ca_mcp "$orchQ" board '{}')")" "cntctr code grant"
+    out=$(_ca_pty y "$d" sh -c "$cmdline")
+    check "code-admin pasted escalation command succeeds under PTY y" "$out" "RC=0"
+    same "code-admin pasted command granted nuke in the apostrophe project" "$(_ca_q "SELECT granted_by||'|'||class_at_grant FROM code_grants WHERE project='$projQs' AND tool_pattern='nuke'")" "human|destructive"
+
+    # 8. Policy: destructive-orchestrator allow lets the orchestrator grant; changes need a TTY y/N
+    out=$(_ca_cli "$d/projA" policy destructive-orchestrator allow); rc=$?
+    same "code-admin policy change without TTY refused" "$((rc != 0))" 1
+    out=$(_ca_pty y "$d/projA" "$BIN" code policy destructive-orchestrator allow)
+    check "code-admin policy change under PTY y" "$out" "RC=0"
+    out=$(_ca_mcp "$orch" code_grant '{"server":"fk","tool_pattern":"nuke","level":"allow"}')
+    same "code-admin allowed policy lets orchestrator grant destructive" "$(_ca_isc "$out")" ok
+    same "code-admin policy-allowed grant records the orchestrator" "$(_ca_q "SELECT granted_by||'|'||class_at_grant FROM code_grants WHERE project='$projA' AND tool_pattern='nuke'")" "orch1|destructive"
+    # 8b. CODE-ADMIN-03: the decision is bound to what commits (policy, effective registration, rule state)
+    _ca_mcp "$orch" code_revoke '{"server":"fk","tool_pattern":"nuke"}' >/dev/null
+    (CNTCTR_TEST_BARRIER="$d/bp" CNTCTR_TEST_BARRIER_AT=grant-precommit _ca_mcp "$orch" code_grant '{"server":"fk","tool_pattern":"nuke","level":"allow"}' > "$d/bp.out") &
+    local bp_job=$!
+    same "code-admin policy-flip barrier reached" "$(_ca_wait_file "$d/bp.ready" && echo yes || echo no)" yes
+    _ca_q "INSERT OR REPLACE INTO meta(k,v) VALUES('code_destructive_orchestrator:$projA','escalate')" >/dev/null
+    : > "$d/bp.go"
+    wait "$bp_job"
+    check "code-admin policy flipped before commit escalates instead of granting" "$(txt "$(cat "$d/bp.out")")" "NOT granted"
+    same "code-admin policy-flip stored no destructive grant" "$(_ca_q "SELECT count(*) FROM code_grants WHERE project='$projA' AND tool_pattern='nuke'")" 0
+    _ca_q "INSERT OR REPLACE INTO meta(k,v) VALUES('code_destructive_orchestrator:$projA','allow')" >/dev/null
+
+    local old_fk
+    old_fk=$(_ca_q "SELECT reg_id FROM code_servers WHERE name='fk' AND scope_project=''")
+    (CNTCTR_TEST_BARRIER="$d/bs" CNTCTR_TEST_BARRIER_AT=grant-precommit _ca_pty y "$d/projC" "$BIN" code grant fk.nuke allow > "$d/bs.out") &
+    local bs_job=$!
+    same "code-admin shadow barrier reached after confirmation" "$(_ca_wait_file "$d/bs.ready" && echo yes || echo no)" yes
+    _ca_cli "$d/projC" server add fk --project --cmd "$py" --arg "$fixture" --arg --tag --arg fkshadow --trust annotations >/dev/null
+    : > "$d/bs.go"
+    wait "$bs_job"
+    out=$(cat "$d/bs.out")
+    check "code-admin shadow added after confirm: grant re-confirmed" "$out" "PROMPTED=2"
+    same "code-admin shadowed grant binds the project-local registration" "$(_ca_q "SELECT reg_id=(SELECT reg_id FROM code_servers WHERE name='fk' AND scope_project='$projC') FROM code_grants WHERE project='$projC' AND tool_pattern='nuke'")" 1
+    same "code-admin nothing bound to the replaced user-scoped registration in projC" "$(_ca_q "SELECT count(*) FROM code_grants WHERE project='$projC' AND reg_id='$old_fk'")" 0
+    _ca_pty y "$d/projC" "$BIN" code server remove --project fk >/dev/null
+
+    _ca_cli "$d/projC" grant fk.zap deny >/dev/null
+    (CNTCTR_TEST_BARRIER="$d/bc" CNTCTR_TEST_BARRIER_AT=grant-precommit _ca_pty y "$d/projC" "$BIN" code grant fk.zap read > "$d/bc.out") &
+    local bc_job=$!
+    same "code-admin protected-rule barrier reached after confirmation" "$(_ca_wait_file "$d/bc.ready" && echo yes || echo no)" yes
+    _ca_q "UPDATE code_grants SET reason='edited meanwhile' WHERE project='$projC' AND tool_pattern='zap'" >/dev/null
+    : > "$d/bc.go"
+    wait "$bc_job"
+    check "code-admin protected rule edited after confirm: re-confirmed" "$(cat "$d/bc.out")" "PROMPTED=2"
+    same "code-admin re-confirmed replace landed" "$(_ca_q "SELECT level||'|'||granted_by FROM code_grants WHERE project='$projC' AND tool_pattern='zap'")" "read|human"
+    _ca_cli "$d/projC" revoke fk.zap >/dev/null
+
+    out=$(_ca_pty y "$d/projA" "$BIN" code policy destructive-orchestrator escalate)
+    check "code-admin policy back to escalate" "$out" "RC=0"
+    out=$(_ca_pty y "$d/projA" "$BIN" code policy destructive-orchestrator bogus)
+    refute "code-admin policy rejects unknown value" "$out" "RC=0"
+
+    # 9. CLI replace/revoke of human rules needs TTY y/N, and daemon-independent persistence
+    out=$(_ca_cli "$d/projA" revoke fake.write_item); rc=$?
+    same "code-admin CLI revoke of human deny without TTY refused" "$((rc != 0))" 1
+    same "code-admin human deny survives refused revoke" "$(_ca_q "SELECT count(*) FROM code_grants WHERE tool_pattern='write_item' AND server='fake'")" 1
+    out=$(_ca_cli "$d/projA" server remove --project fake); rc=$?
+    same "code-admin CLI remove of server with human rules without TTY refused" "$((rc != 0))" 1
+    out=$(_ca_pty n "$d/projA" "$BIN" code server remove --project fake)
+    check "code-admin CLI remove prompts and PTY n aborts" "$out" "PROMPTED=1"
+    same "code-admin PTY n keeps the server" "$(_ca_q "SELECT count(*) FROM code_servers WHERE name='fake'")" 1
+    same "code-admin daemon is up before the stop attempts" "$([ -S "$d/code.sock" ] && echo yes || echo no)" yes
+    out=$(_ca_pty y "$d/projC" "$d/claude" "'$BIN' code stop")
+    check "code-admin code stop refused under a claude ancestor" "$out" "ancestor process 'claude'"
+    out=$(CNTCTR_DB="$db" CNTCTR_ROOT="$d" env -u TMUX_PANE -u CNTCTR_PANE -u CNTCTR_CODE_SOCK "$BIN" code stop 2>&1); rc=$?
+    same "code-admin code stop refused with CNTCTR_ROOT" "$((rc != 0))" 1
+    check "code-admin code stop names CNTCTR_ROOT" "$out" "CNTCTR_ROOT"
+    same "code-admin daemon survived refused stops" "$([ -S "$d/code.sock" ] && echo yes || echo no)" yes
+    check "code-admin code status stays readable under a claude ancestor" "$(_ca_pty n "$d/projC" "$d/claude" "'$BIN' code status --short")" "RC=0"
+    _ca_stop
+    same "code-admin daemon stopped" "$([ -S "$d/code.sock" ] && echo yes || echo no)" "no"
+    check "code-admin registrations survive daemon stop" "$(_ca_cli "$d/projA" server list)" "fk"
+    check "code-admin grants survive daemon stop" "$(_ca_cli "$d/projA" grants fk)" "write_item"
+    out=$(_ca_mcp "$orch" code_server '{"action":"list"}')
+    check "code-admin MCP list after restart sees registrations" "$(txt "$out")" "fk"
+    out=$(_ca_pty y "$d/projA" "$BIN" code server remove --project fake)
+    check "code-admin PTY y removes server with human rules" "$out" "RC=0"
+    check "code-admin remove reports dropped grants" "$out" "dropped 2 grants in 1 projects"
+    _ca_stop
+}
+if [ "${ONLY:-}" = code-admin ]; then
+    code_admin_run
+    printf '%d passed, %d failed\n' "$pass" "$fail"
+    [ "$fail" -eq 0 ]; exit $?
+fi
+
+# ---- Code Mode Phase 7: agent MCP tools (code_find/run/expand/status) and the tools.cntctr.* reverse RPC ----
+code_e2e_run() {
+    local d="$TMPD/code_e2e" db out rc projA projB fixture py orch orch2 workr i
+    mkdir -p "$d/projA" "$d/projB" "$d/nosess"
+    db="$d/kb.db"
+    fixture="$(pwd)/fixtures/fake-mcp.py"
+    py="$(command -v python3)"
+    local r
+    for r in "$d/projA" "$d/projB"; do
+        git -C "$r" init -q
+        git -C "$r" -c user.name=T -c user.email=t@example.invalid commit --allow-empty -qm init
+    done
+    projA=$(CNTCTR_DB="$db" "$BIN" _test-code-kb resolve-cwd "$d/projA")
+    projB=$(CNTCTR_DB="$db" "$BIN" _test-code-kb resolve-cwd "$d/projB")
+
+    _ce_cli() { local dir=$1; shift; (cd "$dir" && CNTCTR_DB="$db" env -u TMUX_PANE -u CNTCTR_PANE -u CNTCTR_ROOT -u CNTCTR_CODE_SOCK "$BIN" code "$@" 2>&1); }
+    _ce_pane() {
+        local p
+        p=$(t new-window -d -P -F '#{pane_id}' -c "$2" cat)
+        t set -p -t "$p" @cntctr_name "$1"; t set -p -t "$p" @cntctr_harness test; t set -p -t "$p" @cntctr_srv $$
+        [ -n "${3:-}" ] && t set -p -t "$p" @cntctr_parent "$3"
+        echo "$p"
+    }
+    _ce_mcp() { CNTCTR_TEST_PANE_ROOT_PID=$$ CNTCTR_DB="$db" call "$@"; }
+    # a paneless MCP process (Codex-style) started in <dir>, attributing itself with from=<name>
+    # stdin stays open until the answer arrives (a closed stdin cancels the call, as for a real harness that goes away)
+    _ce_paneless() {
+        local dir=$1 tool=$2 args=$3 from=$4 fifo callj last="" l n=2
+        fifo=$(mktemp -u "$TMPD/pfifo.XXXXXX"); mkfifo "$fifo"
+        callj=$(jq -nc --arg t "$tool" --argjson a "$args" --arg f "$from" '{jsonrpc:"2.0",id:2,method:"tools/call",params:{name:$t,arguments:($a + {from:$f})}}')
+        (cd "$dir" && CNTCTR_DB="$db" CNTCTR_CLAUDE_SESSIONS_DIR="$d/nosess" env -u TMUX_PANE -u CNTCTR_PANE "$BIN" < "$fifo") | {
+            exec 3> "$fifo"
+            printf '%s\n' "$INIT" "$callj" >&3
+            while [ "$n" -gt 0 ] && IFS= read -r l; do last=$l; n=$((n - 1)); done
+            exec 3>&-
+            printf '%s\n' "$last"
+        }
+        rm -f "$fifo"
+    }
+    _ce_isc() { [ "$(iserr "$1")" = true ] && echo err || echo ok; }
+    _ce_q() { sq "$db" "$1"; }
+    _ce_stop() { _ce_cli "$d" stop >/dev/null 2>&1 || true; }
+    _ce_wait_file() { local f=$1 i=0; while [ ! -f "$f" ] && [ "$i" -lt 500 ]; do sleep 0.02; i=$((i + 1)); done; [ -f "$f" ]; }
+    _ce_run() { _ce_mcp "$1" code_run "$(jq -nc --arg s "$2" '{script:$s}')"; }
+    _ce_j() { printf '%s' "$(txt "$1")" | jq -r "$2" 2>/dev/null; }
+
+    orch=$(_ce_pane orch1 "$d/projA")
+    orch2=$(_ce_pane orch2 "$d/projA")
+    workr=$(_ce_pane worker1 "$d/projA" "$orch")
+
+    # tools/list as <pane>'s agent (the MCP process stands in for the pane's root, a test hook), and just its code_* names
+    _ce_list() { CNTCTR_TEST_PANE_ROOT_PID=$$ CNTCTR_DB="$db" SKIP=1 session "$1" 2 "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | tail -n 1; }
+    _ce_names() { printf '%s' "$1" | jq -r '[.result.tools[].name | select(startswith("code_"))] | sort | join(",")'; }
+    local orchB; orchB=$(_ce_pane orchb "$d/projB")
+
+    # a real process tree: an MCP server that is a descendant of a pane's root process, with no pane id in its environment
+    # (Codex starts MCP servers without TMUX_PANE unless env_vars passes it), finds its pane by walking up and passes is_orchestrator
+    _ce_tree() {   # $1 = cwd, $2 = parent pane for a worker or "": the code_* names of tools/list as seen from inside a new pane
+        local out="$d/tree.$RANDOM" w
+        w=$(t new-window -d -P -F '#{pane_id}' -c "$1" sh -c "sleep 1; { printf '%s\\n' '$INIT' '{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}'; sleep 2; } | env -u TMUX_PANE -u CNTCTR_PANE CNTCTR_CLAUDE_SESSIONS_DIR='$d/nosess' CNTCTR_DB='$db' '$BIN' > '$out.tmp'; mv '$out.tmp' '$out'")
+        [ -n "$2" ] && t set -p -t "$w" @cntctr_parent "$2"
+        local i=0; while [ ! -s "$out" ] && [ "$i" -lt 200 ]; do sleep 0.1; i=$((i + 1)); done
+        _ce_names "$(tail -n 1 "$out")"
+        t kill-pane -t "$w" 2>/dev/null; rm -f "$out"
+    }
+
+    # 0. code tools show only where they work: nothing to use yet, so only an orchestrator sees the admin tools
+    same "code-e2e a plain project (no pane, no server) lists none of the 7 code tools" "$(_ce_names "$(rpc "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | tail -n 1)")" ""
+    same "code-e2e an orchestrator with no usable server lists only the admin tools" "$(_ce_names "$(_ce_list "$orch")")" "code_grant,code_revoke,code_server"
+    same "code-e2e a spawned worker lists no code tool (no server, never admin)" "$(_ce_names "$(_ce_list "$workr")")" ""
+
+    # 1. setup: project-local fake in projA, user-scoped fk; catalogs cached by the CLI probe (no daemon)
+    _ce_cli "$d/projA" server add fake --project --cmd "$py" --arg "$fixture" --arg --pid-file --arg "$d/fake.pid" --trust annotations >/dev/null
+    _ce_cli "$d/projA" server add fk --cmd "$py" --arg "$fixture" --arg --pid-file --arg "$d/fk.pid" --trust annotations >/dev/null
+    _ce_cli "$d/projA" server discover fake >/dev/null
+    _ce_cli "$d/projA" server discover fk >/dev/null
+    _ce_cli "$d/projA" server add lazy --project --cmd "$py" --arg "$fixture" --trust annotations >/dev/null
+    rm -f "$d/fake.pid" "$d/fk.pid"   # the CLI probe started and stopped the servers once; only agent tools count from here
+    same "code-e2e daemon is off before any agent tool runs" "$([ -S "$d/code.sock" ] && echo yes || echo no)" "no"
+    local watch_sh; watch_sh="$(pwd)/watch.sh"
+    _ce_watch() { (cd "$d/projA" && CNTCTR_DB="$db" CNTCTR_BIN="$BIN" env -u TMUX_PANE -u CNTCTR_PANE -u CNTCTR_ROOT -u CNTCTR_CODE_SOCK "$watch_sh" --once 2>&1 | sed -n '/^== code mode ==/,/^== knowledge/p'); }
+    out=$(_ce_watch)
+    check "code-e2e watch.sh --once has a code mode section" "$out" "== code mode =="
+    check "code-e2e watch.sh --once says code: off while the daemon is stopped" "$out" "code: off"
+    same "code-e2e watch.sh --once did not start the daemon" "$([ -S "$d/code.sock" ] && echo yes || echo no)" "no"
+
+    # 2. code_find is passive: cached catalogs only, no server started
+    out=$(_ce_mcp "$orch" code_find '{"query":"echo"}')
+    same "code-e2e code_find ok" "$(_ce_isc "$out")" ok
+    check "code-e2e code_find lists fake.echo with class" "$(txt "$out")" "fake.echo [read]"
+    check "code-e2e code_find shows denied before any grant" "$(txt "$out")" "denied"
+    out=$(_ce_mcp "$orch" code_find '{}')
+    check "code-e2e unindexed server is marked as such" "$(txt "$out")" "lazy (unindexed;"
+    check "code-e2e unindexed hint names the discover command" "$(txt "$out")" "cntctr code server discover lazy"
+    same "code-e2e code_find started no tool server" "$([ -e "$d/fake.pid" ] || [ -e "$d/fk.pid" ] && echo started || echo none)" "none"
+    check "code-e2e code status shows 0 servers after find" "$(_ce_cli "$d/projA" status)" "0 servers"
+    out=$(_ce_mcp "$orch" code_find '{"query":"fake.echo"}')
+    check "code-e2e exact fake.echo hit includes the full inputSchema" "$(txt "$out")" '"msg"'
+    out=$(_ce_mcp "$orch" code_find '{"query":"no_such_tool_zz"}')
+    check "code-e2e code_find with no hit says so" "$(txt "$out")" "no tools"
+
+    # 3. grants, then an end-to-end run with Promise.all, 100 log lines, previews and paging
+    _ce_cli "$d/projA" grant 'fake.*' read >/dev/null
+    _ce_cli "$d/projA" grant 'fk.*' read >/dev/null
+    _ce_cli "$d/projA" grant 'cntctr.*' read >/dev/null
+    # 3a. a granted server shows the 4 agent tools to everyone in the project, the 3 admin tools only to the orchestrator
+    out=$(_ce_list "$orch")
+    _ce_instr() { CNTCTR_TEST_PANE_ROOT_PID=$$ CNTCTR_DB="$db" SKIP=1 session "$1" 1 "$INIT" | tail -n 1 | jq -r '.result.instructions'; }
+    same "code-e2e a process in a pane finds its pane without TMUX_PANE and lists all 7 (orchestrator)" "$(_ce_tree "$d/projA" "")" "code_expand,code_find,code_grant,code_revoke,code_run,code_server,code_status"
+    same "code-e2e ...and a worker pane (@cntctr_parent set) lists only the 4 agent tools" "$(_ce_tree "$d/projA" "$orch")" "code_expand,code_find,code_run,code_status"
+    local instr; instr=$(_ce_instr "$workr")
+    check "code-e2e initialize instructions mention code_find where code mode works" "$instr" "code_find"
+    check "code-e2e ...and code_run" "$instr" "code_run"
+    check "code-e2e ...and the read grant" "$instr" "read grant"
+    same "code-e2e initialize instructions in a plain project do not mention code mode" "$(CNTCTR_DB="$db" session "" 1 "$INIT" | tail -n 1 | jq -r '.result.instructions' | grep -c 'code_find')" 0
+    same "code-e2e an orchestrator with a granted server lists all 7 code tools" "$(_ce_names "$out")" "code_expand,code_find,code_grant,code_revoke,code_run,code_server,code_status"
+    same "code-e2e a spawned worker lists the 4 agent tools, never the admin tools" "$(_ce_names "$(_ce_list "$workr")")" "code_expand,code_find,code_run,code_status"
+    for r in code_find code_run code_expand code_status code_server code_grant code_revoke; do
+        same "code-e2e tools/list has $r with from" "$(printf '%s' "$out" | jq -r --arg n "$r" '[.result.tools[] | select(.name == $n) | .inputSchema.properties | has("from")] | first // false')" "true"
+    done
+    check "code-e2e code_run description states default-deny for read tools" "$(printf '%s' "$out" | jq -r '.result.tools[] | select(.name=="code_run") | .description')" "default-deny"
+    check "code-e2e code_find description says it never starts servers" "$(printf '%s' "$out" | jq -r '.result.tools[] | select(.name=="code_find") | .description')" "never starts"
+    # 3b. projB has no rule: fk (user-scoped, effective there) is unusable; a cntctr.* grant alone (the built-in server) does not count
+    same "code-e2e projB (fk but no rule) lists only the admin tools to its orchestrator" "$(_ce_names "$(_ce_list "$orchB")")" "code_grant,code_revoke,code_server"
+    _ce_cli "$d/projB" grant 'cntctr.*' read >/dev/null
+    same "code-e2e a cntctr.* grant alone does not make projB's agent tools appear" "$(_ce_names "$(_ce_list "$orchB")")" "code_grant,code_revoke,code_server"
+    _ce_q "DELETE FROM code_grants WHERE project='$projB' AND reg_id='cntctr'" >/dev/null
+    # hidden is not disabled: a stale call still gets the normal, clear answer
+    out=$(_ce_run "$orchB" 'return await tools.fk.ping();')
+    same "code-e2e a hidden code_run still answers (denied) in a project with no rule" "$(_ce_isc "$out")" err
+    check "code-e2e ...and the denial names the grant command" "$(_ce_j "$out" '.denied')" "cntctr code grant"
+    check "code-e2e ...and the all-projects form for a read tool" "$(_ce_j "$out" '.denied')" "--all-projects"
+    # P8AB-01: a project-local server cannot take an all-projects rule, so its denial does not suggest one
+    _ce_cli "$d/projB" server add locb --project --cmd "$py" --arg "$fixture" --trust annotations >/dev/null
+    _ce_cli "$d/projB" server discover locb >/dev/null
+    out=$(_ce_run "$orchB" 'return await tools.locb.ping();')
+    same "code-e2e a denied call on a project-local server errs" "$(_ce_isc "$out")" err
+    check "code-e2e ...and suggests the per-project grant" "$(_ce_j "$out" '.denied')" "cntctr code grant"
+    same "code-e2e ...but not --all-projects (the CLI would refuse it)" "$(_ce_j "$out" '.denied' | grep -c -- '--all-projects')" 0
+    _ce_cli "$d/projB" server remove locb >/dev/null
+    check "code-e2e code_status in an unusable project says what to do and the Codex restart" "$(txt "$(_ce_mcp "$orchB" code_status '{}')")" "Codex session must be restarted"
+    out=$(_ce_run "$orch" 'const [p, e] = await Promise.all([tools.fake.ping(), tools.fake.echo({msg:"hi"})]); for (let i = 0; i < 100; i++) console.log("line " + i + " " + "x".repeat(200)); return {p, e, tag: "zzdistinct123"};')
+    same "code-e2e code_run succeeds" "$(_ce_isc "$out")" ok
+    local run1
+    run1=$(_ce_j "$out" '.run_id')
+    same "code-e2e code_run returns a run id" "$([ -n "$run1" ] && [ "$run1" != null ] && echo yes || echo no)" yes
+    local wout; wout=$(_ce_watch)
+    check "code-e2e watch.sh --once shows the running server" "$wout" "fake"
+    same "code-e2e Promise.all result carries both calls" "$(_ce_j "$out" '.result | fromjson | .e.msg')" "hi"
+    same "code-e2e logs preview is bounded" "$([ "$(_ce_j "$out" '.logs | length')" -le 16384 ] && echo yes || echo no)" yes
+    check "code-e2e logs preview points at code_expand" "$(_ce_j "$out" '.logs')" "code_expand"
+    for r in result logs calls denied; do
+        same "code-e2e response has a $r part" "$(printf '%s' "$(txt "$out")" | jq -r "has(\"$r\")")" "true"
+    done
+    check "code-e2e fake-mcp now runs (the run started it)" "$([ -e "$d/fake.pid" ] && echo started || echo none)" "started"
+    # a second agent in the same project pages the whole log
+    local off=0 total=0 got=0 nxt page_n=0
+    while :; do
+        out=$(_ce_mcp "$orch2" code_expand "$(jq -nc --arg r "$run1" --argjson o "$off" '{run:$r,part:"logs",offset:$o,limit:4000}')")
+        same "code-e2e code_expand page ok" "$(_ce_isc "$out")" ok
+        total=$(_ce_j "$out" '.total_len')
+        got=$((got + $(printf '%s' "$(txt "$out")" | jq -j '.slice' | wc -c | tr -d ' ')))
+        nxt=$(_ce_j "$out" '.next_offset')
+        page_n=$((page_n + 1))
+        [ "$nxt" = null ] || [ -z "$nxt" ] && break
+        off=$nxt
+        [ "$page_n" -gt 40 ] && break
+    done
+    same "code-e2e expand pages cover exactly the stored logs" "$got" "$total"
+    same "code-e2e logs needed several bounded pages" "$([ "$page_n" -ge 5 ] && echo yes || echo no)" yes
+    out=$(_ce_mcp "$orch2" code_expand "$(jq -nc --arg r "$run1" '{run:$r,part:"bogus"}')")
+    same "code-e2e code_expand rejects an unknown part" "$(_ce_isc "$out")" err
+    out=$(_ce_mcp "$orch2" code_expand '{"run":"r-nope","part":"logs"}')
+    same "code-e2e unknown run id is an error" "$(_ce_isc "$out")" err
+    check "code-e2e unknown run says not found" "$(txt "$out")" "run r-nope not found"
+
+    # 4. denials: read, write, worker advice
+    out=$(_ce_run "$orch" 'return await tools.fake.write_item({title:"t"});')
+    same "code-e2e write_item with only a read grant fails" "$(_ce_isc "$out")" err
+    check "code-e2e write denial suggests the exact grant command" "$(_ce_j "$out" '.denied')" "cntctr code grant 'fake.write_item' allow"
+    out=$(_ce_run "$orch" 'return await tools.lazy.ping();')
+    check "code-e2e read denial for a server with no rule suggests grant <server>.* read" "$(_ce_j "$out" '.denied')" "cntctr code grant 'lazy.*' read"
+    check "code-e2e denial command starts with cd <quoted root>" "$(_ce_j "$out" '.denied')" "cd '$projA' &&"
+    out=$(_ce_run "$workr" 'return await tools.fake.write_item({title:"t"});')
+    check "code-e2e worker denial tells the worker to ask its parent" "$(txt "$out")" "ask your parent"
+    out=$(_ce_run "$orch" 'return await tools.fake.write_item({title:"t"});')
+    refute "code-e2e orchestrator denial does not tell it to ask a parent" "$(txt "$out")" "ask your parent"
+    out=$(_ce_run "$orch" 'return await tools.cntctr.code_run({script:"1"});')
+    same "code-e2e tools.cntctr.code_run is rejected end to end (daemon virtual table; client allowlist is proved by the rev: checks)" "$(_ce_isc "$out")" err
+    out=$(_ce_run "$orch" 'return await tools.cntctr.code_grant({server:"fake",tool_pattern:"x",level:"read"});')
+    same "code-e2e tools.cntctr.code_grant is rejected end to end (daemon virtual table; client allowlist is proved by the rev: checks)" "$(_ce_isc "$out")" err
+    same "code-e2e that attempt granted nothing" "$(_ce_q "SELECT count(*) FROM code_grants WHERE tool_pattern='x'")" 0
+    out=$(_ce_run "$orch" 'return await tools.cntctr.some_fleet_tool({});')
+    same "code-e2e fleet tools via tools.cntctr are rejected end to end (daemon virtual table; client allowlist is proved by the rev: checks)" "$(_ce_isc "$out")" err
+
+    # 5. tools.cntctr.* bridge
+    out=$(_ce_run "$orch" 'return await tools.cntctr.recall({});')
+    same "code-e2e tools.cntctr.recall works once cntctr.* read is granted" "$(_ce_isc "$out")" ok
+    out=$(_ce_run "$orch" 'return await tools.cntctr.project({});')
+    same "code-e2e tools.cntctr.project({}) succeeds" "$(_ce_isc "$out")" ok
+    check "code-e2e project reports the canonical root" "$(_ce_j "$out" '.result')" "$projA"
+    out=$(_ce_run "$orch" 'return await tools.cntctr.project({key:"hijack"});')
+    same "code-e2e tools.cntctr.project({key}) is rejected" "$(_ce_isc "$out")" err
+    same "code-e2e rejected project write changed nothing" "$(_ce_q "SELECT count(*) FROM projects WHERE key='hijack'")" 0
+    _ce_cli "$d/projA" grant cntctr.send allow >/dev/null
+    out=$(_ce_run "$orch" 'return await tools.cntctr.send({to:"x", text:"hi", wait:true});')
+    same "code-e2e tools.cntctr.send wait:true is rejected" "$(_ce_isc "$out")" err
+    check "code-e2e send rejection names wait" "$(txt "$out")" "wait"
+
+    # 5b. CODE-AGENT-06: a script reading the board must not consume the orchestrator's mail or move its seen cursor
+    local bkey mid seen0 seen1 bo
+    bkey=$(txt "$(_ce_mcp "$orch" project '{}')" | sed -n 's/^project \(.*\) (root .*/\1/p')
+    same "code-e2e board scope resolved" "$([ -n "$bkey" ] && echo yes || echo no)" yes
+    mid=$(sqx "$db" "INSERT INTO posts(scope,sender,text,at) VALUES('$bkey','sender',CAST('[cntctr from=sender id=ab5b0006]
+mail for the orchestrator zzmail06
+[cntctr end id=ab5b0006]' AS TEXT),strftime('%s','now')); INSERT INTO mail(post,name,pane,task,hooked,presentations,socket) VALUES(last_insert_rowid(),'orch1','','ab5b0006',1,0,''); SELECT last_insert_rowid();")
+    sqx "$db" "INSERT INTO posts(scope,sender,text,at) VALUES('$bkey','someone-else','board news zznews06',strftime('%s','now'))" >/dev/null
+    seen0=$(t show -sv @cntctr_seen_orch1 2>/dev/null)
+    same "code-e2e the mail starts unread" "$(sqx "$db" "SELECT delivered FROM mail WHERE post=$mid")" 0
+    for bo in '{}' '{peek:false}' '{peek:0}' '{peek:"no"}'; do
+        out=$(_ce_run "$orch" "await tools.cntctr.board($bo); return 1;")
+        same "code-e2e script board($bo) ran" "$(_ce_isc "$out")" ok
+    done
+    out=$(_ce_run "$orch" "await tools.cntctr.board({id:$mid}); return 1;")
+    same "code-e2e script board({id}) ran" "$(_ce_isc "$out")" ok
+    out=$(_ce_run "$orch" 'await tools.cntctr.board({mode:"mail"}); return 1;')
+    same "code-e2e script board({mode:mail}) ran" "$(_ce_isc "$out")" ok
+    # name-addressed mail (no pane/socket): board shows it, but the daemon's pane injection (redeliver_for) cannot attach and deliver it behind the test's back
+    # delivered=1 is then only ever set by board's read path (kb_mail_finish READ)
+    same "code-e2e scripts calling board did not mark the mail read" "$(sqx "$db" "SELECT delivered FROM mail WHERE post=$mid")" 0
+    seen1=$(t show -sv @cntctr_seen_orch1 2>/dev/null)
+    same "code-e2e scripts calling board left the seen cursor untouched" "$seen1" "$seen0"
+    out=$(_ce_mcp "$orch" board '{}')
+    check "code-e2e a direct board call afterwards still shows the news" "$(txt "$out")" "zznews06"
+    check "code-e2e a direct board call afterwards still shows the mail" "$(txt "$out")" "zzmail06"
+    same "code-e2e the direct call (not the scripts) is what marks the mail read" "$(sqx "$db" "SELECT delivered FROM mail WHERE post=$mid")" 1
+
+    # 6. alias mutation cannot move authority off the canonical root
+    out=$(_ce_mcp "$orch" project '{"key":"other-alias"}')
+    out=$(_ce_run "$orch" 'return await tools.fake.echo({msg:"after-alias"});')
+    same "code-e2e grants still apply after the project alias is reassigned" "$(_ce_isc "$out")" ok
+    out=$(_ce_mcp "$orch2" code_expand "$(jq -nc --arg r "$run1" '{run:$r,part:"result"}')")
+    same "code-e2e expand still finds the run after the alias change" "$(_ce_isc "$out")" ok
+    same "code-e2e runs are stored under the canonical root" "$(_ce_q "SELECT count(DISTINCT project) FROM code_runs WHERE project NOT IN ('$projA', '$projB')")" 0
+
+    # 7. paneless from=<victim>: authority is the local cwd, never the victim's project
+    out=$(_ce_paneless "$d/projB" code_run '{"script":"return await tools.fk.ping();"}' orch1)
+    same "code-e2e paneless run in projB with from=<projA agent> is denied (projB has no grant)" "$(_ce_isc "$out")" err
+    check "code-e2e paneless denial is a grant denial for projB" "$(printf '%s' "$out" | jq -r '.result.content[0].text | fromjson | .denied')" "cd '$projB'"
+    out=$(_ce_paneless "$d/projB" code_expand "$(jq -nc --arg r "$run1" '{run:$r,part:"result"}')" orch1)
+    same "code-e2e paneless expand of projA's run id fails" "$(_ce_isc "$out")" err
+    check "code-e2e paneless expand says not found" "$(printf '%s' "$out" | jq -r '.result.content[0].text')" "run $run1 not found"
+    _ce_cli "$d/projB" grant 'cntctr.*' read >/dev/null
+    _ce_cli "$d/projB" grant cntctr.post allow >/dev/null
+    local posts_before
+    posts_before=$(_ce_q "SELECT count(*) FROM posts")
+    out=$(_ce_paneless "$d/projB" code_run '{"script":"return await tools.cntctr.board({});"}' orch1)
+    same "code-e2e paneless tools.cntctr.board is refused" "$(printf '%s' "$out" | jq -r '.result.content[0].text | fromjson | .is_error')" "true"
+    check "code-e2e paneless board refusal requires a bound pane" "$(printf '%s' "$out" | jq -r '.result.content[0].text')" "bound pane"
+    out=$(_ce_paneless "$d/projB" code_run '{"script":"return await tools.cntctr.post({text:\"cross\"});"}' orch1)
+    same "code-e2e paneless tools.cntctr.post is refused" "$(printf '%s' "$out" | jq -r '.result.content[0].text | fromjson | .is_error')" "true"
+    same "code-e2e refused post wrote nothing anywhere" "$(_ce_q "SELECT count(*) FROM posts")" "$posts_before"
+    out=$(_ce_paneless "$d/projB" code_run '{"script":"return await tools.cntctr.project({});"}' orch1)
+    check "code-e2e paneless project runs against the local cwd" "$(printf '%s' "$out" | jq -r '.result.content[0].text | fromjson | .result')" "$projB"
+
+    # 7b. the user-wide read policy (the way to enable a paneless Codex): projB has no rule of its own, a local deny still wins
+    _ce_cli "$d/projB" grant 'fk.*' read --all-projects >/dev/null
+    same "code-e2e an all-projects read makes projB's agent tools appear" "$(_ce_names "$(_ce_list "$orchB")")" "code_expand,code_find,code_grant,code_revoke,code_run,code_server,code_status"
+    same "code-e2e ...for a paneless (Codex-style) server in projB too" "$(_ce_names "$(cd "$d/projB" && CNTCTR_DB="$db" CNTCTR_CLAUDE_SESSIONS_DIR="$d/nosess" SKIP=1 session "" 2 "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | tail -n 1)")" "code_expand,code_find,code_run,code_status"
+    out=$(_ce_paneless "$d/projB" code_run '{"script":"return await tools.fk.ping();"}' orch1)
+    same "code-e2e all-projects read lets a paneless run use fk in projB" "$(_ce_isc "$out")" ok
+    out=$(_ce_paneless "$d/projB" code_run '{"script":"return await tools.fk.ping();"}' "")
+    same "code-e2e ...with no from= at all (no agent to name outside tmux)" "$(_ce_isc "$out")" ok
+    out=$(_ce_paneless "$d/projB" code_status '{}' "")
+    same "code-e2e ...and code_status answers without from=" "$(_ce_isc "$out")" ok
+    out=$(_ce_paneless "$d/projB" code_grant '{"server":"fk","tool_pattern":"*","level":"read"}' "")
+    check "code-e2e ...but the admin tools still refuse without a pane" "$(printf '%s' "$out" | jq -r '.result.content[0].text')" "no agent pane of its own"
+    out=$(_ce_paneless "$d/projB" code_run '{"script":"return await tools.fk.ping();"}' orch1)
+    same "code-e2e ...and the run really called fk" "$(printf '%s' "$out" | jq -r '.result.content[0].text | fromjson | .is_error')" "false"
+    _ce_cli "$d/projB" grant fk.ping deny >/dev/null
+    out=$(_ce_paneless "$d/projB" code_run '{"script":"return await tools.fk.ping();"}' orch1)
+    same "code-e2e a project-local deny beats the all-projects read" "$(_ce_isc "$out")" err
+    _ce_q "DELETE FROM code_grants WHERE project='$projB' AND tool_pattern='ping'" >/dev/null
+    _ce_cli "$d/projB" revoke 'fk.*' --all-projects >/dev/null
+    out=$(_ce_paneless "$d/projB" code_run '{"script":"return await tools.fk.ping();"}' orch1)
+    same "code-e2e revoking the all-projects rule denies projB again" "$(_ce_isc "$out")" err
+    same "code-e2e ...and hides projB's agent tools again" "$(_ce_names "$(_ce_list "$orchB")")" "code_grant,code_revoke,code_server"
+
+    # 7c. every server or grant change, from the CLI or MCP, wakes a running session (list_changed)
+    local lcfifo="$d/lc.fifo" lcout="$d/lc.out" lcn=0
+    mkfifo "$lcfifo"
+    (CNTCTR_TEST_PANE_ROOT_PID=$$ CNTCTR_DB="$db" TMUX_PANE=$orchB "$BIN" < "$lcfifo" > "$lcout" 2>/dev/null) &
+    local lcpid=$!
+    exec 8> "$lcfifo"
+    printf '%s\n' "$INIT" >&8
+    _ce_lc() {   # <label> <command...>: run it, expect one more list_changed
+        local label=$1 want i=0; shift
+        want=$((lcn + 1))
+        "$@" >/dev/null 2>&1
+        while [ "$(grep -c 'notifications/tools/list_changed' "$lcout" 2>/dev/null)" -lt "$want" ] && [ "$i" -lt 250 ]; do sleep 0.02; i=$((i + 1)); done
+        same "code-e2e list_changed fires on $label" "$([ "$(grep -c 'notifications/tools/list_changed' "$lcout" 2>/dev/null)" -ge "$want" ] && echo yes || echo no)" yes
+        lcn=$(grep -c 'notifications/tools/list_changed' "$lcout" 2>/dev/null)
+    }
+    for i in $(seq 100); do [ -s "$lcout" ] && break; sleep 0.05; done
+    lcn=$(grep -c 'notifications/tools/list_changed' "$lcout" 2>/dev/null || true)
+    _ce_lc "a CLI server add" _ce_cli "$d/projB" server add ntf --project --cmd "$py" --arg "$fixture" --trust annotations
+    _ce_lc "a CLI grant" _ce_cli "$d/projB" grant 'ntf.*' read
+    _ce_lc "a CLI all-projects grant" _ce_cli "$d/projB" grant 'fk.*' read --all-projects
+    _ce_lc "a CLI all-projects revoke" _ce_cli "$d/projB" revoke 'fk.*' --all-projects
+    _ce_lc "an MCP code_grant" _ce_mcp "$orchB" code_grant '{"server":"ntf","tool_pattern":"ping","level":"deny"}'
+    _ce_lc "an MCP code_revoke" _ce_mcp "$orchB" code_revoke '{"server":"ntf","tool_pattern":"ping"}'
+    _ce_lc "a CLI revoke" _ce_cli "$d/projB" revoke 'ntf.*'
+    _ce_lc "an MCP code_server remove" _ce_mcp "$orchB" code_server '{"action":"remove","name":"ntf"}'
+    exec 8>&-
+    wait "$lcpid" 2>/dev/null
+    rm -f "$lcfifo"
+
+    # 8. expiry and recall isolation
+    out=$(_ce_run "$orch" 'return {tag: "zzdistinct123"};')
+    local run2
+    run2=$(_ce_j "$out" '.run_id')
+    out=$(_ce_mcp "$orch" recall '{"query":"zzdistinct123"}')
+    refute "code-e2e recall never sees code_runs" "$(txt "$out")" "zzdistinct123"
+    _ce_q "UPDATE code_runs SET expires=0 WHERE id='$run2'"
+    out=$(_ce_mcp "$orch" code_expand "$(jq -nc --arg r "$run2" '{run:$r,part:"result"}')")
+    same "code-e2e expired run is an error" "$(_ce_isc "$out")" err
+    check "code-e2e expired run says so" "$(txt "$out")" "run $run2 has expired"
+
+    # 9. wall timeout is clamped and enforced per request
+    out=$(_ce_mcp "$orch" code_run "$(jq -nc '{script:"return await tools.fake.sleep_tool({ms:60000});",timeout:2}')")
+    same "code-e2e a 2 s timeout stops a long call" "$(_ce_isc "$out")" err
+
+    # 10. cancellation mid-run cleans up the reverse workers (ASan would report a UAF)
+    local fifo="$d/cancel.fifo" ready="$d/cancel.ready" go="$d/cancel.go" sess_pid sess_rc
+    rm -f "$ready" "$go"
+    mkfifo "$fifo"
+    CNTCTR_TEST_PANE_ROOT_PID=$$ CNTCTR_DB="$db" TMUX_PANE="$orch" "$BIN" < "$fifo" > "$d/cancel.out" 2> "$d/cancel.err" & sess_pid=$!
+    exec 7> "$fifo"
+    printf '%s\n' "$INIT" >&7
+    local cancel_call
+    cancel_call=$(jq -nc --arg rf "$ready" --arg gf "$go" '{jsonrpc:"2.0",id:5,method:"tools/call",params:{name:"code_run",arguments:{script:("const r = tools.cntctr.recall({}); const s = tools.fake.sleep_tool({ms:60000, ready_file:" + ($rf|tojson) + ", go_file:" + ($gf|tojson) + "}); return await Promise.all([r, s]);")}}}')
+    printf '%s\n' "$cancel_call" >&7
+    same "code-e2e long run reached the tool server" "$(_ce_wait_file "$ready" && echo yes || echo no)" yes
+    printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":5}}' >&7
+    : > "$go"
+    exec 7>&-
+    wait "$sess_pid"; sess_rc=$?
+    same "code-e2e cancelled run: the MCP process exits cleanly" "$sess_rc" 0
+    refute "code-e2e cancelled run: no sanitizer report" "$(cat "$d/cancel.err")" "Sanitizer"
+    rm -f "$fifo"
+
+    # 11. code_status: daemon, running server, memory, this project's grants
+    out=$(_ce_mcp "$orch" code_status '{}')
+    same "code-e2e code_status ok" "$(_ce_isc "$out")" ok
+    check "code-e2e code_status names the daemon pid" "$(txt "$out")" "pid "
+    check "code-e2e code_status lists the running fake server" "$(txt "$out")" "fake"
+    check "code-e2e code_status shows memory" "$(txt "$out")" "MB"
+    check "code-e2e code_status lists this project's grants" "$(txt "$out")" "fake.* access read"
+    refute "code-e2e code_status never prints env values or other projects' roots" "$(txt "$out")" "$projB"
+    _ce_stop
+
+    # 12. reverse-RPC handler (no daemon): allowlist before dispatch, identity, bounded concurrency, late replies
+    _ce_rev() { CNTCTR_DB="$db" CNTCTR_TEST_PANE_ROOT_PID=$$ "$BIN" _test-code-rev "$@" 2>&1; }
+    out=$(_ce_rev "$orch" code_run '{"script":"1"}')
+    check "code-e2e rev: code_run is not on the allowlist" "$out" "not allowed"
+    out=$(_ce_rev "$orch" code_grant '{}')
+    check "code-e2e rev: code_grant is not on the allowlist" "$out" "not allowed"
+    out=$(_ce_rev "$orch" some_fleet_tool '{}')
+    check "code-e2e rev: fleet tools are not on the allowlist" "$out" "not allowed"
+    out=$(_ce_rev "$orch" project '{"key":"hijack"}')
+    check "code-e2e rev: project with a key is rejected" "$out" "get-only"
+    for kv in '{"key":""}' '{"key":null}' '{"key":false}' '{"key":0}' '{"key":"x"}'; do
+        out=$(_ce_rev "$orch" project "$kv")
+        check "code-e2e rev: project with key present ($kv) is refused as get-only" "$out" "get-only"
+    done
+    _ce_q "INSERT OR REPLACE INTO projects(root,key) VALUES('$projA','alias-keep')" >/dev/null
+    for kv in '{"key":""}' '{"key":null}' '{"key":"clobber"}'; do _ce_rev "$orch" project "$kv" >/dev/null; done
+    same "code-e2e rev: refused project calls left the project alias untouched" "$(_ce_q "SELECT key FROM projects WHERE root='$projA'")" "alias-keep"
+    out=$(_ce_rev "$orch" project '{}')
+    same "code-e2e rev: project with no key still works" "$(printf '%s' "$out" | jq -r '.ok')" "true"
+    out=$(_ce_run "$orch" 'return await tools.cntctr.project({key:""});')
+    same "code-e2e end to end project({key:\"\"}) is rejected" "$(_ce_isc "$out")" err
+    same "code-e2e end to end project({key:\"\"}) left the alias untouched" "$(_ce_q "SELECT key FROM projects WHERE root='$projA'")" "alias-keep"
+    # CODE-AGENT-06: a script-supplied peek never reaches the board tool, and the handler's own peek is what keeps it read-only
+    # the one-shot rev caller resolves its own project (the alias set above) and takes its pane's @cntctr_name: address the mail there, by name, so no pane can attach it
+    local rk
+    rk=$(_ce_rev "$orch" project '{}' | sed -n 's/.*project \([^ ]*\) (root.*/\1/p')
+    _ce_q "UPDATE posts SET scope='$rk' WHERE rowid=$mid; UPDATE mail SET name='orch1', pane='', socket='', state='pending', delivered=0, shown=0, lease_until=0 WHERE post=$mid" >/dev/null
+    out=$(_ce_rev "$orch" board "{\"id\":$mid,\"peek\":false}")
+    same "code-e2e rev: board through the handler answers" "$(printf '%s' "$out" | jq -r '.ok')" "true"
+    same "code-e2e rev: board with a script-supplied peek:false still does not mark mail read" "$(_ce_q "SELECT delivered FROM mail WHERE post=$mid")" 0
+    out=$(_ce_rev "$orch" send '{"to":"x","text":"hi","wait":true}')
+    check "code-e2e rev: send wait:true is rejected" "$out" "wait"
+    for r in board post send reply; do
+        out=$(_ce_rev - "$r" '{"to":"x","text":"t","id":"1"}')
+        check "code-e2e rev: paneless $r needs a bound pane" "$out" "bound pane"
+    done
+    out=$(cd "$d/projB" && _ce_rev - project '{}')
+    check "code-e2e rev: paneless project uses the local cwd" "$(printf '%s' "$out" | jq -r '.result')" "$projB"
+    out=$(cd "$d/projB" && _ce_rev "$orch" project '{"from":"orch2"}')
+    check "code-e2e rev: a bound pane's project is the pane's, not the process cwd" "$(printf '%s' "$out" | jq -r '.result')" "$projA"
+    out=$(_ce_rev "$orch" burst 10)
+    check "code-e2e rev: burst of 10 all answered" "$out" "replies=10"
+    check "code-e2e rev: at most 4 workers ran at once" "$out" "peak=4"
+    out=$(_ce_rev "$orch" late 6)
+    check "code-e2e rev: replies after the connection closed do not touch freed state" "$out" "late=ok"
+    check "code-e2e rev: nothing leaked past the owner's release" "$out" "replies=6"
+}
+if [ "${ONLY:-}" = code-e2e ]; then
+    code_e2e_run
+    printf '%d passed, %d failed\n' "$pass" "$fail"
+    [ "$fail" -eq 0 ]; exit $?
+fi
+
 if [ "${ONLY:-}" != "m3" ]; then
 
 u28_run
 u22_run
 u23_run
 u24_run
+code_kb_run
+code_js_run
+code_daemon_run
+code_mcp_run
+code_admin_run
+code_e2e_run
 
 # ---- MCP protocol ----
 out=$(rpc "$INIT")
@@ -3264,7 +6494,7 @@ check "initialize names the server" "$out" '"serverInfo":{"name":"cntctr"'
 out=$(rpc '{"jsonrpc":"2.0","id":7,"method":"ping"}')
 same "ping" "$out" '{"jsonrpc":"2.0","id":7,"result":{}}'
 out=$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')
-for tool in spawn send gather reply list kill note recall read forget project distill post board tool_define tool_verdict tool_revoke use; do
+for tool in spawn send gather reply list kill note recall read forget project distill post board tool_define tool_verdict tool_revoke use code_find code_run code_expand code_status code_server code_grant code_revoke; do
     if [ "$tool" = tool_verdict ]; then refute "tools/list hides reviewer-only tool_verdict" "$out" "\"name\":\"$tool\""
     else check "tools/list has $tool" "$out" "\"name\":\"$tool\""; fi
 done
@@ -4870,6 +8100,21 @@ check "T12 fd 3 board call returned the post" "$c0_12" "post for t12"
 refute "T12 fd 3 reply has no notice" "$c0_12" "unread board post"
 check "T12 outer use result has unread notice" "$c1_12" "unread board post"
 
+# T12b (CODE-AGENT-07): a fleet tool's board read peeks (mail stays unread, seen cursor stays) even if it passes peek:false;
+# a direct board call with peek:true is not a peek (stripped), so it consumes. Name-addressed mail: no pane can attach and deliver it behind the test.
+m3_def12b='{"name":"m3_t12b","description":"reads board, then returns nothing","input_schema":{"type":"object"},"interpreter":"sh","script":"cntctr call board \"{\\\"peek\\\":false}\" >/dev/null; echo done"}'
+call "$M3_P12_B" tool_define "$m3_def12b" >/dev/null
+m3_key12=$(txt "$(call "$M3_P12_B" project '{}')" | sed -n 's/^project \(.*\) (root .*/\1/p')
+m3_mid12=$(sqx "$CNTCTR_DB" "INSERT INTO posts(scope,sender,text,at) VALUES('$m3_key12','sender',CAST('[cntctr from=sender id=ab120012]
+mail zzmail12
+[cntctr end id=ab120012]' AS TEXT),strftime('%s','now')); INSERT INTO mail(post,name,pane,task,hooked,presentations,socket) VALUES(last_insert_rowid(),'m3_p12_b','','ab120012',1,0,''); SELECT last_insert_rowid();")
+m3_seen12=$(t show -sv @cntctr_seen_m3_p12_b 2>/dev/null)
+call "$M3_P12_B" use '{"tool":"m3_t12b"}' >/dev/null
+same "T12b fleet board read leaves the mail unread" "$(sqx "$CNTCTR_DB" "SELECT delivered FROM mail WHERE post=$m3_mid12")" 0
+same "T12b fleet board read leaves the seen cursor" "$(t show -sv @cntctr_seen_m3_p12_b 2>/dev/null)" "$m3_seen12"
+call "$M3_P12_B" board '{"peek":true}' >/dev/null
+same "T12b a direct board call with peek:true still consumes the mail" "$(sqx "$CNTCTR_DB" "SELECT delivered FROM mail WHERE post=$m3_mid12")" 1
+
 # T13: reply while sender shows permission prompt falls back to board
 M3_S13=$(m3_newpane m3_s13 "$FSH")
 M3_W13=$(m3_newpane m3_w13)
@@ -5060,11 +8305,22 @@ idx_lines28=$(printf '%s\n' "$out28" | awk '/^Knowledge index/{flag=1; next} fla
 [ "$idx_lines28" -gt 0 ] && ok_ || bad "T28 instructions include a nonempty knowledge index"
 [ "$idx_lines28" -le 10 ] && ok_ || bad "T28 instructions hold at most 10 index lines" "got $idx_lines28 lines"
 
-# T29: byte budget of built-in tools/list plus instructions holds
+# T29: byte budget of built-in tools/list plus instructions. A plain project (no usable code server, not an orchestrator) keeps the
+# original budget; an orchestrator in a project with a granted server also sees the 7 code tools, so it gets its own.
 tools_bytes=$(rpc "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | tail -n 1 | jq -c '.result.tools' | wc -c | tr -d ' ')
 guide_bytes=$(rpc "$INIT" | tail -n 1 | jq -r '.result.instructions' | awk '{print} /^Knowledge index/{exit}' | wc -c | tr -d ' ')
 total_bytes=$((tools_bytes + guide_bytes))
 [ "$total_bytes" -le 13455 ] && ok_ || bad "T29 byte budget holds" "got $total_bytes > 13455"
+same "T29 the plain project lists none of the 7 code tools" "$(rpc "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | tail -n 1 | jq -r '[.result.tools[].name | select(startswith("code_"))] | length')" 0
+M3_P29=$(m3_newpane m3_p29)
+M3_ROOT29=$(CNTCTR_DB="$CNTCTR_DB" "$BIN" _test-code-kb resolve-cwd "$M3_DIR")
+sqx "$CNTCTR_DB" "INSERT INTO code_servers(scope_project,name,reg_id,command,created_at) VALUES('$M3_ROOT29','t29srv','t29reg','/bin/echo',0); INSERT INTO code_grants(project,reg_id,server,tool_pattern,kind,level,granted_by,granted_at) VALUES('$M3_ROOT29','t29reg','t29srv','*','access','read','human',0)" >/dev/null
+orch29_list=$(CNTCTR_TEST_PANE_ROOT_PID=$$ SKIP=1 session "$M3_P29" 2 "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | tail -n 1)
+orch29_guide=$(CNTCTR_TEST_PANE_ROOT_PID=$$ SKIP=1 session "$M3_P29" 1 "$INIT" | tail -n 1 | jq -r '.result.instructions' | awk '{print} /^Knowledge index/{exit}' | wc -c | tr -d ' ')
+sqx "$CNTCTR_DB" "DELETE FROM code_grants WHERE reg_id='t29reg'; DELETE FROM code_servers WHERE reg_id='t29reg'" >/dev/null
+same "T29 an orchestrator with a granted server lists all 7 code tools" "$(printf '%s' "$orch29_list" | jq -r '[.result.tools[].name | select(startswith("code_"))] | length')" 7
+orch29_total=$(( $(printf '%s' "$orch29_list" | jq -c '.result.tools' | wc -c | tr -d ' ') + orch29_guide ))
+[ "$orch29_total" -le 16430 ] && ok_ || bad "T29 orchestrator byte budget holds" "got $orch29_total > 16430"
 
 # T30: reviewer's send to="parent" fails and mentions tool_verdict
 M3_REV30=$(m3_newpane m3_rev30)

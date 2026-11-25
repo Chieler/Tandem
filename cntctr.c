@@ -33,6 +33,13 @@
 #include "kb.h"
 #include "fleet.h"
 #include "hooks.h"
+#include "code_schema.h"
+#include "code_js.h"
+#include "code_daemon.h"
+#include "code_mcp.h"
+#ifdef CNTCTR_TEST_HOOKS
+#include "quickjs.h"
+#endif
 
 #define CNTCTR_VERSION "0.5.5"
 
@@ -443,6 +450,61 @@ static void resolve_project(sqlite3 *db, const char *pane, struct project *p) {
     resolve_cwd(db, cwd, p);
 }
 
+/* Canonical code-mode project root: realpath() of git common dir (stripping /.git) or cwd. */
+static void resolve_code_cwd(const char *cwd, char canon_root[PATH_MAX]) {
+    char candidate[PATH_MAX];
+    char *out = NULL;
+    if (cwd && *cwd &&
+        run(NULL, &out, (const char *[]){"git", "-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir", NULL}) == 0 &&
+        out && *out) {
+        size_t len = strlen(out);
+        if (len > 5 && strcmp(out + len - 5, "/.git") == 0) out[len - 5] = '\0';
+        else if (len == 5 && strcmp(out, "/.git") == 0) out[1] = '\0';
+        snprintf(candidate, sizeof candidate, "%s", out);
+    } else {
+        snprintf(candidate, sizeof candidate, "%s", (cwd && *cwd) ? cwd : ".");
+    }
+    free(out);
+    char resolved[PATH_MAX];
+    if (realpath(candidate, resolved)) snprintf(canon_root, PATH_MAX, "%s", resolved);
+    else snprintf(canon_root, PATH_MAX, "%s", candidate);
+}
+
+/* 0, or -1 when a pane was given but its path cannot be read: authority never falls back to this process's cwd. */
+static int resolve_code_project(const char *pane, char canon_root[PATH_MAX]) {
+    char *out = NULL, cwd[PATH_MAX];
+    if (pane && *pane) {
+        if (TMUX(NULL, &out, "display", "-p", "-t", pane, "#{pane_current_path}") != 0 || !out || !*out) { free(out); return -1; }
+        snprintf(cwd, sizeof cwd, "%s", out);
+    } else if (!getcwd(cwd, sizeof cwd)) {
+        snprintf(cwd, sizeof cwd, ".");
+    }
+    free(out);
+    resolve_code_cwd(cwd, canon_root);
+    return 0;
+}
+
+/* POSIX single-quote escaping ('...' with '\'' for embedded single quotes). */
+static char *shell_quote(const char *s) {
+    if (!s) s = "";
+    size_t cap = 3;
+    for (const char *p = s; *p; p++) cap += (*p == '\'') ? 4 : 1;
+    char *out = malloc(cap), *o = out;
+    if (!out) abort();
+    *o++ = '\'';
+    for (const char *p = s; *p; p++) {
+        if (*p == '\'') {
+            memcpy(o, "'\\''", 4);
+            o += 4;
+        } else {
+            *o++ = *p;
+        }
+    }
+    *o++ = '\'';
+    *o = '\0';
+    return out;
+}
+
 static char *first_line(const char *text, size_t max) {
     size_t n = strcspn(text, "\n");
     if (n > max)
@@ -612,20 +674,77 @@ static char *find_agent(const char *name) {
     return pane;
 }
 
-static int is_reviewer(const char *pane) {
+/* Whether `pane` is a pending-review pane: 1 yes, 0 no, -1 if the store cannot say (admin checks fail closed on it). */
+static int reviewer_state(const char *pane) {
     char *err = NULL;
     sqlite3 *db = kb(&err);
     free(err);
-    if (!db) return 0;
+    if (!db) return -1;
     sqlite3_stmt *st = NULL;
-    int found = 0;
-    if (sqlite3_prepare_v2(db, "SELECT 1 FROM tools WHERE status='pending' AND reviewer_pane=?1 LIMIT 1", -1, &st, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, pane, -1, SQLITE_TRANSIENT);
-        found = sqlite3_step(st) == SQLITE_ROW;
+    int state = -1;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM tools WHERE status='pending' AND reviewer_pane=?1 LIMIT 1", -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_bind_text(st, 1, pane, -1, SQLITE_TRANSIENT) == SQLITE_OK) {
+        int rc = sqlite3_step(st);
+        state = rc == SQLITE_ROW ? 1 : rc == SQLITE_DONE ? 0 : -1;
     }
     sqlite3_finalize(st);
     sqlite3_close(db);
+    return state;
+}
+
+static int is_reviewer(const char *pane) { return reviewer_state(pane) == 1; }
+
+/* Whether this process descends from the root process of `pane`. A pane id in the environment is only a hint
+ * (CODE-ADMIN-01); this is the evidence. Anything that cannot be verified is "no". */
+static int process_in_pane(const char *pane) {
+    long root = 0;
+#ifdef CNTCTR_TEST_HOOKS
+    const char *hook = getenv("CNTCTR_TEST_PANE_ROOT_PID");   /* tests run us outside the pane: name the root process */
+    if (hook && *hook) root = strtol(hook, NULL, 10);
+#endif
+    if (root <= 0) {
+        char *out = NULL;
+        if (TMUX(NULL, &out, "display", "-p", "-t", pane, "#{pane_pid}") != 0 || !out) { free(out); return 0; }
+        root = strtol(out, NULL, 10);
+        free(out);
+    }
+    if (root <= 1) return 0;
+    char *procs = NULL;
+    if (run(NULL, &procs, (const char *[]){"ps", "-A", "-o", "pid=,ppid=", NULL}) != 0 || !procs) { free(procs); return 0; }
+    int found = 0;
+    long pid = (long)getpid();
+    for (int steps = 0; pid > 1 && steps < 256; steps++) {
+        if (pid == root) { found = 1; break; }
+        long next = parent_of(procs, pid);
+        if (next <= 1 || next == pid) break;
+        pid = next;
+    }
+    free(procs);
     return found;
+}
+
+/* Code-mode admin authority: a live, process-bound pane of our own (never `from=`) that no one spawned and that is
+ * not reviewing a tool. Anything we cannot verify counts as "no". *why gets the reason (caller frees). */
+static int is_orchestrator(char **why) {
+    *why = NULL;
+    if (!*self_pane) { *why = fmt("this MCP server has no agent pane of its own (from= is attribution only and never authorizes admin)"); return 0; }
+    if (!pane_alive(self_pane)) { *why = fmt("pane %s is not alive", self_pane); return 0; }
+    if (!process_in_pane(self_pane)) {
+        *why = fmt("this MCP process is not a descendant of pane %s's root process (the pane id in the environment is only a hint)", self_pane);
+        return 0;
+    }
+    char *parent = NULL;
+    if (TMUX(NULL, &parent, "show", "-pqv", "-t", self_pane, "@cntctr_parent") != 0) {
+        *why = fmt("could not read @cntctr_parent of pane %s", self_pane);
+        free(parent);
+        return 0;
+    }
+    int spawned = parent && *parent;
+    free(parent);
+    if (spawned) { *why = fmt("spawned worker panes cannot administer code mode"); return 0; }
+    int rv = reviewer_state(self_pane);
+    if (rv != 0) { *why = fmt(rv < 0 ? "could not check whether pane %s is a reviewer" : "reviewer pane %s cannot administer code mode", self_pane); return 0; }
+    return 1;
 }
 
 /* Pane for a message target (caller frees): "parent" is whoever spawned the caller,
@@ -2319,7 +2438,8 @@ static size_t utf8_prefix(const char *text, size_t end) {
 
 enum { BOARD_PAGE_BYTES = 32768 };
 
-static int board_lookup(sqlite3 *db, const char *scope, json_object *a, json_object *v, char **res) {
+/* peek: look without consuming (scripts reading the board must not mark mail read or move the seen cursor). */
+static int board_lookup(sqlite3 *db, const char *scope, json_object *a, json_object *v, int peek, char **res) {
     long long id = json_object_get_int64(v), offset = 0;
     if (json_object_get_type(v) != json_type_int || id <= 0)
         return fail(res, fmt("board id must be a positive integer"));
@@ -2361,7 +2481,7 @@ static int board_lookup(sqlite3 *db, const char *scope, json_object *a, json_obj
     }
     sqlite3_finalize(st);
     free(key);
-    if (complete && out) kb_mail_finish(db, id, KB_MAIL_READ, 0, NULL, 0);
+    if (complete && out && !peek) kb_mail_finish(db, id, KB_MAIL_READ, 0, NULL, 0);
     if (out) return ok(res, out);
     if (bad_offset) return fail(res, fmt("board offset is outside the mail or splits UTF-8"));
     return fail(res, fmt(rc == SQLITE_DONE ? "mail not found" : "cannot read mail"));
@@ -2467,6 +2587,7 @@ static int board_index(sqlite3 *db, const char *scope, json_object *args, int li
 
 static int tool_board(json_object *a, char **res) {
     json_object *v;
+    int peek = barg(a, "peek");   /* internal-only: set by code_rev_handler and serve_call; dispatch and those two strip any caller-supplied one */
     int limit = json_object_object_get_ex(a, "limit", &v) ? json_object_get_int(v) : 20;
     limit = limit < 1 ? 1 : limit > 200 ? 200 : limit;
     struct project p;
@@ -2485,7 +2606,7 @@ static int tool_board(json_object *a, char **res) {
         return err;
     }
     if (json_object_object_get_ex(a, "id", &v)) {
-        int err = board_lookup(db, p.key, a, v, res);
+        int err = board_lookup(db, p.key, a, v, peek, res);
         sqlite3_close(db);
         return err;
     }
@@ -2508,14 +2629,14 @@ static int tool_board(json_object *a, char **res) {
         sqlite3_close(db);
         return fail(res, fmt("cannot read board snapshot"));
     }
-    for (const char *id = shown; *id;) {
+    for (const char *id = shown; *id && !peek;) {
         char *end;
         kb_mail_finish(db, strtoll(id, &end, 10), KB_MAIL_READ, 0, NULL, 0);
         if (*end != ',') break;
         id = end + 1;
     }
     free(shown);
-    if (*caller_name) set_seen(caller_name, newest);
+    if (*caller_name && !peek) set_seen(caller_name, newest);
     if (omitted_mail > 0) {
         char *more = fmt("%s\nOlder mail is available with board mode=mail.", out);
         free(out);
@@ -2538,7 +2659,17 @@ static int tool_define(json_object *a, char **res);
 static int tool_use(json_object *a, char **res);
 static int tool_verdict(json_object *a, char **res);
 static int tool_revoke(json_object *a, char **res);
+static int tool_code_server(json_object *a, char **res);
+static int tool_code_grant(json_object *a, char **res);
+static int tool_code_revoke(json_object *a, char **res);
+static int tool_code_find(json_object *a, char **res);
+static int tool_code_run(json_object *a, char **res);
+static int tool_code_expand(json_object *a, char **res);
+static int tool_code_status(json_object *a, char **res);
 typedef int (*tool_fn)(json_object *args, char **res);
+/* needs_pane 0 for the code agent tools: a Codex outside tmux (desktop app, cloud) has no pane and no live agent for from= to name;
+ * they authorize by the MCP process cwd (self_pane is "" there). The admin tools skip the generic identity gate too, so they
+ * answer with their own, accurate refusal (from= never authorizes admin) instead of "pass from=". */
 static const struct { const char *name; tool_fn fn; int needs_pane; } TOOL_FNS[] = {
     {"list", tool_list, 0},
     {"send", tool_send, 1},
@@ -2558,6 +2689,13 @@ static const struct { const char *name; tool_fn fn; int needs_pane; } TOOL_FNS[]
     {"tool_verdict", tool_verdict, 0},
     {"tool_revoke", tool_revoke, 0},
     {"use", tool_use, 0},
+    {"code_server", tool_code_server, 0},
+    {"code_grant", tool_code_grant, 0},
+    {"code_revoke", tool_code_revoke, 0},
+    {"code_find", tool_code_find, 0},
+    {"code_run", tool_code_run, 0},
+    {"code_expand", tool_code_expand, 0},
+    {"code_status", tool_code_status, 0},
     {NULL, NULL, 0},
 };
 
@@ -3058,6 +3196,7 @@ static char *serve_call(void *ctx, const char *line) {
     } else {
         json_object_object_get_ex(req, "args", &args);
         json_object *plain = without_from(args);
+        if (!strcmp(tool, "board")) json_object_object_add(plain, "peek", json_object_new_boolean(1));   /* a fleet tool must not consume the agent's mail or move its seen cursor; replaces any peek it supplied */
         is_error = dispatch_as(who->pane, who->name, tool, plain, &text);
         json_object_put(plain);
     }
@@ -3235,6 +3374,7 @@ static int dispatch(const char *name, json_object *args, char **res) {
     if (bad) return fail(res, fmt("argument %s contains NUL byte", bad));
     char *err = set_caller(args);
     if (err) return fail(res, err);
+    if (name && !strcmp(name, "board") && json_object_is_type(args, json_type_object)) json_object_object_del(args, "peek");   /* internal-only */
     learn_mail_identity(caller_pane, caller_name);
     char pane[sizeof caller_pane], who[sizeof caller_name];   /* dispatch_as overwrites caller_* */
     memcpy(pane, caller_pane, sizeof pane);
@@ -3242,7 +3382,7 @@ static int dispatch(const char *name, json_object *args, char **res) {
     return dispatch_as(pane, who, name, args, res);
 }
 
-#define KFROM "\"from\":{\"type\":\"string\",\"description\":\"Your agent name. Needed from Codex, whose cntctr runs outside your pane, to find your project\"}"
+#define KFROM "\"from\":{\"type\":\"string\",\"description\":\"Your agent name; pass it from Codex\"}"
 
 static const char TOOLS[] =
     "{\"tools\":["
@@ -3356,10 +3496,59 @@ static const char TOOLS[] =
     ",{\"name\":\"tool_revoke\",\"description\":\"Withdraw an active, pending or escalated tool. Reviewers reject with tool_verdict instead.\","
     "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"},\"reason\":{\"type\":\"string\"}," KFROM "},"
     "\"required\":[\"name\",\"reason\"]}}"
+    ",{\"name\":\"code_server\",\"description\":\"Orchestrator only. Manage this project's code-mode tool servers; user-scoped or human-ruled servers are CLI-only.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"add\",\"list\",\"remove\",\"discover\",\"restart\"]},"
+    "\"name\":{\"type\":\"string\",\"description\":\"[A-Za-z0-9_-]{1,63}, not cntctr\"},"
+    "\"command\":{\"type\":\"string\",\"description\":\"Executable only; arguments go in args\"},"
+    "\"args\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}},\"env\":{\"type\":\"object\",\"additionalProperties\":{\"type\":\"string\"}},"
+    "\"trust\":{\"type\":\"string\",\"enum\":[\"none\",\"annotations\"],\"description\":\"none (default): every tool is write unless destructiveHint; annotations: also trust readOnlyHint\"},"
+    "\"isolated\":{\"type\":\"boolean\"}," KFROM "},"
+    "\"required\":[\"action\"]}}"
+    ",{\"name\":\"code_grant\",\"description\":\"Orchestrator only. Add a code-mode rule for this project. Default-deny, read tools included: e.g. level read, pattern *. "
+    "allow takes one exact tool; class:* raises a tool's class. Human-set rules are read-only here; a destructive allow is posted to the human. Server cntctr is the built-in allowlist.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"server\":{\"type\":\"string\"},\"tool_pattern\":{\"type\":\"string\",\"description\":\"Exact for allow; * and ? otherwise\"},"
+    "\"level\":{\"type\":\"string\",\"enum\":[\"allow\",\"read\",\"deny\",\"class:write\",\"class:destructive\"]},\"reason\":{\"type\":\"string\"}," KFROM "},"
+    "\"required\":[\"server\",\"tool_pattern\",\"level\"]}}"
+    ",{\"name\":\"code_revoke\",\"description\":\"Orchestrator only. Remove this project's code-mode rule (not human-set ones).\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"server\":{\"type\":\"string\"},\"tool_pattern\":{\"type\":\"string\"},"
+    "\"kind\":{\"type\":\"string\",\"enum\":[\"access\",\"class\"]}," KFROM "},"
+    "\"required\":[\"server\",\"tool_pattern\"]}}"
+    ",{\"name\":\"code_find\",\"description\":\"Search the tools code_run can call; query server.tool for its full schema. Reads cached catalogs, never starts a server.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}," KFROM "}}}"
+    ",{\"name\":\"code_run\",\"description\":\"Run JavaScript (QuickJS, top-level await) calling await tools.<server>.<tool>(args); return a JSON-able value; Promise.all runs calls in parallel. "
+    "Grants are default-deny, read tools included; a denial prints the grant command. tools.cntctr.* is built in. "
+    "Returns {run_id, result, logs, calls, denied, is_error}; page long parts with code_expand.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"script\":{\"type\":\"string\"},"
+    "\"scope\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Only these server.tool patterns\"},"
+    "\"timeout\":{\"type\":\"integer\",\"description\":\"Seconds, default 300, max 1800\"}," KFROM "},"
+    "\"required\":[\"script\"]}}"
+    ",{\"name\":\"code_expand\",\"description\":\"Page a code_run's stored output (64 KiB max per slice; next_offset continues).\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{\"run\":{\"type\":\"string\"},\"part\":{\"type\":\"string\",\"enum\":[\"result\",\"logs\",\"calls\",\"denied\"]},"
+    "\"offset\":{\"type\":\"integer\"},\"limit\":{\"type\":\"integer\"}," KFROM "},"
+    "\"required\":[\"run\"]}}"
+    ",{\"name\":\"code_status\",\"description\":\"Code-mode daemon, this project's servers, memory and grants.\","
+    "\"inputSchema\":{\"type\":\"object\",\"properties\":{" KFROM "}}}"
     "]}";
 
+static const char *const CODE_AGENT_TOOLS[] = {"code_find", "code_run", "code_expand", "code_status", NULL};
+static const char *const CODE_ADMIN_TOOLS[] = {"code_server", "code_grant", "code_revoke", NULL};
+
+static void drop_tools(json_object *arr, const char *const *names) {
+    for (size_t i = json_object_array_length(arr); i-- > 0;)
+        for (const char *const *n = names; *n; n++)
+            if (!strcmp(sarg(json_object_array_get_idx(arr, i), "name"), *n)) { json_object_array_del_idx(arr, i, 1); break; }
+}
+
+/* Whether this MCP server's project has a server code_run can use: the project from the pane, else the process cwd. */
+static int code_project_usable(sqlite3 *db) {
+    char root[PATH_MAX];
+    return resolve_code_project(self_pane, root) == 0 && kb_code_project_has_usable(db, root) == 1;
+}
+
 /* The built-ins plus each fleet tool this server's agent can call. Outside a pane (Codex) the
- * project is unknown, so only global tools show. */
+ * project is unknown, so only global tools show. Code-mode tools show only where they work: the agent tools when the
+ * project has a usable server, the admin tools to an orchestrator. Hidden is not disabled: dispatch still answers a
+ * stale call, and every server or grant change wakes every cntctr (notify_all) to re-list. */
 static json_object *tools_list(void) {
     json_object *r = json_tokener_parse(TOOLS), *arr = NULL;
     json_object_object_get_ex(r, "tools", &arr);
@@ -3370,11 +3559,18 @@ static json_object *tools_list(void) {
                 break;
             }
     }
-    /* MCP has no client list_changed capability; the client name is the only signal. */
-    if (strcasestr(client_name, "codex")) return r;
     char *err = NULL;
     sqlite3 *db = kb(&err);
     free(err);
+    if (!db || !code_project_usable(db)) drop_tools(arr, CODE_AGENT_TOOLS);
+    char *why = NULL;
+    if (!is_orchestrator(&why)) drop_tools(arr, CODE_ADMIN_TOOLS);
+    free(why);
+    /* MCP has no client list_changed capability; the client name is the only signal. */
+    if (strcasestr(client_name, "codex")) {
+        if (db) sqlite3_close(db);
+        return r;
+    }
     if (!db) return r;
     struct project p;
     const char *key = "global";
@@ -3754,6 +3950,11 @@ static const char GUIDE[] =
     "Pass urgent=true only when every agent must see a post now. "
     "An end line [cntctr end id=...] without its header means the start was lost; reply to that id asking for a resend.";
 
+/* Added only where code mode works, so a plain project pays nothing for it. */
+static const char CODE_GUIDE[] =
+    " Code mode: code_find searches the tools of connected MCP servers; code_run runs a JS script that calls them as "
+    "tools.<server>.<tool>(args). A tool needs a read grant; a denial prints the command for the user.";
+
 /* Usage guide plus the knowledge index: our project's and global entries, or only
  * global ones for a server outside any pane (Codex), capped at 40 lines and 4 KB. */
 static char *instructions(void) {
@@ -3763,6 +3964,7 @@ static char *instructions(void) {
     if (!db) return strdup(GUIDE);
     struct project p;
     resolve_project(db, self_pane, &p);
+    int code = code_project_usable(db);
     char *index = *self_pane ? kb_index(db, p.key, "global", NULL, NULL, 10) : kb_index(db, "global", NULL, NULL, NULL, 10);
     sqlite3_close(db);
     if (strlen(index) > 4096) {
@@ -3770,7 +3972,8 @@ static char *instructions(void) {
         char *nl = strrchr(index, '\n');
         if (nl) *nl = '\0';
     }
-    char *r = fmt("%s%s\n\nKnowledge index (%s):\n%s", GUIDE,
+    char *r = fmt("%s%s%s\n\nKnowledge index (%s):\n%s", GUIDE,
+                  code ? CODE_GUIDE : "",
                   *self_pane ? "" : " This cntctr runs outside your tmux pane: pass from=<your agent name> to the knowledge tools.",
                   *self_pane ? p.key : "global only", *index ? index : "(empty)");
     free(index);
@@ -5162,6 +5365,7 @@ static int stats_cmd(int argc, char **argv) {
         } else goto usage;
     }
     char path[4096]; sqlite3 *db = NULL;
+    kb_test_guard(kb_path(path, sizeof path));
     if (sqlite3_open_v2(kb_path(path, sizeof path), &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
         fprintf(stderr, "stats: cannot open knowledge store: %s\n", sqlite3_errmsg(db));
         sqlite3_close(db); return 1;
@@ -5196,6 +5400,2841 @@ usage:
 
 int usage_cmd(int argc, char **argv, const char *cwd);
 
+/* ---- code mode CLI & guard ---- */
+
+static int code_valid_server_name(const char *name) {
+    if (!name || !*name) return 0;
+    if (strcmp(name, "cntctr") == 0) return 0;
+    size_t n = 0;
+    for (const char *p = name; *p; p++, n++) {
+        unsigned char c = (unsigned char)*p;
+        if (!(isalnum(c) || c == '_' || c == '-')) return 0;
+    }
+    return n >= 1 && n <= 63;
+}
+
+static int code_has_whitespace(const char *s) {
+    if (!s) return 0;
+    for (const char *p = s; *p; p++)
+        if (isspace((unsigned char)*p)) return 1;
+    return 0;
+}
+
+/* Refuse automated/agent CLI invocations; when destructive_prompt != 0, require TTY y/N. */
+static int cli_admin_guard(int destructive_prompt, const char *summary) {
+    const char *croot = getenv("CNTCTR_ROOT");
+    if (croot && *croot) {
+        fprintf(stderr, "refused by cli_admin_guard (CNTCTR_ROOT is set): run this command from your own terminal\n");
+        return -1;
+    }
+    const char *pane = getenv("CNTCTR_PANE");
+    if (!pane || !*pane) pane = getenv("TMUX_PANE");
+    if (pane && *pane) {
+        char *parent = NULL;
+        if (TMUX(NULL, &parent, "show", "-pqv", "-t", pane, "@cntctr_parent") != 0) {
+            fprintf(stderr, "refused by cli_admin_guard (tmux check failed for pane %s): %s\n",
+                    pane, parent && *parent ? parent : "tmux unavailable");
+            free(parent);
+            return -1;
+        }
+        if (parent && *parent) {
+            fprintf(stderr, "refused by cli_admin_guard (@cntctr_parent is set on pane %s): spawned agent panes cannot administer code mode\n", pane);
+            free(parent);
+            return -1;
+        }
+        free(parent);
+    }
+    char *procs = NULL;
+    if (run(NULL, &procs, (const char *[]){"ps", "-A", "-o", "pid=,ppid=,comm=", NULL}) != 0 || !procs) {
+        fprintf(stderr, "refused by cli_admin_guard (ps ancestor check failed)\n");
+        free(procs);
+        return -1;
+    }
+    long stop_pid = 0;
+#ifdef CNTCTR_TEST_HOOKS
+    const char *stop_env = getenv("CNTCTR_TEST_ANCESTOR_STOP_PID");
+    if (stop_env && *stop_env) stop_pid = strtol(stop_env, NULL, 10);
+#endif
+    long pid = getppid();
+    for (int steps = 0; pid > 1 && steps < 256; steps++) {
+        if (stop_pid > 0 && pid == stop_pid) break;
+        char comm[64];
+        comm_of(procs, pid, comm);
+        size_t clen = strlen(comm);
+        while (clen > 0 && (comm[clen - 1] == ' ' || comm[clen - 1] == '\t' || comm[clen - 1] == '\r'))
+            comm[--clen] = '\0';
+        if (!strcmp(comm, "claude") || !strcmp(comm, "codex") || !strcmp(comm, "agy")) {
+            fprintf(stderr, "refused by cli_admin_guard (ancestor process '%s' pid %ld): run this command from your own terminal\n", comm, pid);
+            free(procs);
+            return -1;
+        }
+        long next = parent_of(procs, pid);
+        if (next <= 1 || next == pid) break;
+        pid = next;
+    }
+    free(procs);
+    if (destructive_prompt) {
+        if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) {
+            fprintf(stderr, "refused by cli_admin_guard (interactive TTY required for destructive confirmation)\n");
+            return -1;
+        }
+        fprintf(stderr, "%s\nProceed? [y/N] ", summary ? summary : "Confirm destructive action.");
+        fflush(stderr);
+        char ans[64];
+        if (!fgets(ans, sizeof ans, stdin)) {
+            fprintf(stderr, "aborted\n");
+            return -1;
+        }
+        char *p = ans;
+        while (*p == ' ' || *p == '\t') p++;
+        size_t len = strlen(p);
+        while (len > 0 && (p[len - 1] == '\n' || p[len - 1] == '\r' || p[len - 1] == ' ' || p[len - 1] == '\t'))
+            p[--len] = '\0';
+        int yes = (p[0] == 'y' || p[0] == 'Y') &&
+                  (p[1] == '\0' || ((p[1] == 'e' || p[1] == 'E') && (p[2] == 's' || p[2] == 'S') && p[3] == '\0'));
+        if (!yes) {
+            fprintf(stderr, "aborted\n");
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* ---- code mode admin: helpers shared by the MCP tools and the CLI ---- */
+
+static const char *code_class_name(enum code_class c) {
+    return c == CODE_READ ? "read" : c == CODE_WRITE ? "write" : "destructive";
+}
+
+static int code_cancel_cb(void *ctx) { (void)ctx; return cancelled(); }
+
+/* One daemon RPC with a deadline. 0 (and *resp when asked) on ok:true; -1 with *err otherwise (fails closed). */
+static int code_rpc(json_object *req, int autostart, int timeout_ms, json_object **resp, char **err) {
+    json_object *r = NULL, *jok = NULL, *jerr = NULL;
+    char *e = NULL;
+    if (code_client_rpc(req, autostart, &r, NULL, code_cancel_cb, NULL, timeout_ms, &e) != 0) {
+        *err = e ? e : strdup("daemon unreachable");
+        return -1;
+    }
+    if (!json_object_object_get_ex(r, "ok", &jok) || !json_object_get_boolean(jok)) {
+        *err = strdup(json_object_object_get_ex(r, "error", &jerr) && json_object_is_type(jerr, json_type_string)
+                          ? json_object_get_string(jerr) : "daemon error");
+        json_object_put(r);
+        return -1;
+    }
+    if (resp) *resp = r;
+    else json_object_put(r);
+    return 0;
+}
+
+static int code_daemon_running(void) {
+    json_object *st = NULL;
+    char *e = NULL;
+    int up = code_client_probe(&st, &e) == 0 && st != NULL;   /* rc 0 with no status: the daemon is off */
+    if (st) json_object_put(st);
+    free(e);
+    return up;
+}
+
+/* Tell a running daemon a registration was replaced or removed: it stops that registration's instances (by its OLD
+ * reg_id) and nothing else. A brand-new name has no old registration, so there is nothing to stop. Never starts it. */
+static void code_notify_reload(const char *old_reg_id) {
+    if (!old_reg_id || !*old_reg_id || !code_daemon_running()) return;
+    json_object *req = json_object_new_object();
+    json_object_object_add(req, "method", json_object_new_string("reload"));
+    json_object_object_add(req, "reg_id", json_object_new_string(old_reg_id));
+    char *err = NULL;
+    code_rpc(req, 0, 10000, NULL, &err);
+    free(err);
+    json_object_put(req);
+}
+
+static int code_parse_level(const char *s, const char **kind) {
+    if (!s) return 0;
+    if (!strcmp(s, "allow") || !strcmp(s, "deny") || !strcmp(s, "read")) { *kind = "access"; return 1; }
+    if (!strcmp(s, "class:write") || !strcmp(s, "class:destructive")) { *kind = "class"; return 1; }
+    return 0;
+}
+
+/* A server a grant refers to: a registration, or the virtual "cntctr" (reg_id "cntctr", static allowlist). */
+struct code_target {
+    char name[64], reg_id[64], owner[PATH_MAX];
+    int virt;
+    struct code_server_row srv;
+};
+
+static void code_target_free(struct code_target *t) { if (!t->virt) kb_code_server_free(&t->srv); }
+
+static int code_target_resolve(sqlite3 *db, const char *root, const char *name, struct code_target *t, char **err) {
+    memset(t, 0, sizeof *t);
+    snprintf(t->name, sizeof t->name, "%s", name);
+    if (!strcmp(name, "cntctr")) {
+        t->virt = 1;
+        snprintf(t->reg_id, sizeof t->reg_id, "cntctr");
+        return 0;
+    }
+    if (!code_valid_server_name(name) || kb_code_server_get(db, root, name, &t->srv) != 0) {
+        *err = fmt("unknown server '%s' (code_server list shows this project's servers)", name);
+        return -1;
+    }
+    snprintf(t->reg_id, sizeof t->reg_id, "%s", t->srv.reg_id);
+    const char *own = code_owner_project(&t->srv, root);
+    snprintf(t->owner, sizeof t->owner, "%s", own ? own : "");
+    return 0;
+}
+
+/* The target's tools as a JSON array of {name, class, ...}: static for "cntctr", else the stored catalog. NULL if none. */
+static json_object *code_target_tools(sqlite3 *db, const struct code_target *t) {
+    if (t->virt) {
+        json_object *arr = json_object_new_array();
+        for (size_t i = 0; i < code_cntctr_tool_count(); i++) {
+            const char *n = code_cntctr_tool_name(i);
+            enum code_class c = CODE_WRITE;
+            code_cntctr_tool_class(n, &c);
+            json_object *o = json_object_new_object();
+            json_object_object_add(o, "name", json_object_new_string(n));
+            json_object_object_add(o, "class", json_object_new_string(code_class_name(c)));
+            json_object_array_add(arr, o);
+        }
+        return arr;
+    }
+    char *tj = NULL;
+    long long gen = 0;
+    if (kb_code_catalog_get(db, t->reg_id, t->owner, &tj, &gen) != 0 || !tj) { free(tj); return NULL; }
+    json_object *arr = json_tokener_parse(tj);
+    free(tj);
+    if (!arr || !json_object_is_type(arr, json_type_array)) {
+        if (arr) json_object_put(arr);
+        return NULL;
+    }
+    return arr;
+}
+
+/* Run discovery so the catalog is stored: through the daemon (MCP: starting it; CLI: only if it is already up),
+ * else one direct probe with the daemon's scrubbed environment. */
+static int code_discover(sqlite3 *db, const struct code_target *t, const char *root, int via_mcp, char **err) {
+    if (t->virt) return 0;
+    json_object *req = json_object_new_object();
+    json_object_object_add(req, "method", json_object_new_string("discover"));
+    json_object_object_add(req, "project", json_object_new_string(root));
+    json_object_object_add(req, "server", json_object_new_string(t->name));
+    int rc;
+    if (via_mcp || code_daemon_running()) {
+        rc = code_rpc(req, via_mcp, 60000, NULL, err);
+    } else {
+        long long gen = 0;
+        rc = code_mcp_probe_server(db, &t->srv, root, 30, &gen, err) == 0 ? 0 : -1;
+        if (rc != 0 && !*err) *err = strdup("probe failed");
+    }
+    json_object_put(req);
+    return rc;
+}
+
+/* The target's tools, discovering first when none are stored. NULL with *err when they cannot be had (callers fail closed). */
+static json_object *code_tools_or_discover(sqlite3 *db, const struct code_target *t, const char *root, int via_mcp, char **err) {
+    json_object *tools = code_target_tools(db, t);
+    if (tools) return tools;
+    char *derr = NULL;
+    if (code_discover(db, t, root, via_mcp, &derr) != 0) {
+        *err = fmt("cannot discover tools of '%s': %s", t->name, derr ? derr : "unknown error");
+        free(derr);
+        return NULL;
+    }
+    free(derr);
+    tools = code_target_tools(db, t);
+    if (!tools) *err = fmt("server '%s' reported no catalog", t->name);
+    return tools;
+}
+
+static int code_tool_class(json_object *tools, const char *tool, enum code_class *cls) {
+    for (size_t i = 0; i < json_object_array_length(tools); i++) {
+        json_object *o = json_object_array_get_idx(tools, i);
+        if (!sarg(o, "name") || strcmp(sarg(o, "name"), tool) != 0) continue;
+        const char *c = sarg(o, "class");
+        *cls = c && !strcmp(c, "read") ? CODE_READ : c && !strcmp(c, "write") ? CODE_WRITE : CODE_DESTRUCTIVE;
+        return 1;
+    }
+    return 0;
+}
+
+static char *code_tool_suggestions(json_object *tools, const char *typed) {
+    size_t n = json_object_array_length(tools);
+    const char **names = calloc(n ? n : 1, sizeof *names);
+    if (!names) abort();
+    size_t k = 0;
+    for (size_t i = 0; i < n; i++) {
+        const char *nm = sarg(json_object_array_get_idx(tools, i), "name");
+        if (nm) names[k++] = nm;
+    }
+    char *sug = code_suggest_names(typed, names, k);
+    free(names);
+    return sug;
+}
+
+#ifdef CNTCTR_TEST_HOOKS
+/* Pause at the named site until <CNTCTR_TEST_BARRIER>.go exists (creating .ready first), so tests can change the world
+ * between a decision and its commit deterministically. Bounded: gives up after 30 s. */
+static void code_test_barrier(const char *site) {
+    const char *path = getenv("CNTCTR_TEST_BARRIER"), *at = getenv("CNTCTR_TEST_BARRIER_AT");
+    if (!path || !*path || !at || strcmp(at, site) != 0) return;
+    char *ready = fmt("%s.ready", path), *go = fmt("%s.go", path);
+    int fd = open(ready, O_WRONLY | O_CREAT, 0600);
+    if (fd >= 0) close(fd);
+    for (int i = 0; i < 3000 && access(go, F_OK) != 0; i++) usleep(10000);
+    free(ready);
+    free(go);
+}
+#else
+#define code_test_barrier(site) ((void)0)
+#endif
+
+/* A grant request after validation: where it applies, which table kind, and the class the rule would bind. */
+struct code_grant_plan {
+    struct code_target t;
+    const char *kind;
+    enum code_class eff;
+    char cag[16];
+    int destructive;
+    char *snapshot;   /* kb_code_grant_snapshot() taken before the class/rule inputs were read */
+    char *policy_key, *policy;   /* MCP only: the destructive policy, read in the same transaction as the snapshot */
+};
+
+static char *code_policy_key(const char *root);
+
+static void code_grant_plan_free(struct code_grant_plan *pl) {
+    free(pl->snapshot);
+    free(pl->policy_key);
+    free(pl->policy);
+    pl->snapshot = pl->policy_key = pl->policy = NULL;
+    code_target_free(&pl->t);
+}
+
+/* Validate a grant and, for allow, discover and bind the exact tool's effective class. 0, or -1 with *err.
+ * from_mcp checks for a human rule first, before anything is discovered (no process starts for a refusal).
+ * The snapshot of the rules/catalog is taken BEFORE the class inputs are read, so a later change makes the commit
+ * return -3 instead of committing a decision made on older inputs. On success the caller frees the plan. */
+static int code_grant_prepare(sqlite3 *db, const char *root, const char *server, const char *pattern,
+                              const char *level, int from_mcp, int all_projects, struct code_grant_plan *pl, char **err) {
+    memset(pl, 0, sizeof *pl);
+    if (!code_parse_level(level, &pl->kind)) {
+        *err = fmt("level must be allow, read, deny, class:write or class:destructive");
+        return -1;
+    }
+    if (all_projects && strcmp(level, "read") != 0 && strcmp(level, "deny") != 0) {
+        *err = fmt("--all-projects takes read or deny only; allow and class rules stay per project and per tool");
+        return -1;
+    }
+    if (!pattern || !*pattern || strlen(pattern) > 200) { *err = fmt("tool_pattern must be 1 to 200 characters"); return -1; }
+    for (const unsigned char *c = (const unsigned char *)pattern; *c; c++)
+        if (*c < 0x20 || *c == 0x7f) { *err = fmt("tool_pattern must not contain control characters"); return -1; }
+    /* all-projects: the user-scoped server of that name, whatever this directory's project has (a project-local server of
+     * the same name shadows it only there) */
+    if (code_target_resolve(db, all_projects ? "" : root, server, &pl->t, err) != 0) return -1;
+    if (all_projects && pl->t.virt) {
+        *err = fmt("the built-in cntctr server is granted per project, not for all projects");
+        return -1;
+    }
+    const char *rules_project = all_projects ? KB_CODE_ALL_PROJECTS : root;
+    int is_allow = strcmp(level, "allow") == 0;
+    if (from_mcp) {
+        int has_human = 0, prot = 0;
+        if (kb_code_grant_inspect(db, root, pl->t.reg_id, pattern, pl->kind, &has_human, &prot) != 0) {
+            *err = fmt("database error checking existing rules");
+            code_grant_plan_free(pl);
+            return -1;
+        }
+        if (has_human) {
+            *err = fmt("a human set this rule; ask the user");
+            code_grant_plan_free(pl);
+            return -1;
+        }
+    }
+    if (is_allow) {
+        if (strpbrk(pattern, "*?")) {
+            *err = fmt("allow needs one exact tool name (no * or ?); use level read for patterns");
+            code_grant_plan_free(pl);
+            return -1;
+        }
+        json_object *tools = code_tools_or_discover(db, &pl->t, root, from_mcp, err);   /* may discover: before the snapshot */
+        if (!tools) { code_grant_plan_free(pl); return -1; }
+        json_object_put(tools);
+    }
+    if (from_mcp) pl->policy_key = code_policy_key(root);
+    pl->snapshot = kb_code_grant_snapshot(db, rules_project, pl->t.reg_id, pl->t.owner, pl->policy_key, &pl->policy);
+    if (!pl->snapshot) {
+        *err = fmt("database error reading existing rules");
+        code_grant_plan_free(pl);
+        return -1;
+    }
+    if (is_allow) {
+        json_object *tools = code_target_tools(db, &pl->t);   /* re-read after the snapshot */
+        enum code_class base = CODE_WRITE;
+        if (!tools) { *err = fmt("server '%s' reported no catalog", server); code_grant_plan_free(pl); return -1; }
+        if (!code_tool_class(tools, pattern, &base)) {
+            char *sug = code_tool_suggestions(tools, pattern);
+            *err = sug ? fmt("unknown tool %s.%s; did you mean: %s?", server, pattern, sug) : fmt("unknown tool %s.%s", server, pattern);
+            free(sug);
+            json_object_put(tools);
+            code_grant_plan_free(pl);
+            return -1;
+        }
+        json_object_put(tools);
+        enum code_class eff = base;
+        char *why = NULL;
+        /* Only the effective class matters here; but a failed rule lookup must not read as "no class rule". */
+        int crc = kb_code_check_grant(db, root, pl->t.reg_id, pattern, base, &eff, &why);
+        free(why);
+        if (crc < 0) {   /* the rule lookup failed: not "no class rule" */
+            *err = fmt("database error reading existing rules");
+            code_grant_plan_free(pl);
+            return -1;
+        }
+        pl->eff = eff;
+        pl->destructive = eff == CODE_DESTRUCTIVE;
+        snprintf(pl->cag, sizeof pl->cag, "%s", code_class_name(eff));
+    }
+    return 0;
+}
+
+static char *code_policy_key(const char *root) { return fmt("code_destructive_orchestrator:%s", root); }
+
+/* ---- MCP admin tools ---- */
+
+static char *code_format_servers(sqlite3 *db, const char *json_str, int detail) {
+    json_object *arr = json_str ? json_tokener_parse(json_str) : NULL;
+    char *out = strdup("");
+    if (!arr || !json_object_is_type(arr, json_type_array)) {
+        if (arr) json_object_put(arr);
+        return out;
+    }
+    for (size_t i = 0; i < json_object_array_length(arr); i++) {
+        json_object *item = json_object_array_get_idx(arr, i), *ja = NULL, *je = NULL, *ji = NULL;
+        const char *name = sarg(item, "name"), *scope = sarg(item, "scope"), *trust = sarg(item, "trust"), *cmd = sarg(item, "command");
+        json_object_object_get_ex(item, "args", &ja);
+        json_object_object_get_ex(item, "env_keys", &je);
+        json_object_object_get_ex(item, "isolated", &ji);
+        char *line = fmt("%s (%s) trust=%s isolated=%d cmd=%s", name ? name : "", scope && *scope ? scope : "user",
+                         trust ? trust : "none", ji && json_object_get_boolean(ji) ? 1 : 0, cmd ? cmd : "");
+        if (ja && json_object_is_type(ja, json_type_array) && json_object_array_length(ja) > 0) {
+            char *t = fmt("%s args=%s", line, json_object_to_json_string_ext(ja, JSON_C_TO_STRING_PLAIN));
+            free(line);
+            line = t;
+        }
+        if (je && json_object_is_type(je, json_type_array) && json_object_array_length(je) > 0) {
+            char *keys = strdup("");
+            for (size_t j = 0; j < json_object_array_length(je); j++) {
+                const char *k = json_object_get_string(json_object_array_get_idx(je, j));
+                char *t = fmt("%s%s%s", keys, j ? "," : "", k ? k : "");
+                free(keys);
+                keys = t;
+            }
+            char *t = fmt("%s env=%s", line, keys);
+            free(keys);
+            free(line);
+            line = t;
+        }
+        if (name && scope && !strcmp(scope, "project")) {
+            char reg[64];
+            int has_human = 0;
+            if (kb_code_server_inspect(db, "", name, reg, &has_human) == 0) {
+                char *t = fmt("%s\n  shadowed: replaces the user-scoped server '%s' in this project", line, name);
+                free(line);
+                line = t;
+            }
+        } else if (name) {
+            char *sh = kb_code_server_shadows_json(db, name);
+            json_object *sa = sh ? json_tokener_parse(sh) : NULL;
+            free(sh);
+            if (sa && json_object_is_type(sa, json_type_array) && json_object_array_length(sa) > 0) {
+                char *roots = strdup("");
+                for (size_t j = 0; j < json_object_array_length(sa); j++) {
+                    char *t = fmt("%s%s%s", roots, j ? ", " : "", json_object_get_string(json_object_array_get_idx(sa, j)));
+                    free(roots);
+                    roots = t;
+                }
+                /* MCP callers learn only that other projects shadow the name, not where those projects live */
+                char *t = detail ? fmt("%s\n  shadowed in %zu projects by project-local rows: %s", line, json_object_array_length(sa), roots)
+                                 : fmt("%s\n  shadowed in %zu projects by project-local rows", line, json_object_array_length(sa));
+                free(roots);
+                free(line);
+                line = t;
+            }
+            if (sa) json_object_put(sa);
+        }
+        char *t = fmt("%s%s\n", out, line);
+        free(out);
+        free(line);
+        out = t;
+    }
+    json_object_put(arr);
+    return out;
+}
+
+static char *code_format_tools(json_object *tools) {
+    char *out = fmt("%zu tools:\n", json_object_array_length(tools));
+    for (size_t i = 0; i < json_object_array_length(tools); i++) {
+        json_object *o = json_object_array_get_idx(tools, i);
+        char *t = fmt("%s  %s  %s\n", out, sarg(o, "name") ? sarg(o, "name") : "", sarg(o, "class") ? sarg(o, "class") : "?");
+        free(out);
+        out = t;
+    }
+    return out;
+}
+
+static int code_json_strings_ok(json_object *v, int want_object) {
+    if (!v) return 1;
+    if (want_object) {
+        if (!json_object_is_type(v, json_type_object)) return 0;
+        json_object_object_foreach(v, k, child) {
+            (void)k;
+            if (!json_object_is_type(child, json_type_string)) return 0;
+        }
+        return 1;
+    }
+    if (!json_object_is_type(v, json_type_array)) return 0;
+    for (size_t i = 0; i < json_object_array_length(v); i++)
+        if (!json_object_is_type(json_object_array_get_idx(v, i), json_type_string)) return 0;
+    return 1;
+}
+
+static int code_admin_gate(const char *tool, char **res) {
+    char *why = NULL;
+    if (is_orchestrator(&why)) return 0;
+    fail(res, fmt("%s is orchestrator-only: %s", tool, why ? why : "not an orchestrator"));
+    free(why);
+    return 1;
+}
+
+static int tool_code_server(json_object *a, char **res) {
+    *res = NULL;
+    if (code_admin_gate("code_server", res)) return 1;
+    const char *action = sarg(a, "action"), *name = sarg(a, "name");
+    if (!action) return fail(res, fmt("code_server needs 'action' (add, list, remove, discover or restart)"));
+    char root[PATH_MAX], *err = NULL;
+    if (resolve_code_project(self_pane, root) != 0) return fail(res, fmt("could not read the project path of pane %s", self_pane));
+    sqlite3 *db = kb(&err);
+    if (!db) return fail(res, err);
+    int rc = 1;
+
+    if (!strcmp(action, "list")) {
+        char *js = kb_code_server_list_json(db, root);
+        char *txt = code_format_servers(db, js, 0);
+        free(js);
+        rc = ok(res, *txt ? txt : (free(txt), strdup("no servers")));
+        sqlite3_close(db);
+        return rc;
+    }
+    if (!name || !*name) { sqlite3_close(db); return fail(res, fmt("code_server %s needs 'name'", action)); }
+
+    if (!strcmp(action, "add")) {
+        const char *cmd = sarg(a, "command"), *trust = sarg(a, "trust");
+        json_object *jargs = NULL, *jenv = NULL;
+        json_object_object_get_ex(a, "args", &jargs);
+        json_object_object_get_ex(a, "env", &jenv);
+        if (!code_valid_server_name(name)) rc = fail(res, fmt("invalid server name '%s' (letters, digits, _ and -, up to 63; not cntctr)", name));
+        else if (!cmd || !*cmd) rc = fail(res, fmt("code_server add needs 'command'"));
+        else if (code_has_whitespace(cmd)) rc = fail(res, fmt("command must not contain whitespace; pass arguments in args"));
+        else if (trust && strcmp(trust, "none") && strcmp(trust, "annotations")) rc = fail(res, fmt("trust must be none or annotations"));
+        else if (!code_json_strings_ok(jargs, 0)) rc = fail(res, fmt("args must be an array of strings"));
+        else if (!code_json_strings_ok(jenv, 1)) rc = fail(res, fmt("env must be an object of strings"));
+        else {
+            struct code_server_row row;
+            memset(&row, 0, sizeof row);
+            if (strlen(root) >= sizeof row.scope_project) { sqlite3_close(db); return fail(res, fmt("project root is too long")); }
+            snprintf(row.scope_project, sizeof row.scope_project, "%s", root);
+            snprintf(row.name, sizeof row.name, "%s", name);
+            snprintf(row.trust, sizeof row.trust, "%s", trust ? trust : "none");
+            snprintf(row.created_by, sizeof row.created_by, "%s", caller_name);
+            row.isolated = barg(a, "isolated");
+            row.command = (char *)cmd;
+            json_object *empty_a = jargs ? NULL : json_object_new_array(), *empty_e = jenv ? NULL : json_object_new_object();
+            row.args_json = strdup(json_object_to_json_string_ext(jargs ? jargs : empty_a, JSON_C_TO_STRING_PLAIN));
+            row.env_json = strdup(json_object_to_json_string_ext(jenv ? jenv : empty_e, JSON_C_TO_STRING_PLAIN));
+            if (empty_a) json_object_put(empty_a);
+            if (empty_e) json_object_put(empty_e);
+            char reg_id[64] = "";
+            int dg = 0, dp = 0;
+            rc = 1;
+            for (int attempt = 0; attempt < 3; attempt++) {
+                char ureg[64], expected[64] = "";
+                int uh = 0, has_human = 0;
+                int ui = kb_code_server_inspect(db, "", name, ureg, &uh);
+                if (ui == 0) { rc = fail(res, fmt("'%s' already names a user-scoped server; shadowing it is CLI-only (cntctr code server add --project)", name)); break; }
+                if (ui != -1) { rc = fail(res, fmt("database error inspecting '%s'", name)); break; }
+                int pi = kb_code_server_inspect(db, root, name, expected, &has_human);
+                if (pi != 0 && pi != -1) { rc = fail(res, fmt("database error inspecting '%s'", name)); break; }
+                if (pi == 0 && has_human) { rc = fail(res, fmt("a human set rules on this server; ask the user")); break; }
+                int prc = kb_code_server_put_checked(db, &row, 1, pi == 0 ? expected : "", 0, reg_id, &dg, &dp);
+                if (prc == 0) {
+                    code_notify_reload(pi == 0 ? expected : "");
+                    notify_all();
+                    rc = ok(res, dg > 0 ? fmt("added server %s (%s) reg_id=%s; dropped %d grants in %d projects", name, root, reg_id, dg, dp)
+                                        : fmt("added server %s (%s) reg_id=%s", name, root, reg_id));
+                    break;
+                }
+                if (prc == -3) continue;
+                rc = fail(res, prc == -2 ? fmt("a human set rules on this server, or the name belongs to a user-scoped server; ask the user")
+                                         : fmt("failed to store server '%s'", name));
+                break;
+            }
+            if (rc == 1 && !*res) *res = fmt("server '%s' kept changing; try again", name);
+            free(row.args_json);
+            free(row.env_json);
+        }
+    } else if (!strcmp(action, "remove") || !strcmp(action, "restart")) {
+        int is_remove = !strcmp(action, "remove");
+        char reg[64] = "";
+        int has_human = 0;
+        int ir = kb_code_server_inspect(db, root, name, reg, &has_human);
+        if (ir == -2) rc = fail(res, fmt("database error inspecting '%s'", name));
+        else if (ir != 0) {
+            char ureg[64];
+            int uh = 0, ui = kb_code_server_inspect(db, "", name, ureg, &uh);
+            rc = fail(res, ui == 0 ? fmt("'%s' is a user-scoped server; only the CLI may %s it", name, action)
+                                   : fmt("server '%s' not found in this project", name));
+        } else if (is_remove) {
+            rc = 1;
+            for (int attempt = 0; attempt < 3; attempt++) {
+                int dg = 0, dp = 0;
+                if (attempt) {
+                    ir = kb_code_server_inspect(db, root, name, reg, &has_human);
+                    if (ir != 0) { rc = fail(res, fmt("server '%s' changed; try again", name)); break; }
+                }
+                if (has_human) { rc = fail(res, fmt("a human set rules on this server; ask the user")); break; }
+                int drc = kb_code_server_del_checked(db, root, name, 1, reg, 0, &dg, &dp);
+                if (drc > 0) {
+                    code_notify_reload(reg);
+                    notify_all();
+                    rc = ok(res, dg > 0 ? fmt("removed server %s; dropped %d grants in %d projects", name, dg, dp) : fmt("removed server %s", name));
+                    break;
+                }
+                if (drc == -3) continue;
+                rc = fail(res, drc == -2 ? fmt("a human set rules on this server; ask the user") : fmt("failed to remove server '%s'", name));
+                break;
+            }
+            if (rc == 1 && !*res) *res = fmt("server '%s' kept changing; try again", name);
+        } else if (!code_daemon_running()) {
+            rc = ok(res, fmt("the code daemon is not running; nothing to restart"));
+        } else {
+            json_object *req = json_object_new_object();
+            json_object_object_add(req, "method", json_object_new_string("restart"));
+            json_object_object_add(req, "project", json_object_new_string(root));
+            json_object_object_add(req, "reg_id", json_object_new_string(reg));
+            json_object_object_add(req, "server", json_object_new_string(name));
+            char *rerr = NULL;
+            rc = code_rpc(req, 0, 15000, NULL, &rerr) == 0 ? ok(res, fmt("restarted server %s", name))
+                                                           : fail(res, fmt("restart failed: %s", rerr ? rerr : "unknown error"));
+            free(rerr);
+            json_object_put(req);
+        }
+    } else if (!strcmp(action, "discover")) {
+        struct code_target t;
+        if (code_target_resolve(db, root, name, &t, &err) != 0) { rc = fail(res, err); }
+        else {
+            if (code_discover(db, &t, root, 1, &err) != 0) {
+                rc = fail(res, fmt("discover failed: %s", err ? err : "unknown error"));
+                free(err);
+            } else {
+                json_object *tools = code_target_tools(db, &t);
+                if (!tools) rc = fail(res, fmt("server '%s' reported no catalog", name));
+                else {
+                    char *txt = code_format_tools(tools);
+                    json_object_put(tools);
+                    rc = ok(res, txt);
+                }
+            }
+            code_target_free(&t);
+        }
+    } else {
+        rc = fail(res, fmt("unknown action '%s' (add, list, remove, discover, restart)", action));
+    }
+    sqlite3_close(db);
+    return rc;
+}
+
+static const char *code_granter(void) {
+    return !strcasecmp(caller_name, "human") ? "agent-named-human" : caller_name;   /* "human" is reserved for the CLI */
+}
+
+static int tool_code_grant(json_object *a, char **res) {
+    *res = NULL;
+    if (code_admin_gate("code_grant", res)) return 1;
+    const char *server = sarg(a, "server"), *pattern = sarg(a, "tool_pattern"), *level = sarg(a, "level"), *reason = sarg(a, "reason");
+    if (need(res, a, "code_grant", (const char *const[]){"server", "tool_pattern", "level", NULL},
+             "{\"server\":\"fake\",\"tool_pattern\":\"echo\",\"level\":\"allow\"}")) return 1;
+    char root[PATH_MAX], *err = NULL;
+    if (resolve_code_project(self_pane, root) != 0) return fail(res, fmt("could not read the project path of pane %s", self_pane));
+    sqlite3 *db = kb(&err);
+    if (!db) return fail(res, err);
+    int rc = 1;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        struct code_grant_plan pl;
+        if (code_grant_prepare(db, root, server, pattern, level, 1, 0, &pl, &err) != 0) { rc = fail(res, err); break; }
+        if (pl.destructive) {
+            int allowed = pl.policy && !strcmp(pl.policy, "allow");   /* read in the snapshot's transaction */
+            if (!allowed) {
+                struct project p;
+                resolve_project(db, self_pane, &p);
+                char *target = fmt("%s.%s", server, pattern), *qroot = shell_quote(root), *qtarget = shell_quote(target);
+                char *cmd = fmt("cd %s && cntctr code grant %s allow", qroot, qtarget);
+                char *post = fmt("%s wants to allow destructive tool %s.%s in %s. Run in your own terminal (harness panes are refused): %s",
+                                 caller_name, server, pattern, root, cmd);
+                free(announce(db, p.key, caller_name, post, caller_pane, 0));
+                rc = ok(res, fmt("NOT granted: %s.%s is destructive and needs a human. The request is posted to the project board.\n"
+                                 "Run in your own terminal (harness panes are refused):\n  %s", server, pattern, cmd));
+                free(post); free(cmd); free(qroot); free(qtarget); free(target);
+                code_grant_plan_free(&pl);
+                break;
+            }
+        }
+        struct kb_code_grant_guard guard = { pl.t.virt ? NULL : pl.t.name, pl.snapshot, pl.t.owner, pl.policy_key,
+                                             pl.destructive ? pl.policy_key : NULL, 1 };
+        code_test_barrier("grant-precommit");
+        int prc = kb_code_grant_put_checked(db, root, pl.t.reg_id, server, pattern, pl.kind, level, pl.cag, code_granter(),
+                                            reason ? reason : "", 1, &guard);
+        code_grant_plan_free(&pl);
+        if (prc == 0) {
+            char *cls = *pl.cag ? fmt(" (class %s)", pl.cag) : strdup("");
+            rc = ok(res, fmt("granted %s.%s %s%s", server, pattern, level, cls));
+            free(cls);
+            notify_all();
+            break;
+        }
+        if (prc == -3) continue;
+        rc = fail(res, prc == -2 ? fmt("a human set this rule; ask the user") : fmt("failed to store the grant"));
+        break;
+    }
+    if (rc == 1 && !*res) *res = fmt("the server kept changing; try again");
+    sqlite3_close(db);
+    return rc;
+}
+
+static int tool_code_revoke(json_object *a, char **res) {
+    *res = NULL;
+    if (code_admin_gate("code_revoke", res)) return 1;
+    const char *server = sarg(a, "server"), *pattern = sarg(a, "tool_pattern"), *kind = sarg(a, "kind");
+    if (need(res, a, "code_revoke", (const char *const[]){"server", "tool_pattern", NULL}, "{\"server\":\"fake\",\"tool_pattern\":\"echo\"}")) return 1;
+    if (kind && strcmp(kind, "access") && strcmp(kind, "class")) return fail(res, fmt("kind must be access or class"));
+    char root[PATH_MAX], *err = NULL;
+    if (resolve_code_project(self_pane, root) != 0) return fail(res, fmt("could not read the project path of pane %s", self_pane));
+    sqlite3 *db = kb(&err);
+    if (!db) return fail(res, err);
+    struct code_target t;
+    if (code_target_resolve(db, root, server, &t, &err) != 0) { sqlite3_close(db); return fail(res, err); }
+    int rc = 1;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        int has_human = 0, prot = 0;
+        char *snap = kb_code_grant_snapshot(db, root, t.reg_id, t.owner, NULL, NULL);
+        if (!snap) { rc = fail(res, fmt("database error reading existing rules")); break; }
+        if (kb_code_grant_inspect(db, root, t.reg_id, pattern, kind, &has_human, &prot) != 0) { free(snap); rc = fail(res, fmt("database error checking existing rules")); break; }
+        if (has_human) { free(snap); rc = fail(res, fmt("a human set this rule; ask the user")); break; }
+        struct kb_code_grant_guard guard = { t.virt ? NULL : t.name, snap, t.owner, NULL, NULL, 1 };
+        code_test_barrier("revoke-precommit");
+        int drc = kb_code_grant_del_checked(db, root, t.reg_id, pattern, kind, 1, &guard);
+        free(snap);
+        if (drc > 0) { notify_all(); rc = ok(res, fmt("revoked %s.%s", server, pattern)); break; }
+        if (drc == 0) {
+            int ap_human = 0, ap_prot = 0;
+            if (kb_code_grant_inspect(db, KB_CODE_ALL_PROJECTS, t.reg_id, pattern, kind, &ap_human, &ap_prot) == 0 && ap_human)
+                rc = fail(res, fmt("%s.%s is an all-projects rule a human set; only the user can remove it (cntctr code revoke --all-projects)", server, pattern));
+            else
+                rc = fail(res, fmt("no rule %s.%s in this project", server, pattern));
+            break;
+        }
+        if (drc == -3) continue;
+        rc = fail(res, drc == -2 ? fmt("a human set this rule; ask the user") : fmt("failed to remove the rule"));
+        break;
+    }
+    if (rc == 1 && !*res) *res = fmt("the server kept changing; try again");
+    code_target_free(&t);
+    sqlite3_close(db);
+    return rc;
+}
+
+/* ---- code mode agent tools: code_find, code_run, code_expand, code_status, and the tools.cntctr.* reverse RPC ---- */
+
+#define CODE_REV_MAX_WORKERS 4       /* CNTCTR_CODE_MAX_REV_CALLS: reverse workers per run */
+#define CODE_REV_MAX_QUEUE   64      /* queued reverse calls per run (JS in-flight cap is lower; this is a backstop) */
+#define CODE_REV_RESULT_MAX  (1024 * 1024)
+
+/* tools.cntctr.* allowlist (checked here, on the client, BEFORE dispatch_as); the classes live in the daemon's table. */
+static const char *const CODE_CNTCTR_ALLOWLIST[] = {"list", "recall", "read", "board", "project", "note", "post", "send", "reply", NULL};
+static const char *const CODE_CNTCTR_PANE_ONLY[] = {"board", "post", "send", "reply", NULL};
+
+static int code_in_list(const char *const *list, const char *s) {
+    for (; *list; list++)
+        if (s && !strcmp(*list, s)) return 1;
+    return 0;
+}
+
+struct rev_item {
+    int64_t id;
+    char *tool, *args_text;   /* private copies: no json-c object is shared between threads */
+    void (*reply)(void *rctx, json_object *resp);
+    void *rctx;
+    struct rev_item *next;
+};
+
+/* One run's reverse-RPC connection state. Refcounted: the run owns one ref, every worker thread another, so a late
+ * reply (after the run ended or was cancelled) only ever touches this heap object and the reply token's own
+ * refcounted connection. The per-connection write mutex lives in that connection (code_daemon.c rpc_conn_shared). */
+struct rev_ctx {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int refcount, closed;
+    char pane[32];   /* the verified origin: self_pane, NEVER a from=-supplied pane; "" when paneless */
+    char name[128];  /* attribution only */
+    int workers, active, peak, queued;
+    struct rev_item *head, *tail;
+    int hold;        /* tests (CNTCTR_TEST_HOOKS): park workers before they dispatch */
+};
+
+static struct rev_ctx *rev_ctx_new(const char *pane, const char *name) {
+    struct rev_ctx *c = calloc(1, sizeof *c);
+    if (!c) abort();
+    pthread_mutex_init(&c->mu, NULL);
+    pthread_cond_init(&c->cv, NULL);
+    c->refcount = 1;
+    snprintf(c->pane, sizeof c->pane, "%s", pane ? pane : "");
+    snprintf(c->name, sizeof c->name, "%s", name ? name : "");
+    return c;
+}
+
+static void rev_ctx_unref(struct rev_ctx *c) {
+    pthread_mutex_lock(&c->mu);
+    int last = --c->refcount == 0;
+    pthread_mutex_unlock(&c->mu);
+    if (!last) return;
+    pthread_mutex_destroy(&c->mu);
+    pthread_cond_destroy(&c->cv);
+    free(c);
+}
+
+static void rev_item_free(struct rev_item *it) {
+    free(it->tool);
+    free(it->args_text);
+    free(it);
+}
+
+static json_object *rev_reply_obj(int64_t id, int ok_flag, const char *text) {
+    json_object *r = json_object_new_object();
+    json_object_object_add(r, "id", json_object_new_int64(id));
+    json_object_object_add(r, "ok", json_object_new_boolean(ok_flag));
+    json_object_object_add(r, ok_flag ? "result" : "error", json_object_new_string(text ? text : ""));
+    return r;
+}
+
+static void rev_send(struct rev_item *it, int ok_flag, const char *text) {
+    json_object *r = rev_reply_obj(it->id, ok_flag, text);
+    it->reply(it->rctx, r);   /* the callback writes it; we still own it */
+    json_object_put(r);
+}
+
+static void *rev_worker_main(void *arg) {
+    struct rev_ctx *c = arg;
+    for (;;) {
+        pthread_mutex_lock(&c->mu);
+        struct rev_item *it = c->head;
+        if (!it) {
+            c->workers--;
+            pthread_mutex_unlock(&c->mu);
+            rev_ctx_unref(c);
+            return NULL;
+        }
+        c->head = it->next;
+        if (!c->head) c->tail = NULL;
+        c->queued--;
+        c->active++;
+        if (c->active > c->peak) c->peak = c->active;
+        pthread_cond_broadcast(&c->cv);
+        while (c->hold && !c->closed) pthread_cond_wait(&c->cv, &c->mu);
+        int closed = c->closed;
+        pthread_mutex_unlock(&c->mu);
+
+        if (closed) {
+            rev_send(it, 0, "run finished before this call ran");
+        } else {
+            json_object *args = json_tokener_parse(it->args_text);
+            char *res = NULL;
+            int rc;
+            if (!args || !json_object_is_type(args, json_type_object)) {
+                rc = 1;
+                res = strdup("invalid arguments");
+            } else {
+                rc = dispatch_as(c->pane, c->name, it->tool, args, &res);
+            }
+            if (args) json_object_put(args);
+            if (!res) res = strdup("");
+            size_t n = strlen(res);
+            if (n > CODE_REV_RESULT_MAX) {
+                n = CODE_REV_RESULT_MAX;
+                while (n > 0 && ((unsigned char)res[n] & 0xC0) == 0x80) n--;
+                char *cut = fmt("%.*s\n... (truncated to %d bytes)", (int)n, res, CODE_REV_RESULT_MAX);
+                free(res);
+                res = cut;
+            }
+            rev_send(it, rc == 0, res);
+            free(res);
+        }
+        rev_item_free(it);
+        pthread_mutex_lock(&c->mu);
+        c->active--;
+        pthread_cond_broadcast(&c->cv);
+        pthread_mutex_unlock(&c->mu);
+    }
+}
+
+/* The run ended or was cancelled: answer what is still queued, wake held workers, drop the owner's reference. */
+static void rev_ctx_close(struct rev_ctx *c) {
+    pthread_mutex_lock(&c->mu);
+    c->closed = 1;
+    struct rev_item *q = c->head;
+    c->head = c->tail = NULL;
+    c->queued = 0;
+    pthread_cond_broadcast(&c->cv);
+    pthread_mutex_unlock(&c->mu);
+    while (q) {
+        struct rev_item *nx = q->next;
+        rev_send(q, 0, "run finished before this call ran");
+        rev_item_free(q);
+        q = nx;
+    }
+    rev_ctx_unref(c);
+}
+
+static void rev_refuse(void (*reply)(void *, json_object *), void *rctx, int64_t id, const char *why) {
+    json_object *r = rev_reply_obj(id, 0, why);
+    reply(rctx, r);
+    json_object_put(r);
+}
+
+/* code_rev_fn for code_client_rpc: runs on the RPC thread, so it only validates, copies and queues. */
+static void code_rev_handler(void *ctx, json_object *req, void (*reply)(void *rctx, json_object *resp), void *rctx) {
+    struct rev_ctx *c = ctx;
+    json_object *jid = NULL, *jtool = NULL, *jargs = NULL;
+    int64_t id = 0;
+    if (json_object_object_get_ex(req, "id", &jid) && jid) id = json_object_get_int64(jid);
+    const char *method = sarg(req, "method"), *tool = sarg(req, "tool");
+    (void)jtool;
+    if (!method || strcmp(method, "rev_call") != 0) { rev_refuse(reply, rctx, id, "unsupported reverse call"); return; }
+    if (!tool || !code_in_list(CODE_CNTCTR_ALLOWLIST, tool)) {
+        char *m = fmt("tools.cntctr.%s is not allowed from a script", tool ? tool : "(none)");
+        rev_refuse(reply, rctx, id, m);
+        free(m);
+        return;
+    }
+    json_object_object_get_ex(req, "args", &jargs);
+    json_object *args = json_object_new_object();   /* a filtered copy: no `from`, nothing shared with the RPC thread */
+    if (jargs && json_object_is_type(jargs, json_type_object)) {
+        json_object_object_foreach(jargs, k, v) {
+            if (!strcmp(k, "from") || !strcmp(k, "peek")) continue;   /* peek is ours to set, never the script's */
+            json_object_object_add(args, k, json_tokener_parse(json_object_to_json_string_ext(v, JSON_C_TO_STRING_PLAIN)));
+        }
+    }
+    const char *why = NULL;
+    if (!strcmp(tool, "project")) {
+        json_object *jk = NULL;
+        /* tool_project resets the alias whenever "key" is present, even "" or null: refuse on presence alone */
+        if (json_object_object_get_ex(args, "key", &jk))
+            why = "tools.cntctr.project is get-only from a script (no key)";
+    }
+    if (!why && !strcmp(tool, "send")) {
+        json_object *jw = NULL;
+        if (json_object_object_get_ex(args, "wait", &jw) && jw && json_object_get_boolean(jw))
+            why = "tools.cntctr.send cannot wait (wait:true is not allowed from a script)";
+        else
+            json_object_object_add(args, "wait", json_object_new_boolean(0));
+    }
+    /* a script reading the board must not consume the agent's mail or move its seen cursor (silent information loss) */
+    if (!why && !strcmp(tool, "board")) json_object_object_add(args, "peek", json_object_new_boolean(1));
+    char *pm = NULL;
+    if (!why && !*c->pane && code_in_list(CODE_CNTCTR_PANE_ONLY, tool)) {
+        pm = fmt("tools.cntctr.%s needs a bound pane (this agent runs outside its tmux pane, so it has no verified identity to act as)", tool);
+        why = pm;
+    }
+    if (why) {
+        rev_refuse(reply, rctx, id, why);
+        free(pm);
+        json_object_put(args);
+        return;
+    }
+    struct rev_item *it = calloc(1, sizeof *it);
+    if (!it) abort();
+    it->id = id;
+    it->tool = strdup(tool);
+    it->args_text = strdup(json_object_to_json_string_ext(args, JSON_C_TO_STRING_PLAIN));
+    it->reply = reply;
+    it->rctx = rctx;
+    json_object_put(args);
+
+    int start = 0, refuse_full = 0, refuse_closed = 0;
+    pthread_mutex_lock(&c->mu);
+    if (c->closed) refuse_closed = 1;
+    else if (c->queued >= CODE_REV_MAX_QUEUE) refuse_full = 1;
+    else {
+        if (c->tail) c->tail->next = it;
+        else c->head = it;
+        c->tail = it;
+        c->queued++;
+        if (c->workers < CODE_REV_MAX_WORKERS) { c->workers++; c->refcount++; start = 1; }
+    }
+    pthread_mutex_unlock(&c->mu);
+    if (refuse_closed || refuse_full) {
+        rev_refuse(reply, rctx, id, refuse_closed ? "run finished before this call ran" : "too many queued tools.cntctr calls");
+        rev_item_free(it);
+        return;
+    }
+    if (start) {
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, rev_worker_main, c) != 0) {
+            pthread_mutex_lock(&c->mu);
+            c->workers--;
+            c->refcount--;
+            pthread_mutex_unlock(&c->mu);
+            /* the item stays queued for a running worker if there is one; otherwise answer it now */
+            pthread_mutex_lock(&c->mu);
+            int none = c->workers == 0;
+            struct rev_item *mine = NULL;
+            if (none) {
+                mine = c->head;
+                c->head = c->tail = NULL;
+                c->queued = 0;
+            }
+            pthread_mutex_unlock(&c->mu);
+            while (mine) {
+                struct rev_item *nx = mine->next;
+                rev_send(mine, 0, "cannot start a worker thread");
+                rev_item_free(mine);
+                mine = nx;
+            }
+        } else {
+            pthread_detach(tid);
+        }
+    }
+}
+
+/* One line of untrusted text for prose: first line only, control characters flattened, at most `max` bytes. */
+static char *code_clean_line(const char *s, size_t max) {
+    if (!s) s = "";
+    size_t n = strcspn(s, "\n\r");
+    if (n > max) {
+        n = max;
+        while (n > 0 && ((unsigned char)s[n] & 0xC0) == 0x80) n--;
+    }
+    char *o = malloc(n + 1);
+    if (!o) abort();
+    for (size_t i = 0; i < n; i++) o[i] = ((unsigned char)s[i] < 0x20 || s[i] == 0x7f) ? ' ' : s[i];
+    o[n] = '\0';
+    return o;
+}
+
+static char *code_format_grants_text(const char *json_str) {
+    json_object *arr = json_str ? json_tokener_parse(json_str) : NULL;
+    char *out = strdup("");
+    if (!arr || !json_object_is_type(arr, json_type_array)) { if (arr) json_object_put(arr); free(out); return NULL; }
+    for (size_t i = 0; i < json_object_array_length(arr); i++) {
+        json_object *g = json_object_array_get_idx(arr, i);
+        const char *cag = sarg(g, "class_at_grant"), *rs = sarg(g, "reason");
+        char *reason = rs && *rs ? code_clean_line(rs, 200) : NULL;
+        const char *scope = sarg(g, "scope");
+        char *line = fmt("%s.%s %s %s%s%s by=%s%s%s%s\n", sarg(g, "server") ? sarg(g, "server") : "", sarg(g, "tool_pattern") ? sarg(g, "tool_pattern") : "",
+                         sarg(g, "kind") ? sarg(g, "kind") : "", sarg(g, "level") ? sarg(g, "level") : "",
+                         cag && *cag ? " class=" : "", cag && *cag ? cag : "", sarg(g, "granted_by") ? sarg(g, "granted_by") : "",
+                         reason ? " reason=" : "", reason ? reason : "", scope && !strcmp(scope, "all-projects") ? " [all-projects]" : "");
+        free(reason);
+        char *t = fmt("%s%s", out, line);
+        free(out);
+        free(line);
+        out = t;
+    }
+    json_object_put(arr);
+    return out;
+}
+
+static int tool_code_find(json_object *a, char **res) {
+    *res = NULL;
+    const char *query = sarg(a, "query");
+    char root[PATH_MAX];
+    if (resolve_code_project(self_pane, root) != 0) return fail(res, fmt("could not read the project path of pane %s", self_pane));
+    json_object *resp = NULL;
+    char *err = NULL;
+    for (int exact = 1; exact >= 0; exact--) {
+        json_object *req = json_object_new_object();
+        json_object_object_add(req, "method", json_object_new_string("find"));
+        json_object_object_add(req, "project", json_object_new_string(root));
+        const char *dot = query ? strchr(query, '.') : NULL;
+        if (exact) {
+            if (!dot || dot == query || !dot[1] || strlen(dot + 1) > 128 || (size_t)(dot - query) >= 64) { json_object_put(req); continue; }
+            char sname[64];
+            snprintf(sname, sizeof sname, "%.*s", (int)(dot - query), query);
+            if (!code_valid_server_name(sname) && strcmp(sname, "cntctr") != 0) { json_object_put(req); continue; }
+            json_object_object_add(req, "server", json_object_new_string(sname));
+            json_object_object_add(req, "tool", json_object_new_string(dot + 1));
+        } else if (query && *query) {
+            json_object_object_add(req, "query", json_object_new_string(query));
+        }
+        if (resp) { json_object_put(resp); resp = NULL; }
+        free(err);
+        err = NULL;
+        int rrc = code_rpc(req, 1, 30000, &resp, &err);   /* autostarts the daemon, never a tool server */
+        json_object_put(req);
+        if (rrc != 0) {
+            char *m = fmt("code_find failed: %s", err ? err : "daemon unavailable");
+            free(err);
+            return fail(res, m);
+        }
+        json_object *jt = NULL;
+        if (exact && json_object_object_get_ex(resp, "tools", &jt) && json_object_array_length(jt) == 0) continue;   /* not an exact name */
+        break;
+    }
+    if (!resp) return fail(res, fmt("code_find failed: no answer"));
+    json_object *jt = NULL, *ju = NULL;
+    json_object_object_get_ex(resp, "tools", &jt);
+    json_object_object_get_ex(resp, "uncatalogued", &ju);
+    char *out = strdup("");
+    size_t nt = jt && json_object_is_type(jt, json_type_array) ? json_object_array_length(jt) : 0;
+    for (size_t i = 0; i < nt && strlen(out) < 60000; i++) {
+        json_object *m = json_object_array_get_idx(jt, i), *jg = NULL, *js = NULL;
+        char *desc = code_clean_line(sarg(m, "description"), 160);
+        json_object_object_get_ex(m, "granted", &jg);
+        char *line = fmt("%s.%s [%s] %s%s%s\n", sarg(m, "server") ? sarg(m, "server") : "", sarg(m, "name") ? sarg(m, "name") : "",
+                         sarg(m, "class") ? sarg(m, "class") : "?", jg && json_object_get_boolean(jg) ? "granted" : "denied",
+                         *desc ? " \xe2\x80\x94 " : "", desc);
+        free(desc);
+        char *t = fmt("%s%s", out, line);
+        free(out); free(line);
+        out = t;
+        if (json_object_object_get_ex(m, "inputSchema", &js) && js) {
+            const char *sj = json_object_to_json_string_ext(js, JSON_C_TO_STRING_PLAIN);
+            t = fmt("%s  inputSchema: %.8000s\n", out, sj ? sj : "{}");
+            free(out);
+            out = t;
+        }
+    }
+    size_t nu = ju && json_object_is_type(ju, json_type_array) ? json_object_array_length(ju) : 0;
+    for (size_t i = 0; i < nu; i++) {
+        const char *un = json_object_get_string(json_object_array_get_idx(ju, i));
+        if (!un || !code_valid_server_name(un)) continue;
+        if (query && *query && !strcasestr(un, query)) continue;
+        char *t = fmt("%s%s (unindexed; ask orchestrator for code_server action=discover or run cntctr code server discover %s)\n", out, un, un);
+        free(out);
+        out = t;
+    }
+    json_object_put(resp);
+    if (!*out) { free(out); out = fmt("no tools match%s%s", query && *query ? " " : "", query && *query ? query : ""); }
+    return ok(res, out);
+}
+
+static int code_is_worker(void) {
+    if (!*self_pane) return 0;
+    char *parent = NULL;
+    int worker = TMUX(NULL, &parent, "show", "-pqv", "-t", self_pane, "@cntctr_parent") == 0 && parent && *parent;
+    free(parent);
+    return worker;
+}
+
+static int tool_code_run(json_object *a, char **res) {
+    *res = NULL;
+    const char *script = sarg(a, "script");
+    if (need(res, a, "code_run", (const char *const[]){"script", NULL}, "{\"script\":\"return await tools.fake.echo({msg:'hi'});\"}")) return 1;
+    char root[PATH_MAX];
+    if (resolve_code_project(self_pane, root) != 0) return fail(res, fmt("could not read the project path of pane %s", self_pane));
+    json_object *jscope = NULL, *jto = NULL;
+    json_object_object_get_ex(a, "scope", &jscope);
+    json_object_object_get_ex(a, "timeout", &jto);
+    if (jscope && (!json_object_is_type(jscope, json_type_array) || !code_json_strings_ok(jscope, 0)))
+        return fail(res, fmt("scope must be an array of strings"));
+    int wall = 300;
+    const char *envw = getenv("CNTCTR_CODE_WALL_SEC");
+    if (envw && *envw) { long v = strtol(envw, NULL, 10); if (v >= 1) wall = v > 1800 ? 1800 : (int)v; }
+    if (jto) {
+        if (!json_object_is_type(jto, json_type_int) && !json_object_is_type(jto, json_type_double))
+            return fail(res, fmt("timeout must be a number of seconds"));
+        int64_t v = json_object_get_int64(jto);
+        wall = v < 1 ? 1 : v > 1800 ? 1800 : (int)v;
+    }
+    json_object *req = json_object_new_object();
+    json_object_object_add(req, "method", json_object_new_string("run"));
+    json_object_object_add(req, "project", json_object_new_string(root));
+    json_object_object_add(req, "caller", json_object_new_string(caller_name));
+    json_object_object_add(req, "script", json_object_new_string(script));
+    json_object_object_add(req, "timeout", json_object_new_int(wall));
+    if (jscope) json_object_object_add(req, "scope", json_object_get(jscope));
+
+    struct rev_ctx *rc_ctx = rev_ctx_new(self_pane, caller_name);   /* pane: self_pane only, never caller_pane from from= */
+    json_object *resp = NULL;
+    char *err = NULL;
+    int rpc_rc = code_client_rpc(req, 1, &resp, code_rev_handler, code_cancel_cb, rc_ctx, (wall + 30) * 1000, &err);
+    json_object_put(req);
+    rev_ctx_close(rc_ctx);
+    if (rpc_rc != 0) {
+        char *m = fmt("code_run failed: %s", err ? err : "daemon unavailable");
+        free(err);
+        return fail(res, m);
+    }
+    json_object *jok = NULL, *jerr = NULL, *jie = NULL, *jrc = NULL;
+    if (!json_object_object_get_ex(resp, "ok", &jok) || !json_object_get_boolean(jok)) {
+        char *m = fmt("code_run failed: %s", json_object_object_get_ex(resp, "error", &jerr) && json_object_is_type(jerr, json_type_string)
+                                                  ? json_object_get_string(jerr) : "daemon error");
+        json_object_put(resp);
+        return fail(res, m);
+    }
+    json_object *out = json_object_new_object();
+    static const char *const keys[] = {"run_id", "result", "logs", "calls", "denied", NULL};
+    for (int i = 0; keys[i]; i++) {
+        const char *v = sarg(resp, keys[i]);
+        json_object_object_add(out, keys[i], json_object_new_string(v ? v : ""));
+    }
+    int is_error = json_object_object_get_ex(resp, "is_error", &jie) && json_object_get_boolean(jie);
+    json_object_object_add(out, "is_error", json_object_new_boolean(is_error));
+    json_object_object_add(out, "retained_capped",
+                           json_object_new_boolean(json_object_object_get_ex(resp, "retained_capped", &jrc) && json_object_get_boolean(jrc)));
+    const char *denied = sarg(resp, "denied");
+    if (denied && *denied && code_is_worker())
+        json_object_object_add(out, "note", json_object_new_string(
+            "you are a spawned worker and cannot grant access: ask your parent (the orchestrator) to run code_grant, or ask the user to run the command above"));
+    char *txt = strdup(json_object_to_json_string_ext(out, JSON_C_TO_STRING_PLAIN));
+    json_object_put(out);
+    json_object_put(resp);
+    return is_error ? fail(res, txt) : ok(res, txt);
+}
+
+static int tool_code_expand(json_object *a, char **res) {
+    *res = NULL;
+    const char *run = sarg(a, "run"), *part = sarg(a, "part");
+    if (need(res, a, "code_expand", (const char *const[]){"run", NULL}, "{\"run\":\"r-...\",\"part\":\"logs\"}")) return 1;
+    if (!part) part = "result";
+    if (strcmp(part, "result") && strcmp(part, "logs") && strcmp(part, "calls") && strcmp(part, "denied"))
+        return fail(res, fmt("part must be result, logs, calls or denied"));
+    if (strlen(run) > 64) return fail(res, fmt("run %.64s not found", run));
+    json_object *jo = NULL, *jl = NULL;
+    int64_t off = 0, lim = 16384;
+    if (json_object_object_get_ex(a, "offset", &jo) && jo) off = json_object_get_int64(jo);
+    if (json_object_object_get_ex(a, "limit", &jl) && jl) lim = json_object_get_int64(jl);
+    if (off < 0) off = 0;
+    if (lim < 1) lim = 1;
+    if (lim > 65536) lim = 65536;
+    char root[PATH_MAX], *err = NULL;
+    if (resolve_code_project(self_pane, root) != 0) return fail(res, fmt("could not read the project path of pane %s", self_pane));
+    sqlite3 *db = kb(&err);
+    if (!db) return fail(res, err);
+    char *slice = NULL;
+    size_t total = 0, start = 0;
+    int capped = 0;
+    int rc = kb_code_run_expand(db, root, run, part, (size_t)off, (size_t)lim, &slice, &total, &capped, &start);
+    sqlite3_close(db);
+    if (rc == 1) { free(slice); return fail(res, fmt("run %s has expired", run)); }
+    if (rc == -1) { free(slice); return fail(res, fmt("run %s not found", run)); }
+    if (rc != 0) { free(slice); return fail(res, fmt("could not read the run store")); }
+    size_t n = slice ? strlen(slice) : 0;
+    json_object *o = json_object_new_object();
+    json_object_object_add(o, "run", json_object_new_string(run));
+    json_object_object_add(o, "part", json_object_new_string(part));
+    json_object_object_add(o, "offset", json_object_new_int64((int64_t)start));
+    json_object_object_add(o, "total_len", json_object_new_int64((int64_t)total));
+    if (start + n < total) json_object_object_add(o, "next_offset", json_object_new_int64((int64_t)(start + n)));
+    json_object_object_add(o, "retained_capped", json_object_new_boolean(capped != 0));
+    if (capped) json_object_object_add(o, "note", json_object_new_string("the retained copy of this part hit its storage ceiling and ends early"));
+    json_object_object_add(o, "slice", json_object_new_string(slice ? slice : ""));
+    free(slice);
+    char *txt = strdup(json_object_to_json_string_ext(o, JSON_C_TO_STRING_PLAIN));
+    json_object_put(o);
+    return ok(res, txt);
+}
+
+static int tool_code_status(json_object *a, char **res) {
+    (void)a;
+    *res = NULL;
+    char root[PATH_MAX], *err = NULL;
+    if (resolve_code_project(self_pane, root) != 0) return fail(res, fmt("could not read the project path of pane %s", self_pane));
+    json_object *st = NULL;
+    char *perr = NULL;
+    int prc = code_client_probe(&st, &perr);
+    char *out;
+    if (prc != 0) { out = fmt("code daemon: unreachable (%s)\n", perr ? perr : "unknown"); }
+    else if (!st) { out = strdup("code daemon: off (it starts on the first code_run or code_find)\n"); }
+    else {
+        json_object *jp = NULL, *jm = NULL, *js = NULL, *jar = NULL;
+        json_object_object_get_ex(st, "active_runs", &jar);
+        json_object_object_get_ex(st, "pid", &jp);
+        json_object_object_get_ex(st, "rss_mb", &jm);
+        json_object_object_get_ex(st, "servers", &js);
+        out = fmt("code daemon: pid %lld, %s, %d MB, %d active runs\n", jp ? (long long)json_object_get_int64(jp) : 0LL,
+                  sarg(st, "version") ? sarg(st, "version") : "?", jm ? json_object_get_int(jm) : 0, jar ? json_object_get_int(jar) : 0);
+        size_t other = 0;
+        for (size_t i = 0; js && json_object_is_type(js, json_type_array) && i < json_object_array_length(js); i++) {
+            json_object *s = json_object_array_get_idx(js, i), *ek = NULL, *jpid = NULL, *jr = NULL;
+            const char *owner = sarg(s, "owner_project");
+            if (owner && *owner && strcmp(owner, root) != 0) { other++; continue; }   /* other projects' instances are only counted */
+            json_object_object_get_ex(s, "env_keys", &ek);
+            json_object_object_get_ex(s, "pid", &jpid);
+            json_object_object_get_ex(s, "rss_mb", &jr);
+            char *keys = strdup("");
+            for (size_t j = 0; ek && json_object_is_type(ek, json_type_array) && j < json_object_array_length(ek); j++) {
+                char *k = code_clean_line(json_object_get_string(json_object_array_get_idx(ek, j)), 64), *t = fmt("%s%s%s", keys, j ? "," : "", k);
+                free(k); free(keys);
+                keys = t;
+            }
+            char *line = fmt("%s  server %s state=%s pid=%lld %lld MB%s%s\n", out, sarg(s, "name") ? sarg(s, "name") : "", sarg(s, "state") ? sarg(s, "state") : "?",
+                             jpid ? (long long)json_object_get_int64(jpid) : 0LL, jr ? (long long)json_object_get_int64(jr) : 0LL, *keys ? " env=" : "", keys);
+            free(keys); free(out);
+            out = line;
+        }
+        if (other) { char *t = fmt("%s  %zu server instances of other projects\n", out, other); free(out); out = t; }
+    }
+    json_object_put(st);
+    free(perr);
+    sqlite3 *db = kb(&err);
+    if (!db) { free(out); return fail(res, err); }
+    char *gj = kb_code_grant_list_json(db, root, "");
+    int usable = kb_code_project_has_usable(db, root);
+    sqlite3_close(db);
+    char *gt = code_format_grants_text(gj);
+    free(gj);
+    if (!gt) { free(out); return fail(res, fmt("could not read this project's grants")); }
+    char *t = fmt("%sgrants for %s:\n%s%s", out, root, *gt ? gt : "  (none)\n",
+                  usable == 1 ? "" : "no usable code server here: a server needs a non-deny rule for this project (cntctr code grant <server>.* read, or --all-projects). "
+                                     "code_find, code_run and code_expand are hidden until then; a Codex session must be restarted to see them once enabled.\n");
+    free(out);
+    free(gt);
+    return ok(res, t);
+}
+
+/* ---- CLI: grant, revoke, grants, policy, discover, restart ---- */
+
+static int code_cli_root_db(sqlite3 **db, char root[PATH_MAX]) {
+    char cwd[PATH_MAX], *err = NULL;
+    if (!getcwd(cwd, sizeof cwd)) snprintf(cwd, sizeof cwd, ".");
+    resolve_code_cwd(cwd, root);
+    *db = kb(&err);
+    if (!*db) { fprintf(stderr, "%s\n", err); free(err); return -1; }
+    return 0;
+}
+
+/* "<server>.<pattern>" into its two parts (server names have no dots). */
+static int code_split_target(const char *arg, char server[64], const char **pattern) {
+    const char *dot = strchr(arg, '.');
+    if (!dot || dot == arg || !dot[1] || (size_t)(dot - arg) >= 64) return -1;
+    snprintf(server, 64, "%.*s", (int)(dot - arg), arg);
+    *pattern = dot + 1;
+    return 0;
+}
+
+static int code_grant_cmd(int argc, char **argv) {
+    const char *reason = "";
+    int all = 0;
+    if (argc < 5) goto usage;
+    for (int i = 5; i < argc; i++) {
+        if (!strcmp(argv[i], "--reason") && i + 1 < argc) reason = argv[++i];
+        else if (!strcmp(argv[i], "--all-projects")) all = 1;
+        else goto usage;
+    }
+    char server[64];
+    const char *pattern = NULL, *level = argv[4];
+    if (code_split_target(argv[3], server, &pattern) != 0) goto usage;
+    const char *kind_unused = NULL;
+    if (!code_parse_level(level, &kind_unused)) goto usage;
+    if (cli_admin_guard(0, NULL) != 0) return 1;
+    sqlite3 *db;
+    char root[PATH_MAX];
+    if (code_cli_root_db(&db, root) != 0) return 1;
+    int rc = 1;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        char *err = NULL;
+        struct code_grant_plan pl;
+        if (code_grant_prepare(db, root, server, pattern, level, 0, all, &pl, &err) != 0) {
+            fprintf(stderr, "code grant: %s\n", err ? err : "failed");
+            free(err);
+            break;
+        }
+        const char *proj = all ? KB_CODE_ALL_PROJECTS : root, *where = all ? "all projects" : root;
+        int has_human = 0, prot = 0;
+        if (kb_code_grant_inspect(db, proj, pl.t.reg_id, pattern, pl.kind, &has_human, &prot) != 0) {
+            fprintf(stderr, "code grant: database error checking existing rules\n");
+            code_grant_plan_free(&pl);
+            break;
+        }
+        int approved = 0;
+        if (pl.destructive || prot) {
+            char *msg = pl.destructive
+                ? fmt("Allow DESTRUCTIVE tool %s.%s in %s?", server, pattern, where)
+                : fmt("Replace the human-set rule on %s.%s in %s?", server, pattern, where);
+            int g = cli_admin_guard(1, msg);
+            free(msg);
+            if (g != 0) { code_grant_plan_free(&pl); break; }
+            approved = 1;
+        }
+        struct kb_code_grant_guard guard = { pl.t.virt ? NULL : pl.t.name, pl.snapshot, pl.t.owner, NULL, NULL, approved };
+        code_test_barrier("grant-precommit");
+        int prc = kb_code_grant_put_checked(db, proj, pl.t.reg_id, server, pattern, pl.kind, level, pl.cag, "human", reason, 0, &guard);
+        code_grant_plan_free(&pl);
+        if (prc == 0) {
+            printf("granted %s.%s %s in %s\n", server, pattern, level, where);
+            notify_all();
+            rc = 0;
+            break;
+        }
+        if (prc == -3) { fprintf(stderr, "rules or server changed before commit; re-checking\n"); continue; }
+        fprintf(stderr, "code grant: failed to store the grant\n");
+        break;
+    }
+    sqlite3_close(db);
+    return rc;
+usage:
+    fprintf(stderr, "usage: cntctr code grant <server>.<pattern> <allow|deny|read|class:write|class:destructive> [--reason <text>] [--all-projects]\n"
+                    "  --all-projects: a user-wide rule for a user-scoped server, read or deny only; a project's own rule beats it, a deny from either denies\n");
+    return 2;
+}
+
+static int code_revoke_cmd(int argc, char **argv) {
+    const char *kind = NULL;
+    int all = 0;
+    if (argc < 4) goto usage;
+    for (int i = 4; i < argc; i++) {
+        if (!strcmp(argv[i], "--kind") && i + 1 < argc) kind = argv[++i];
+        else if (!strcmp(argv[i], "--all-projects")) all = 1;
+        else goto usage;
+    }
+    if (kind && strcmp(kind, "access") && strcmp(kind, "class")) goto usage;
+    char server[64];
+    const char *pattern = NULL;
+    if (code_split_target(argv[3], server, &pattern) != 0) goto usage;
+    if (cli_admin_guard(0, NULL) != 0) return 1;
+    sqlite3 *db;
+    char root[PATH_MAX];
+    if (code_cli_root_db(&db, root) != 0) return 1;
+    int rc = 1;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        char *err = NULL;
+        struct code_target t;
+        const char *proj = all ? KB_CODE_ALL_PROJECTS : root, *where = all ? "all projects" : root;
+        if (code_target_resolve(db, all ? "" : root, server, &t, &err) != 0) { fprintf(stderr, "code revoke: %s\n", err); free(err); break; }
+        if (all && t.virt) {
+            fprintf(stderr, "code revoke: the built-in cntctr server is granted per project, not for all projects\n");
+            code_target_free(&t);
+            break;
+        }
+        int has_human = 0, prot = 0;
+        char *snap = kb_code_grant_snapshot(db, proj, t.reg_id, t.owner, NULL, NULL);
+        if (!snap || kb_code_grant_inspect(db, proj, t.reg_id, pattern, kind, &has_human, &prot) != 0) {
+            fprintf(stderr, "code revoke: database error checking existing rules\n");
+            free(snap);
+            code_target_free(&t);
+            break;
+        }
+        int approved = 0;
+        if (prot) {
+            char *msg = fmt("Remove the human-set rule on %s.%s in %s?", server, pattern, where);
+            int g = cli_admin_guard(1, msg);
+            free(msg);
+            if (g != 0) { free(snap); code_target_free(&t); break; }
+            approved = 1;
+        }
+        struct kb_code_grant_guard guard = { t.virt ? NULL : t.name, snap, t.owner, NULL, NULL, approved };
+        code_test_barrier("revoke-precommit");
+        int drc = kb_code_grant_del_checked(db, proj, t.reg_id, pattern, kind, 0, &guard);
+        free(snap);
+        code_target_free(&t);
+        if (drc > 0) { printf("revoked %s.%s in %s\n", server, pattern, where); notify_all(); rc = 0; break; }
+        if (drc == 0) { fprintf(stderr, "code revoke: no rule %s.%s %s\n", server, pattern, all ? "for all projects" : "in this project (an all-projects rule needs --all-projects)"); break; }
+        if (drc == -3) { fprintf(stderr, "rules or server changed before commit; re-checking\n"); continue; }
+        fprintf(stderr, "code revoke: failed to remove the rule\n");
+        break;
+    }
+    sqlite3_close(db);
+    return rc;
+usage:
+    fprintf(stderr, "usage: cntctr code revoke <server>.<pattern> [--kind access|class] [--all-projects]\n");
+    return 2;
+}
+
+static int code_grants_cmd(int argc, char **argv) {
+    if (argc > 4) {
+        fprintf(stderr, "usage: cntctr code grants [<server>]\n");
+        return 2;
+    }
+    if (cli_admin_guard(0, NULL) != 0) return 1;
+    sqlite3 *db;
+    char root[PATH_MAX];
+    if (code_cli_root_db(&db, root) != 0) return 1;
+    char *js = kb_code_grant_list_json(db, root, argc == 4 ? argv[3] : "");
+    char *pol_key = code_policy_key(root), *pol = kb_meta_get(db, pol_key);
+    sqlite3_close(db);
+    free(pol_key);
+    json_object *arr = js ? json_tokener_parse(js) : NULL;
+    free(js);
+    if (!arr || !json_object_is_type(arr, json_type_array)) {
+        if (arr) json_object_put(arr);
+        free(pol);
+        fprintf(stderr, "code grants: could not read grants\n");
+        return 1;
+    }
+    for (size_t i = 0; i < json_object_array_length(arr); i++) {
+        json_object *g = json_object_array_get_idx(arr, i);
+        const char *cag = sarg(g, "class_at_grant"), *rs = sarg(g, "reason");
+        const char *scope = sarg(g, "scope");
+        printf("%s.%s %s %s%s%s by=%s%s%s%s\n", sarg(g, "server") ? sarg(g, "server") : "", sarg(g, "tool_pattern") ? sarg(g, "tool_pattern") : "",
+               sarg(g, "kind") ? sarg(g, "kind") : "", sarg(g, "level") ? sarg(g, "level") : "",
+               cag && *cag ? " class=" : "", cag && *cag ? cag : "", sarg(g, "granted_by") ? sarg(g, "granted_by") : "",
+               rs && *rs ? " reason=" : "", rs && *rs ? rs : "", scope && !strcmp(scope, "all-projects") ? " [all-projects]" : "");
+    }
+    printf("policy destructive-orchestrator: %s\n", pol && !strcmp(pol, "allow") ? "allow" : "escalate");
+    json_object_put(arr);
+    free(pol);
+    return 0;
+}
+
+static int code_policy_cmd(int argc, char **argv) {
+    if (argc != 5 || strcmp(argv[3], "destructive-orchestrator") || (strcmp(argv[4], "escalate") && strcmp(argv[4], "allow"))) {
+        fprintf(stderr, "usage: cntctr code policy destructive-orchestrator <escalate|allow>\n");
+        return 2;
+    }
+    if (cli_admin_guard(0, NULL) != 0) return 1;
+    sqlite3 *db;
+    char root[PATH_MAX];
+    if (code_cli_root_db(&db, root) != 0) return 1;
+    char *msg = fmt("Set destructive-orchestrator policy for %s to '%s'%s", root, argv[4],
+                    !strcmp(argv[4], "allow") ? " (orchestrators may then grant destructive tools without asking you)" : "");
+    int g = cli_admin_guard(1, msg);
+    free(msg);
+    if (g != 0) { sqlite3_close(db); return 1; }
+    char *key = code_policy_key(root);
+    sqlite3_stmt *st = NULL;
+    int rc = 1;
+    if (sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO meta(k, v) VALUES(?1, ?2)", -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_bind_text(st, 1, key, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
+        sqlite3_bind_text(st, 2, argv[4], -1, SQLITE_TRANSIENT) == SQLITE_OK && sqlite3_step(st) == SQLITE_DONE) {
+        printf("policy destructive-orchestrator for %s: %s\n", root, argv[4]);
+        rc = 0;
+    } else {
+        fprintf(stderr, "code policy: failed to store the policy\n");
+    }
+    sqlite3_finalize(st);
+    free(key);
+    sqlite3_close(db);
+    return rc;
+}
+
+static int code_server_discover_cmd(int argc, char **argv) {
+    if (argc != 5 || !code_valid_server_name(argv[4])) {
+        fprintf(stderr, "usage: cntctr code server discover <name>\n");
+        return 2;
+    }
+    if (cli_admin_guard(0, NULL) != 0) return 1;
+    sqlite3 *db;
+    char root[PATH_MAX], *err = NULL;
+    if (code_cli_root_db(&db, root) != 0) return 1;
+    struct code_target t;
+    int rc = 1;
+    if (code_target_resolve(db, root, argv[4], &t, &err) != 0) {
+        fprintf(stderr, "code server discover: %s\n", err);
+        free(err);
+    } else {
+        if (code_discover(db, &t, root, 0, &err) != 0) {
+            fprintf(stderr, "code server discover: %s\n", err ? err : "failed");
+            free(err);
+        } else {
+            json_object *tools = code_target_tools(db, &t);
+            if (!tools) fprintf(stderr, "code server discover: server reported no catalog\n");
+            else {
+                char *txt = code_format_tools(tools);
+                fputs(txt, stdout);
+                free(txt);
+                json_object_put(tools);
+                rc = 0;
+            }
+        }
+        code_target_free(&t);
+    }
+    sqlite3_close(db);
+    return rc;
+}
+
+static int code_server_restart_cmd(int argc, char **argv) {
+    if (argc != 5 || !code_valid_server_name(argv[4])) {
+        fprintf(stderr, "usage: cntctr code server restart <name>\n");
+        return 2;
+    }
+    if (cli_admin_guard(0, NULL) != 0) return 1;
+    sqlite3 *db;
+    char root[PATH_MAX], *err = NULL;
+    if (code_cli_root_db(&db, root) != 0) return 1;
+    struct code_target t;
+    int rc = 1;
+    if (code_target_resolve(db, root, argv[4], &t, &err) != 0) {
+        fprintf(stderr, "code server restart: %s\n", err);
+        free(err);
+    } else {
+        if (!code_daemon_running()) {
+            printf("the code daemon is not running; nothing to restart\n");
+            rc = 0;
+        } else {
+            json_object *req = json_object_new_object();
+            json_object_object_add(req, "method", json_object_new_string("restart"));
+            json_object_object_add(req, "project", json_object_new_string(root));
+            json_object_object_add(req, "reg_id", json_object_new_string(t.reg_id));
+            json_object_object_add(req, "server", json_object_new_string(argv[4]));
+            if (code_rpc(req, 0, 15000, NULL, &err) == 0) { printf("restarted server %s\n", argv[4]); rc = 0; }
+            else { fprintf(stderr, "code server restart: %s\n", err ? err : "failed"); free(err); }
+            json_object_put(req);
+        }
+        code_target_free(&t);
+    }
+    sqlite3_close(db);
+    return rc;
+}
+
+static int code_server_add_cmd(int argc, char **argv) {
+    if (argc < 5) goto usage;
+    const char *name = argv[4];
+    if (!code_valid_server_name(name)) {
+        fprintf(stderr, "code server add: invalid server name '%s' (must match ^[a-zA-Z0-9_-]{1,63}$ and cannot be 'cntctr')\n", name);
+        return 2;
+    }
+    const char *cmd = NULL, *trust = "annotations";
+    int project_scope = 0, isolated = 0;
+    json_object *args_arr = json_object_new_array();
+    json_object *env_obj = json_object_new_object();
+    for (int i = 5; i < argc; i++) {
+        if (!strcmp(argv[i], "--cmd") && i + 1 < argc) {
+            cmd = argv[++i];
+        } else if (!strcmp(argv[i], "--arg") && i + 1 < argc) {
+            json_object_array_add(args_arr, json_object_new_string(argv[++i]));
+        } else if (!strcmp(argv[i], "--env") && i + 1 < argc) {
+            const char *kv = argv[++i], *eq = strchr(kv, '=');
+            if (!eq || eq == kv) {
+                fprintf(stderr, "code server add: --env requires KEY=VALUE\n");
+                json_object_put(args_arr);
+                json_object_put(env_obj);
+                return 2;
+            }
+            char *k = fmt("%.*s", (int)(eq - kv), kv);
+            json_object_object_add(env_obj, k, json_object_new_string(eq + 1));
+            free(k);
+        } else if (!strcmp(argv[i], "--project")) {
+            project_scope = 1;
+        } else if (!strcmp(argv[i], "--isolated")) {
+            isolated = 1;
+        } else if (!strcmp(argv[i], "--trust") && i + 1 < argc) {
+            trust = argv[++i];
+            if (strcmp(trust, "annotations") != 0 && strcmp(trust, "none") != 0) {
+                fprintf(stderr, "code server add: --trust must be 'annotations' or 'none'\n");
+                json_object_put(args_arr);
+                json_object_put(env_obj);
+                return 2;
+            }
+        } else {
+            json_object_put(args_arr);
+            json_object_put(env_obj);
+            goto usage;
+        }
+    }
+    if (!cmd || !*cmd) {
+        fprintf(stderr, "code server add: --cmd <exe> is required\n");
+        json_object_put(args_arr);
+        json_object_put(env_obj);
+        return 2;
+    }
+    if (code_has_whitespace(cmd)) {
+        fprintf(stderr, "code server add: --cmd must not contain whitespace; pass arguments with repeated --arg\n");
+        json_object_put(args_arr);
+        json_object_put(env_obj);
+        return 2;
+    }
+
+    /* Run non-interactive guard before any subprocess probe (git/realpath) or DB write. */
+    if (cli_admin_guard(0, NULL) != 0) {
+        json_object_put(args_arr);
+        json_object_put(env_obj);
+        return 1;
+    }
+
+    char cwd[PATH_MAX], canon_root[PATH_MAX] = "";
+    if (project_scope) {
+        if (!getcwd(cwd, sizeof cwd)) snprintf(cwd, sizeof cwd, ".");
+        resolve_code_cwd(cwd, canon_root);
+    }
+
+    char *err = NULL;
+    sqlite3 *db = kb(&err);
+    if (!db) {
+        fprintf(stderr, "%s\n", err);
+        free(err);
+        json_object_put(args_arr);
+        json_object_put(env_obj);
+        return 1;
+    }
+
+    struct code_server_row row;
+    memset(&row, 0, sizeof row);
+    if (project_scope && strlen(canon_root) >= sizeof row.scope_project) {
+        fprintf(stderr, "code server add: canonical project root exceeds maximum length\n");
+        sqlite3_close(db);
+        json_object_put(args_arr);
+        json_object_put(env_obj);
+        return 1;
+    }
+    snprintf(row.scope_project, sizeof row.scope_project, "%s", project_scope ? canon_root : "");
+    snprintf(row.name, sizeof row.name, "%s", name);
+    snprintf(row.trust, sizeof row.trust, "%s", trust);
+    snprintf(row.created_by, sizeof row.created_by, "human");
+    row.isolated = isolated;
+    row.command = (char *)cmd;
+    row.args_json = (char *)json_object_to_json_string_ext(args_arr, JSON_C_TO_STRING_PLAIN);
+    row.env_json = (char *)json_object_to_json_string_ext(env_obj, JSON_C_TO_STRING_PLAIN);
+
+    char reg_id[64] = "", old_reg[64] = "";
+    int dropped_grants = 0, dropped_projects = 0, rc = -1;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        char expected_reg[64] = "";
+        int has_human = 0;
+        int irc = kb_code_server_inspect(db, row.scope_project, name, expected_reg, &has_human);
+        if (irc == -2) {
+            fprintf(stderr, "code server add: database error inspecting '%s'\n", name);
+            rc = 1;
+            break;
+        }
+        if (has_human) {
+            char *msg = fmt("Replacing server '%s' (%s) will drop human-set rules on registration %s.",
+                            name, project_scope ? canon_root : "user", expected_reg);
+            int g = cli_admin_guard(1, msg);
+            free(msg);
+            if (g != 0) { rc = 1; break; }
+        }
+        int prc = kb_code_server_put_checked(db, &row, 0, expected_reg, has_human, reg_id,
+                                             &dropped_grants, &dropped_projects);
+        if (prc == 0) { snprintf(old_reg, sizeof old_reg, "%s", expected_reg); rc = 0; break; }
+        if (prc == -3) {
+            fprintf(stderr, "server '%s' changed before commit; re-checking\n", name);
+            continue;
+        }
+        fprintf(stderr, "code server add: failed to store server '%s'\n", name);
+        rc = 1;
+        break;
+    }
+    char *shadowed = rc == 0 && !project_scope ? kb_code_server_shadows_json(db, name) : NULL;
+    sqlite3_close(db);
+    json_object_put(args_arr);
+    json_object_put(env_obj);
+    if (rc != 0) return 1;
+    printf("added server %s (%s) reg_id=%s\n", name, project_scope ? canon_root : "user", reg_id);
+    if (dropped_grants > 0)
+        printf("dropped %d grants in %d projects\n", dropped_grants, dropped_projects);
+    json_object *sh = shadowed ? json_tokener_parse(shadowed) : NULL;
+    free(shadowed);
+    if (sh && json_object_is_type(sh, json_type_array) && json_object_array_length(sh) > 0) {
+        printf("shadowed in %zu projects by project-local rows of the same name:\n", json_object_array_length(sh));
+        for (size_t i = 0; i < json_object_array_length(sh); i++)
+            printf("  %s\n", json_object_get_string(json_object_array_get_idx(sh, i)));
+    }
+    if (sh) json_object_put(sh);
+    code_notify_reload(old_reg);
+    notify_all();
+    return 0;
+usage:
+    fprintf(stderr, "usage: cntctr code server add <name> --cmd <exe> [--arg <a>]... [--env K=V]... [--project] [--isolated] [--trust annotations|none]\n");
+    return 2;
+}
+
+static int code_server_list_cmd(int argc, char **argv) {
+    int as_json = 0;
+    for (int i = 4; i < argc; i++) {
+        if (!strcmp(argv[i], "--json")) as_json = 1;
+        else {
+            fprintf(stderr, "usage: cntctr code server list [--json]\n");
+            return 2;
+        }
+    }
+    if (cli_admin_guard(0, NULL) != 0) return 1;
+    char cwd[PATH_MAX], canon_root[PATH_MAX];
+    if (!getcwd(cwd, sizeof cwd)) snprintf(cwd, sizeof cwd, ".");
+    resolve_code_cwd(cwd, canon_root);
+    char *err = NULL;
+    sqlite3 *db = kb(&err);
+    if (!db) {
+        fprintf(stderr, "%s\n", err);
+        free(err);
+        return 1;
+    }
+    char *json_str = kb_code_server_list_json(db, canon_root);
+    if (as_json) {
+        sqlite3_close(db);
+        printf("%s\n", json_str ? json_str : "[]");
+        free(json_str);
+        return 0;
+    }
+    char *txt = code_format_servers(db, json_str, 1);
+    sqlite3_close(db);
+    free(json_str);
+    fputs(txt, stdout);
+    free(txt);
+    return 0;
+}
+
+static int code_server_remove_cmd(int argc, char **argv) {
+    int project_scope = 0, end_opts = 0;
+    const char *name = NULL;
+    for (int i = 4; i < argc; i++) {
+        if (!end_opts && !strcmp(argv[i], "--")) { end_opts = 1; continue; }
+        if (!end_opts && !strcmp(argv[i], "--project")) project_scope = 1;
+        else if ((!end_opts && argv[i][0] == '-') || name) goto usage;
+        else name = argv[i];
+    }
+    if (!name || !code_valid_server_name(name)) goto usage;
+    if (cli_admin_guard(0, NULL) != 0) return 1;
+
+    char cwd[PATH_MAX], canon_root[PATH_MAX] = "";
+    if (project_scope) {
+        if (!getcwd(cwd, sizeof cwd)) snprintf(cwd, sizeof cwd, ".");
+        resolve_code_cwd(cwd, canon_root);
+    }
+    const char *scope = project_scope ? canon_root : "";
+    char *err = NULL;
+    sqlite3 *db = kb(&err);
+    if (!db) {
+        fprintf(stderr, "%s\n", err);
+        free(err);
+        return 1;
+    }
+
+    int dropped_grants = 0, dropped_projects = 0, rc = 1;
+    char old_reg[64] = "";
+    for (int attempt = 0; attempt < 3; attempt++) {
+        char expected_reg[64] = "";
+        int has_human = 0;
+        int irc = kb_code_server_inspect(db, scope, name, expected_reg, &has_human);
+        if (irc == -2) {
+            fprintf(stderr, "code server remove: database error inspecting '%s'\n", name);
+            rc = 1;
+            break;
+        }
+        if (irc != 0) {
+            fprintf(stderr, "code server remove: server '%s' not found (%s)\n", name, project_scope ? canon_root : "user");
+            rc = 1;
+            break;
+        }
+        if (has_human) {
+            char *msg = fmt("Removing server '%s' (%s) will drop human-set rules on registration %s.",
+                            name, project_scope ? canon_root : "user", expected_reg);
+            int g = cli_admin_guard(1, msg);
+            free(msg);
+            if (g != 0) { rc = 1; break; }
+        }
+        int drc = kb_code_server_del_checked(db, scope, name, 0, expected_reg, has_human,
+                                             &dropped_grants, &dropped_projects);
+        if (drc > 0) { snprintf(old_reg, sizeof old_reg, "%s", expected_reg); rc = 0; break; }
+        if (drc == -3) {
+            fprintf(stderr, "server '%s' changed before commit; re-checking\n", name);
+            continue;
+        }
+        fprintf(stderr, "code server remove: server '%s' not found (%s)\n", name, project_scope ? canon_root : "user");
+        rc = 1;
+        break;
+    }
+    sqlite3_close(db);
+    if (rc != 0) return 1;
+    printf("removed server %s (%s)\n", name, project_scope ? canon_root : "user");
+    if (dropped_grants > 0)
+        printf("dropped %d grants in %d projects\n", dropped_grants, dropped_projects);
+    code_notify_reload(old_reg);
+    notify_all();
+    return 0;
+usage:
+    fprintf(stderr, "usage: cntctr code server remove [--project] [--] <name>\n");
+    return 2;
+}
+
+static int code_cmd(int argc, char **argv) {
+    if (argc >= 3 && !strcmp(argv[2], "stop") && cli_admin_guard(0, NULL) != 0) return 1;   /* stop kills tool servers and cancels runs */
+    if (argc >= 3 && (!strcmp(argv[2], "status") || !strcmp(argv[2], "stop")))
+        return code_status_cmd(argc, argv);
+    if (argc >= 4 && !strcmp(argv[2], "server")) {
+        if (!strcmp(argv[3], "add")) return code_server_add_cmd(argc, argv);
+        if (!strcmp(argv[3], "list")) return code_server_list_cmd(argc, argv);
+        if (!strcmp(argv[3], "remove")) return code_server_remove_cmd(argc, argv);
+        if (!strcmp(argv[3], "discover")) return code_server_discover_cmd(argc, argv);
+        if (!strcmp(argv[3], "restart")) return code_server_restart_cmd(argc, argv);
+    }
+    if (argc >= 3 && !strcmp(argv[2], "grant")) return code_grant_cmd(argc, argv);
+    if (argc >= 3 && !strcmp(argv[2], "grants")) return code_grants_cmd(argc, argv);
+    if (argc >= 3 && !strcmp(argv[2], "revoke")) return code_revoke_cmd(argc, argv);
+    if (argc >= 3 && !strcmp(argv[2], "policy")) return code_policy_cmd(argc, argv);
+    fprintf(stderr, "usage: cntctr code status [--short|--verbose] | stop | server add|list|remove|discover|restart ... | grant | grants | revoke | policy ...\n"
+                    "Authority is per pane: the orchestrator's pane and every process running inside it share its code-mode authority.\n"
+                    "Grants guard against mistakes and prompt injection; they are not a boundary against the same user.\n");
+    return 2;
+}
+
+#ifdef CNTCTR_TEST_HOOKS
+struct test_progress_ctx { int remaining; int fired; };
+static int test_progress_cb(void *arg) {
+    struct test_progress_ctx *ctx = arg;
+    if (ctx->remaining > 0) {
+        ctx->remaining--;
+        if (ctx->remaining == 0) { ctx->fired = 1; return 1; }
+    }
+    return 0;
+}
+
+struct test_trace_ctx { sqlite3 *db; const char *needle; int fired; };
+static int test_trace_interrupt_cb(unsigned mask, void *arg, void *p, void *x) {
+    (void)mask; (void)p;
+    struct test_trace_ctx *ctx = arg;
+    const char *sql = (const char *)x;
+    if (!ctx->fired && sql && strstr(sql, ctx->needle)) {
+        ctx->fired = 1;
+        sqlite3_interrupt(ctx->db);
+    }
+    return 0;
+}
+
+static enum code_class test_parse_class(const char *s) {
+    if (!s || !strcmp(s, "read")) return CODE_READ;
+    if (!strcmp(s, "write")) return CODE_WRITE;
+    return CODE_DESTRUCTIVE;
+}
+
+static const char *test_class_str(enum code_class c) {
+    return c == CODE_READ ? "read" : c == CODE_WRITE ? "write" : "destructive";
+}
+
+static char *test_read_stdin(void) {
+    size_t len = 0, cap = 4096;
+    char *buf = malloc(cap);
+    if (!buf) abort();
+    for (;;) {
+        if (cap - len < 2) buf = realloc(buf, cap *= 2);
+        ssize_t n = read(STDIN_FILENO, buf + len, cap - len - 1);
+        if (n > 0) len += (size_t)n;
+        else if (n < 0 && errno == EINTR) continue;
+        else break;
+    }
+    buf[len] = '\0';
+    return buf;
+}
+
+static int test_code_kb_cmd(int argc, char **argv) {
+    if (argc < 3) { fprintf(stderr, "usage: cntctr _test-code-kb <subcmd> ...\n"); return 2; }
+    const char *sub = argv[2];
+    if (!strcmp(sub, "resolve-cwd") && argc >= 4) {
+        char root[PATH_MAX];
+        resolve_code_cwd(argv[3], root);
+        printf("%s\n", root);
+        return 0;
+    }
+    if (!strcmp(sub, "resolve-project")) {
+        char root[PATH_MAX];
+        if (resolve_code_project(argc >= 4 ? argv[3] : NULL, root) != 0) {
+            fprintf(stderr, "cannot read the project path of pane %s\n", argv[3]);
+            return 1;
+        }
+        printf("%s\n", root);
+        return 0;
+    }
+    if (!strcmp(sub, "grant-snapshot") && argc >= 6) {   /* project reg_id owner: the guard snapshot as hex, "" on a DB error */
+        sqlite3 *sdb = kb(&(char *){NULL});
+        if (!sdb) return 1;
+        char *snap = kb_code_grant_snapshot(sdb, argv[3], argv[4], argv[5], NULL, NULL);
+        sqlite3_close(sdb);
+        if (!snap) return 1;
+        for (const char *c = snap; *c; c++) printf("%02x", (unsigned char)*c);
+        printf("\n");
+        free(snap);
+        return 0;
+    }
+    if (!strcmp(sub, "shell-quote") && argc >= 4) {
+        char *q = shell_quote(argv[3]);
+        printf("%s\n", q);
+        free(q);
+        return 0;
+    }
+    char *err = NULL;
+    sqlite3 *db = kb(&err);
+    if (!db) { fprintf(stderr, "%s\n", err); free(err); return 1; }
+
+    int exit_rc = 0;
+    if (!strcmp(sub, "server-put") && argc >= 12) {
+        struct code_server_row row;
+        memset(&row, 0, sizeof row);
+        if (strlen(argv[3]) >= sizeof row.scope_project) {
+            fprintf(stderr, "server-put: scope_project exceeds PATH_MAX\n");
+            sqlite3_close(db);
+            return 1;
+        }
+        snprintf(row.scope_project, sizeof row.scope_project, "%s", argv[3]);
+        snprintf(row.name, sizeof row.name, "%s", argv[4]);
+        row.command = argv[5];
+        row.args_json = argv[6];
+        row.env_json = argv[7];
+        row.isolated = atoi(argv[8]);
+        snprintf(row.trust, sizeof row.trust, "%s", argv[9]);
+        snprintf(row.created_by, sizeof row.created_by, "%s", argv[10]);
+        int from_mcp = atoi(argv[11]);
+        char reg_id[64] = "";
+        int dg = 0, dp = 0;
+        int rc = kb_code_server_put(db, &row, from_mcp, reg_id, &dg, &dp);
+        printf("rc=%d reg_id=%s dropped_grants=%d dropped_projects=%d\n", rc, reg_id, dg, dp);
+    } else if (!strcmp(sub, "server-put-checked") && argc >= 8) {
+        struct code_server_row row;
+        memset(&row, 0, sizeof row);
+        if (strlen(argv[3]) >= sizeof row.scope_project) {
+            fprintf(stderr, "server-put-checked: scope_project exceeds PATH_MAX\n");
+            sqlite3_close(db);
+            return 1;
+        }
+        snprintf(row.scope_project, sizeof row.scope_project, "%s", argv[3]);
+        snprintf(row.name, sizeof row.name, "%s", argv[4]);
+        row.command = argv[5];
+        row.args_json = "[]";
+        row.env_json = "{}";
+        snprintf(row.trust, sizeof row.trust, "annotations");
+        snprintf(row.created_by, sizeof row.created_by, "human");
+        const char *exp_reg = argv[6];
+        int approved = atoi(argv[7]);
+        char reg_id[64] = "";
+        int dg = 0, dp = 0;
+        int rc = kb_code_server_put_checked(db, &row, 0, exp_reg, approved, reg_id, &dg, &dp);
+        printf("rc=%d reg_id=%s dropped_grants=%d dropped_projects=%d\n", rc, reg_id, dg, dp);
+    } else if (!strcmp(sub, "server-get") && argc >= 5) {
+        struct code_server_row row;
+        if (kb_code_server_get(db, argv[3], argv[4], &row) == 0) {
+            json_object *o = json_object_new_object();
+            json_object_object_add(o, "scope_project", json_object_new_string(row.scope_project));
+            json_object_object_add(o, "name", json_object_new_string(row.name));
+            json_object_object_add(o, "reg_id", json_object_new_string(row.reg_id));
+            json_object_object_add(o, "command", json_object_new_string(row.command ? row.command : ""));
+            json_object_object_add(o, "args_json", json_object_new_string(row.args_json ? row.args_json : "[]"));
+            json_object_object_add(o, "env_json", json_object_new_string(row.env_json ? row.env_json : "{}"));
+            json_object_object_add(o, "isolated", json_object_new_int(row.isolated));
+            json_object_object_add(o, "trust", json_object_new_string(row.trust));
+            json_object_object_add(o, "created_by", json_object_new_string(row.created_by));
+            printf("%s\n", json_object_to_json_string_ext(o, JSON_C_TO_STRING_PLAIN));
+            json_object_put(o);
+            kb_code_server_free(&row);
+        } else {
+            printf("not_found\n");
+        }
+    } else if (!strcmp(sub, "server-del") && argc >= 6) {
+        int dg = 0, dp = 0;
+        int rc = kb_code_server_del(db, argv[3], argv[4], atoi(argv[5]), &dg, &dp);
+        printf("rc=%d dropped_grants=%d dropped_projects=%d\n", rc, dg, dp);
+    } else if (!strcmp(sub, "server-del-checked") && argc >= 7) {
+        int dg = 0, dp = 0;
+        int rc = kb_code_server_del_checked(db, argv[3], argv[4], 0, argv[5], atoi(argv[6]), &dg, &dp);
+        printf("rc=%d dropped_grants=%d dropped_projects=%d\n", rc, dg, dp);
+    } else if (!strcmp(sub, "server-has-human") && argc >= 5) {
+        printf("%d\n", kb_code_server_has_human_grants(db, argv[3], argv[4]));
+    } else if (!strcmp(sub, "server-list") && argc >= 4) {
+        char *out = kb_code_server_list_json(db, argv[3]);
+        printf("%s\n", out ? out : "[]");
+        free(out);
+    } else if (!strcmp(sub, "catalog-set") && argc >= 6) {
+        long long gen = 0;
+        int rc = kb_code_catalog_set(db, argv[3], argv[4], argv[5], &gen);
+        printf("rc=%d meta_gen=%lld\n", rc, gen);
+    } else if (!strcmp(sub, "catalog-get") && argc >= 5) {
+        char *tj = NULL;
+        long long gen = 0;
+        int rc = kb_code_catalog_get(db, argv[3], argv[4], &tj, &gen);
+        if (rc == 0) printf("rc=0 meta_gen=%lld tools=%s\n", gen, tj ? tj : "");
+        else printf("rc=-1\n");
+        free(tj);
+    } else if (!strcmp(sub, "grant-put") && argc >= 13) {
+        int rc = kb_code_grant_put(db, argv[3], argv[4], argv[5], argv[6], argv[7],
+                                   argv[8], argv[9], argv[10], argv[11], atoi(argv[12]));
+        printf("rc=%d\n", rc);
+    } else if (!strcmp(sub, "grant-del") && argc >= 8) {
+        int rc = kb_code_grant_del(db, argv[3], argv[4], argv[5], argv[6], atoi(argv[7]));
+        printf("rc=%d\n", rc);
+    } else if (!strcmp(sub, "has-non-deny") && argc >= 5) {
+        printf("%d\n", kb_code_has_non_deny_grant(db, argv[3], argv[4]));
+    } else if (!strcmp(sub, "grant-list") && argc >= 4) {
+        char *out = kb_code_grant_list_json(db, argv[3], argc >= 5 ? argv[4] : NULL);
+        printf("%s\n", out ? out : "[]");
+        free(out);
+    } else if (!strcmp(sub, "grant-check") && argc >= 7) {
+        enum code_class eff = CODE_READ;
+        char *why = NULL;
+        int rc = kb_code_check_grant(db, argv[3], argv[4], argv[5], test_parse_class(argv[6]), &eff, &why);
+        printf("rc=%d effective=%s why=%s\n", rc, test_class_str(eff), why ? why : "");
+        free(why);
+    } else if (!strcmp(sub, "grant-check-interrupt") && argc >= 7) {
+        /* Warm schema cache so progress handler interrupts sqlite3_step, not schema load. */
+        sqlite3_exec(db, "SELECT count(*) FROM code_grants", NULL, NULL, NULL);
+        int fired = 0, allowed_on_interrupt = 0;
+        for (int ops = 1; ops <= 200; ops++) {
+            struct test_progress_ctx pctx = {ops, 0};
+            enum code_class eff = CODE_READ;
+            char *why = NULL;
+            sqlite3_progress_handler(db, 1, test_progress_cb, &pctx);
+            int rc = kb_code_check_grant(db, argv[3], argv[4], argv[5], test_parse_class(argv[6]), &eff, &why);
+            sqlite3_progress_handler(db, 0, NULL, NULL);
+            free(why);
+            if (pctx.fired) {
+                fired++;
+                if (rc == 0) allowed_on_interrupt++;
+            }
+        }
+        printf("fired=%d allowed_on_interrupt=%d\n", fired, allowed_on_interrupt);
+    } else if (!strcmp(sub, "auth-interrupt") && argc >= 6) {
+        const char *mode = argv[3];
+        const char *needle = !strcmp(mode, "server-shadow")
+            ? "SELECT 1 FROM code_servers WHERE scope_project = ''"
+            : "SELECT 1 FROM code_grants WHERE";
+        struct test_trace_ctx tctx = {db, needle, 0};
+        sqlite3_trace_v2(db, SQLITE_TRACE_STMT, test_trace_interrupt_cb, &tctx);
+        int rc = -1, bypassed = 0;
+        if (!strcmp(mode, "grant-put") && argc >= 8) {
+            rc = kb_code_grant_put(db, argv[4], argv[5], argv[6], argv[7],
+                                   "access", "allow", "write", "orch", "bypass", 1);
+            if (rc == 0) bypassed = 1;
+        } else if (!strcmp(mode, "grant-del") && argc >= 7) {
+            rc = kb_code_grant_del(db, argv[4], argv[5], argv[6], "access", 1);
+            if (rc > 0) bypassed = 1;
+        } else if (!strcmp(mode, "server-shadow") && argc >= 6) {
+            struct code_server_row row;
+            memset(&row, 0, sizeof row);
+            snprintf(row.scope_project, sizeof row.scope_project, "%s", argv[4]);
+            snprintf(row.name, sizeof row.name, "%s", argv[5]);
+            row.command = "/bin/echo"; row.args_json = "[]"; row.env_json = "{}";
+            snprintf(row.trust, sizeof row.trust, "none");
+            snprintf(row.created_by, sizeof row.created_by, "orch");
+            char rid[64] = ""; int dg = 0, dp = 0;
+            rc = kb_code_server_put(db, &row, 1, rid, &dg, &dp);
+            if (rc == 0) bypassed = 1;
+        } else if (!strcmp(mode, "server-put-human") && argc >= 6) {
+            struct code_server_row row;
+            memset(&row, 0, sizeof row);
+            snprintf(row.scope_project, sizeof row.scope_project, "%s", argv[4]);
+            snprintf(row.name, sizeof row.name, "%s", argv[5]);
+            row.command = "/bin/echo"; row.args_json = "[]"; row.env_json = "{}";
+            snprintf(row.trust, sizeof row.trust, "none");
+            snprintf(row.created_by, sizeof row.created_by, "orch");
+            char rid[64] = ""; int dg = 0, dp = 0;
+            rc = kb_code_server_put(db, &row, 1, rid, &dg, &dp);
+            if (rc == 0) bypassed = 1;
+        } else if (!strcmp(mode, "server-del-human") && argc >= 6) {
+            int dg = 0, dp = 0;
+            rc = kb_code_server_del(db, argv[4], argv[5], 1, &dg, &dp);
+            if (rc > 0) bypassed = 1;
+        }
+        sqlite3_trace_v2(db, 0, NULL, NULL);
+        printf("fired=%d bypassed=%d rc=%d\n", tctx.fired, bypassed, rc);
+    } else if (!strcmp(sub, "run-save") && argc >= 13) {
+        char *stdin_buf = NULL;
+        const char *res = argv[7];
+        if (!strcmp(res, "@stdin")) {
+            stdin_buf = test_read_stdin();
+            res = stdin_buf;
+        }
+        int rc = kb_code_run_save(db, argv[3], argv[4], argv[5], argv[6], res,
+                                  argv[8], argv[9], argv[10], atoi(argv[11]), atoi(argv[12]));
+        free(stdin_buf);
+        printf("rc=%d\n", rc);
+    } else if (!strcmp(sub, "run-expand") && argc >= 8) {
+        char *slice = NULL;
+        size_t total = 0;
+        int capped = 0;
+        int rc = kb_code_run_expand(db, argv[3], argv[4], argv[5],
+                                    (size_t)strtoull(argv[6], NULL, 10),
+                                    (size_t)strtoull(argv[7], NULL, 10),
+                                    &slice, &total, &capped, NULL);
+        json_object *o = json_object_new_object();
+        json_object_object_add(o, "rc", json_object_new_int(rc));
+        json_object_object_add(o, "status", json_object_new_string(rc == 0 ? "ok" : rc == 1 ? "expired" : "not_found"));
+        json_object_object_add(o, "total_len", json_object_new_int64((long long)total));
+        json_object_object_add(o, "retained_capped", json_object_new_int(capped));
+        json_object_object_add(o, "slice", json_object_new_string(slice ? slice : ""));
+        printf("%s\n", json_object_to_json_string_ext(o, JSON_C_TO_STRING_PLAIN));
+        json_object_put(o);
+        free(slice);
+    } else if (!strcmp(sub, "run-sweep")) {
+        time_t now = argc >= 4 ? (time_t)strtoll(argv[3], NULL, 10) : time(NULL);
+        int n = kb_code_run_sweep(db, now);
+        printf("swept=%d\n", n);
+    } else {
+        fprintf(stderr, "unknown _test-code-kb subcmd or wrong arg count: %s\n", sub);
+        exit_rc = 2;
+    }
+    sqlite3_close(db);
+    return exit_rc;
+}
+
+/* ---- _test-code-js driver for Phase 3 (threaded barrier mock + schema validator) ---- */
+struct mock_job {
+    struct mock_ctx *m;
+    char *server;
+    char *tool;
+    json_object *args;
+    struct code_call_handle *h;
+    int cancelled;
+    int started;
+    pthread_t tid;
+    struct mock_job *next;
+};
+
+struct mock_ctx {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int inflight, peak_inflight;
+    int barrier_n, barrier_waiting, barrier_released;
+    int cancel_count, late_completions, lazy_dispatches, fast_dispatches;
+    int run_done, stopping, force_late;
+    struct mock_job *jobs;
+};
+
+static void mock_sleep_ms(struct mock_job *j, int total_ms, int respect_cancel) {
+    int slept = 0;
+    while (slept < total_ms) {
+        if (respect_cancel) {
+            pthread_mutex_lock(&j->m->mu);
+            int stop = j->cancelled || j->m->stopping;
+            pthread_mutex_unlock(&j->m->mu);
+            if (stop) break;
+        }
+        int step = (total_ms - slept > 25) ? 25 : (total_ms - slept);
+        struct timespec ts = { step / 1000, (step % 1000) * 1000000L };
+        nanosleep(&ts, NULL);
+        slept += step;
+    }
+}
+
+static void *mock_worker(void *arg) {
+    struct mock_job *j = (struct mock_job *)arg;
+    struct mock_ctx *m = j->m;
+
+    pthread_mutex_lock(&m->mu);
+    m->inflight++;
+    if (m->inflight > m->peak_inflight) m->peak_inflight = m->inflight;
+    pthread_mutex_unlock(&m->mu);
+
+    enum code_call_status st = CODE_CALL_OK;
+    char *payload = NULL;
+    int is_json = 1;
+    const char *gcmd = NULL;
+
+    if (strcmp(j->server, "lazy") == 0) {
+        pthread_mutex_lock(&m->mu);
+        m->lazy_dispatches++;
+        pthread_mutex_unlock(&m->mu);
+        payload = strdup("{\"lazy\":true}");
+    } else if (strcmp(j->tool, "barrier_tool") == 0) {
+        struct timespec start_ts, now_ts;
+        clock_gettime(CLOCK_MONOTONIC, &start_ts);
+        pthread_mutex_lock(&m->mu);
+        m->barrier_waiting++;
+        if (m->barrier_waiting >= m->barrier_n) {
+            m->barrier_released = 1;
+            pthread_cond_broadcast(&m->cv);
+        }
+        while (!m->barrier_released && !j->cancelled && !m->stopping) {
+            clock_gettime(CLOCK_MONOTONIC, &now_ts);
+            long elapsed_ms = (now_ts.tv_sec - start_ts.tv_sec) * 1000L +
+                              (now_ts.tv_nsec - start_ts.tv_nsec) / 1000000L;
+            if (elapsed_ms >= 5000) break;
+#ifdef __APPLE__
+            struct timespec rel = { 0, 50000000L };
+            pthread_cond_timedwait_relative_np(&m->cv, &m->mu, &rel);
+#else
+            struct timespec rt;
+            clock_gettime(CLOCK_REALTIME, &rt);
+            rt.tv_nsec += 50000000L;
+            if (rt.tv_nsec >= 1000000000L) { rt.tv_sec++; rt.tv_nsec -= 1000000000L; }
+            pthread_cond_timedwait(&m->cv, &m->mu, &rt);
+#endif
+        }
+        int peak = m->peak_inflight;
+        int ok_rel = m->barrier_released;
+        pthread_mutex_unlock(&m->mu);
+        if (ok_rel) payload = fmt("{\"barrier\":true,\"peak\":%d}", peak);
+        else { st = CODE_CALL_ERROR; is_json = 0; payload = strdup("barrier timed out"); }
+    } else if (strcmp(j->tool, "slow_1500ms") == 0) {
+        mock_sleep_ms(j, 1500, !m->force_late);
+        payload = strdup("{\"slow\":1500}");
+    } else if (strcmp(j->tool, "slow_3000ms") == 0) {
+        mock_sleep_ms(j, 3000, 1);
+        payload = strdup("{\"slow\":3000}");
+    } else if (strcmp(j->tool, "async_denied") == 0) {
+        st = CODE_CALL_DENIED;
+        is_json = 0;
+        payload = strdup("server policy denied");
+        gcmd = "cd '/tmp' && cntctr code grant 'mock.async_denied' allow";
+    } else {
+        pthread_mutex_lock(&m->mu);
+        m->fast_dispatches++;
+        pthread_mutex_unlock(&m->mu);
+        json_object *res = json_object_new_object();
+        json_object_object_add(res, "echo", json_object_get(j->args));
+        json_object_object_add(res, "ok", json_object_new_boolean(1));
+        payload = strdup(json_object_to_json_string_ext(res, JSON_C_TO_STRING_PLAIN));
+        json_object_put(res);
+    }
+
+    pthread_mutex_lock(&m->mu);
+    if (m->inflight > 0) m->inflight--;
+    if (m->run_done) m->late_completions++;
+    pthread_mutex_unlock(&m->mu);
+
+    code_js_complete(j->h, st, payload, is_json, gcmd);
+    code_call_handle_unref(j->h);
+    json_object_put(j->args);
+    free(payload);
+    free(j->server);
+    free(j->tool);
+    return NULL;
+}
+
+static void mock_dispatch(void *ctx, const char *server, const char *reg_id, long long meta_gen,
+                          const char *tool, json_object *args_owned, int timeout_ms,
+                          struct code_call_handle *h) {
+    (void)reg_id; (void)meta_gen; (void)timeout_ms;
+    struct mock_ctx *m = (struct mock_ctx *)ctx;
+    json_object *jin = NULL;
+    if (strcmp(tool, "fast") == 0 && args_owned && json_object_object_get_ex(args_owned, "inline", &jin) &&
+        jin && json_object_get_boolean(jin)) {
+        /* Completes before dispatch returns: the completion is claimed strictly before any call deadline, with no
+         * worker-thread scheduling involved (CODE-JS-05 test determinism). */
+        pthread_mutex_lock(&m->mu);
+        m->fast_dispatches++;
+        pthread_mutex_unlock(&m->mu);
+        json_object *res = json_object_new_object();
+        json_object_object_add(res, "echo", json_object_get(args_owned));
+        json_object_object_add(res, "ok", json_object_new_boolean(1));
+        char *payload = strdup(json_object_to_json_string_ext(res, JSON_C_TO_STRING_PLAIN));
+        json_object_put(res);
+        code_js_complete(h, CODE_CALL_OK, payload, 1, NULL);
+        code_call_handle_unref(h);
+        json_object_put(args_owned);
+        free(payload);
+        return;
+    }
+    struct mock_job *j = calloc(1, sizeof *j);
+    if (!j) {
+        code_js_complete(h, CODE_CALL_ERROR, "oom", 0, NULL);
+        code_call_handle_unref(h);
+        json_object_put(args_owned);
+        return;
+    }
+    j->m = m;
+    j->server = strdup(server);
+    j->tool = strdup(tool);
+    j->args = args_owned;
+    j->h = h;
+
+    pthread_mutex_lock(&m->mu);
+    j->next = m->jobs;
+    m->jobs = j;
+    pthread_mutex_unlock(&m->mu);
+
+    if (pthread_create(&j->tid, NULL, mock_worker, j) == 0) {
+        j->started = 1;
+    } else {
+        code_js_complete(h, CODE_CALL_ERROR, "thread create failed", 0, NULL);
+        code_call_handle_unref(h);
+        json_object_put(args_owned);
+        free(j->server);
+        free(j->tool);
+        j->server = j->tool = NULL;
+    }
+}
+
+static void mock_cancel_call(void *ctx, struct code_call_handle *h) {
+    struct mock_ctx *m = (struct mock_ctx *)ctx;
+    pthread_mutex_lock(&m->mu);
+    m->cancel_count++;
+    for (struct mock_job *j = m->jobs; j; j = j->next) {
+        if (j->h == h) j->cancelled = 1;
+    }
+    pthread_cond_broadcast(&m->cv);
+    pthread_mutex_unlock(&m->mu);
+}
+
+struct cancel_timer_arg {
+    struct code_run_cancel *cancel;
+    int delay_ms;
+    pthread_mutex_t mu;
+    int stop;
+};
+
+static void *cancel_timer_fn(void *arg) {
+    struct cancel_timer_arg *a = (struct cancel_timer_arg *)arg;
+    int slept = 0;
+    while (slept < a->delay_ms) {
+        pthread_mutex_lock(&a->mu);
+        int s = a->stop;
+        pthread_mutex_unlock(&a->mu);
+        if (s) return NULL;
+        int step = (a->delay_ms - slept > 20) ? 20 : (a->delay_ms - slept);
+        struct timespec ts = { step / 1000, (step % 1000) * 1000000L };
+        nanosleep(&ts, NULL);
+        slept += step;
+    }
+    code_run_cancel_signal(a->cancel, "test cancel");
+    return NULL;
+}
+
+struct schema_race_arg {
+    json_object *schema;
+    pthread_mutex_t *mu;
+    pthread_cond_t *cv;
+    int *go;
+    int tid;
+    int iters;
+    int failures;
+};
+
+static void *schema_race_worker(void *arg) {
+    struct schema_race_arg *a = (struct schema_race_arg *)arg;
+    static const char *const BAD_ARGS[5] = {
+        "{\"a\":1}",
+        "{\"b\":999}",
+        "{\"c\":10}",
+        "{\"d\":20}",
+        "{\"e\":9007199254740993}"
+    };
+    json_object *vals[5];
+    for (int i = 0; i < 5; i++) vals[i] = json_tokener_parse(BAD_ARGS[i]);
+    pthread_mutex_lock(a->mu);
+    while (!*a->go) pthread_cond_wait(a->cv, a->mu);
+    pthread_mutex_unlock(a->mu);
+    for (int i = 0; i < a->iters; i++) {
+        char *err = NULL;
+        int idx = (i + a->tid) % 5;
+        int rc = code_schema_validate(a->schema, vals[idx], &err);
+        if (rc != 1 || !err || !*err) a->failures++;
+        free(err);
+    }
+    for (int i = 0; i < 5; i++) json_object_put(vals[i]);
+    return NULL;
+}
+
+static int test_code_js_cmd(int argc, char **argv) {
+    if (argc < 3) { fprintf(stderr, "usage: cntctr _test-code-js <schema|schema-race|suggest|run> ...\n"); return 2; }
+    const char *sub = argv[2];
+    if (strcmp(sub, "schema-race") == 0) {
+        json_object *schema = json_tokener_parse(
+            "{\"type\":\"object\",\"properties\":{"
+            "\"a\":{\"minimum\":10},"
+            "\"b\":{\"maximum\":100},"
+            "\"c\":{\"exclusiveMinimum\":10},"
+            "\"d\":{\"exclusiveMaximum\":20},"
+            "\"e\":{\"multipleOf\":2}"
+            "}}");
+        if (!schema) return 2;
+        pthread_mutex_t mu;
+        pthread_cond_t cv;
+        pthread_mutex_init(&mu, NULL);
+        pthread_cond_init(&cv, NULL);
+        int go = 0;
+        pthread_t tids[4];
+        struct schema_race_arg args[4];
+        for (int i = 0; i < 4; i++) {
+            args[i] = (struct schema_race_arg){ schema, &mu, &cv, &go, i, 2000, 0 };
+            if (pthread_create(&tids[i], NULL, schema_race_worker, &args[i]) != 0) {
+                pthread_mutex_lock(&mu);
+                go = 1;
+                pthread_cond_broadcast(&cv);
+                pthread_mutex_unlock(&mu);
+                for (int j = 0; j < i; j++) pthread_join(tids[j], NULL);
+                pthread_cond_destroy(&cv);
+                pthread_mutex_destroy(&mu);
+                json_object_put(schema);
+                return 1;
+            }
+        }
+        pthread_mutex_lock(&mu);
+        go = 1;
+        pthread_cond_broadcast(&cv);
+        pthread_mutex_unlock(&mu);
+        int fails = 0;
+        for (int i = 0; i < 4; i++) {
+            pthread_join(tids[i], NULL);
+            fails += args[i].failures;
+        }
+        pthread_cond_destroy(&cv);
+        pthread_mutex_destroy(&mu);
+        json_object_put(schema);
+        printf("{\"failures\":%d}\n", fails);
+        return fails == 0 ? 0 : 1;
+    }
+    if (strcmp(sub, "schema") == 0 && argc == 5) {
+        json_object *schema = json_tokener_parse(argv[3]);
+        json_object *args = json_tokener_parse(argv[4]);
+        char *err1 = NULL, *err2 = NULL;
+        enum schema_res er = code_schema_eval(schema, schema, args, "", 0, &err1);
+        int vr = code_schema_validate(schema, args, &err2);
+        json_object *o = json_object_new_object();
+        json_object_object_add(o, "eval", json_object_new_int((int)er));
+        json_object_object_add(o, "validate", json_object_new_int(vr));
+        json_object_object_add(o, "err", json_object_new_string(err2 ? err2 : (err1 ? err1 : "")));
+        printf("%s\n", json_object_to_json_string_ext(o, JSON_C_TO_STRING_PLAIN));
+        json_object_put(o);
+        free(err1); free(err2);
+        if (schema) json_object_put(schema);
+        if (args) json_object_put(args);
+        return 0;
+    }
+    if (strcmp(sub, "suggest") == 0 && argc >= 4) {
+        char *s = code_suggest_names(argv[3], (const char *const *)(argv + 4), (size_t)(argc - 4));
+        printf("%s\n", s ? s : "");
+        free(s);
+        return 0;
+    }
+    if (strcmp(sub, "run") == 0) {
+        char *in = NULL;
+        size_t len = 0, cap = 4096;
+        in = malloc(cap);
+        if (!in) return 1;
+        size_t n;
+        while ((n = fread(in + len, 1, cap - len - 1, stdin)) > 0) {
+            len += n;
+            if (len + 1 >= cap) {
+                cap *= 2;
+                char *p = realloc(in, cap);
+                if (!p) { free(in); return 1; }
+                in = p;
+            }
+        }
+        in[len] = '\0';
+        json_object *cfg = json_tokener_parse(in);
+        free(in);
+        if (!cfg || !json_object_is_type(cfg, json_type_object)) {
+            if (cfg) json_object_put(cfg);
+            fprintf(stderr, "invalid json config\n");
+            return 2;
+        }
+
+        const char *db_path = getenv("CNTCTR_DB");
+        const char *project = "/tmp/test";
+        const char *reg_id = "reg-mock";
+        const char *uncat_reg_id = NULL;
+        const char *script = "";
+        json_object *v = NULL;
+        if (json_object_object_get_ex(cfg, "db", &v) && v) db_path = json_object_get_string(v);
+        if (json_object_object_get_ex(cfg, "project", &v) && v) project = json_object_get_string(v);
+        if (json_object_object_get_ex(cfg, "reg_id", &v) && v) reg_id = json_object_get_string(v);
+        if (json_object_object_get_ex(cfg, "uncat_reg_id", &v) && v) uncat_reg_id = json_object_get_string(v);
+        if (json_object_object_get_ex(cfg, "script", &v) && v) script = json_object_get_string(v);
+
+        const char **scope = NULL;
+        size_t nscope = 0;
+        if (json_object_object_get_ex(cfg, "scope", &v) && v && json_object_is_type(v, json_type_array)) {
+            nscope = json_object_array_length(v);
+            if (nscope > 0) {
+                scope = calloc(nscope, sizeof *scope);
+                for (size_t i = 0; i < nscope; i++)
+                    scope[i] = json_object_get_string(json_object_array_get_idx(v, i));
+            }
+        }
+
+        /* Mock catalog */
+        json_object *s_fast = NULL;
+        if (json_object_object_get_ex(cfg, "fast_schema", &v) && v) {
+            s_fast = json_object_get(v);
+        } else {
+            s_fast = json_tokener_parse(
+                "{\"type\":\"object\",\"properties\":{\"q\":{\"type\":\"string\"},\"n\":{\"type\":\"integer\"},"
+                "\"mode\":{\"enum\":[\"a\",\"b\"]},\"nested\":{\"type\":\"object\",\"required\":[\"id\"],"
+                "\"properties\":{\"id\":{\"type\":\"integer\"}}}}}");
+        }
+        json_object *s_write = json_tokener_parse(
+            "{\"type\":\"object\",\"required\":[\"name\"],\"properties\":{\"name\":{\"type\":\"string\"}}}");
+        json_object *s_obj = json_tokener_parse("{\"type\":\"object\"}");
+
+        struct code_tool_meta catalog[] = {
+            { "mock", (char *)reg_id, "fast", "fast read tool", 1, CODE_READ, s_fast },
+            { "mock", (char *)reg_id, "write_tool", "write tool", 1, CODE_WRITE, s_write },
+            { "mock", (char *)reg_id, "barrier_tool", "barrier tool", 1, CODE_READ, s_obj },
+            { "mock", (char *)reg_id, "slow_1500ms", "slow 1500ms tool", 1, CODE_READ, s_obj },
+            { "mock", (char *)reg_id, "slow_3000ms", "slow 3000ms tool", 1, CODE_READ, s_obj },
+            { "mock", (char *)reg_id, "async_denied", "async denied tool", 1, CODE_READ, s_obj },
+        };
+        struct code_server_hint servers[2];
+        size_t nservers = 1;
+        servers[0] = (struct code_server_hint){ "mock", (char *)reg_id, 1 };
+        if (uncat_reg_id && *uncat_reg_id) {
+            servers[1] = (struct code_server_hint){ "lazy", (char *)uncat_reg_id, 0 };
+            nservers = 2;
+        }
+
+        struct mock_ctx m;
+        memset(&m, 0, sizeof m);
+        pthread_mutex_init(&m.mu, NULL);
+        pthread_cond_init(&m.cv, NULL);
+        m.barrier_n = 3;
+        if (json_object_object_get_ex(cfg, "barrier_n", &v) && v) m.barrier_n = json_object_get_int(v);
+
+        int wait_late_ms = 0, cancel_after_ms = 0;
+        if (json_object_object_get_ex(cfg, "wait_late_ms", &v) && v) wait_late_ms = json_object_get_int(v);
+        if (json_object_object_get_ex(cfg, "cancel_after_ms", &v) && v) cancel_after_ms = json_object_get_int(v);
+        m.force_late = wait_late_ms > 0 ? 1 : 0;
+
+        struct code_run_cancel *cancel = code_run_cancel_new();
+        struct cancel_timer_arg cta;
+        memset(&cta, 0, sizeof cta);
+        pthread_t cancel_tid;
+        int has_cancel_thr = 0;
+        if (cancel_after_ms > 0) {
+            cta.cancel = cancel;
+            cta.delay_ms = cancel_after_ms;
+            pthread_mutex_init(&cta.mu, NULL);
+            if (pthread_create(&cancel_tid, NULL, cancel_timer_fn, &cta) == 0) has_cancel_thr = 1;
+        }
+
+        struct code_run_opts opts;
+        memset(&opts, 0, sizeof opts);
+        opts.db_path = db_path;
+        opts.project = project;
+        opts.script = script;
+        opts.scope = scope;
+        opts.nscope = nscope;
+        opts.catalog = catalog;
+        opts.ncatalog = sizeof catalog / sizeof *catalog;
+        opts.servers = servers;
+        opts.nservers = nservers;
+        opts.cancel = cancel;
+        opts.dispatch = mock_dispatch;
+        opts.cancel_call = mock_cancel_call;
+        opts.dispatch_ctx = &m;
+
+        if (json_object_object_get_ex(cfg, "max_mb", &v) && v) opts.max_mb = (size_t)json_object_get_int64(v);
+        if (json_object_object_get_ex(cfg, "max_stack_bytes", &v) && v) opts.max_stack_bytes = (size_t)json_object_get_int64(v);
+        if (json_object_object_get_ex(cfg, "result_cap_bytes", &v) && v) opts.result_cap_bytes = (size_t)json_object_get_int64(v);
+        if (json_object_object_get_ex(cfg, "calls_preview_bytes", &v) && v) opts.calls_preview_bytes = (size_t)json_object_get_int64(v);
+        if (json_object_object_get_ex(cfg, "max_log_bytes", &v) && v) opts.max_log_bytes = (size_t)json_object_get_int64(v);
+        if (json_object_object_get_ex(cfg, "max_queue_bytes", &v) && v) opts.max_queue_bytes = (size_t)json_object_get_int64(v);
+        if (json_object_object_get_ex(cfg, "cpu_sec", &v) && v) opts.cpu_sec = json_object_get_int(v);
+        if (json_object_object_get_ex(cfg, "wall_sec", &v) && v) opts.wall_sec = json_object_get_int(v);
+        if (json_object_object_get_ex(cfg, "call_sec", &v) && v) opts.call_sec = json_object_get_int(v);
+        if (json_object_object_get_ex(cfg, "max_inflight", &v) && v) opts.max_inflight = json_object_get_int(v);
+
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        struct code_run_out out;
+        int rc = code_js_run(&opts, &out);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        long long elapsed_ms = (long long)(t1.tv_sec - t0.tv_sec) * 1000LL +
+                               (long long)(t1.tv_nsec - t0.tv_nsec) / 1000000LL;
+
+        if (has_cancel_thr) {
+            pthread_mutex_lock(&cta.mu);
+            cta.stop = 1;
+            pthread_mutex_unlock(&cta.mu);
+            pthread_join(cancel_tid, NULL);
+            pthread_mutex_destroy(&cta.mu);
+        }
+
+        pthread_mutex_lock(&m.mu);
+        m.run_done = 1;
+        if (!m.force_late) {
+            m.stopping = 1;
+            pthread_cond_broadcast(&m.cv);
+        }
+        pthread_mutex_unlock(&m.mu);
+
+        if (wait_late_ms > 0) {
+            struct timespec ts = { wait_late_ms / 1000, (wait_late_ms % 1000) * 1000000L };
+            nanosleep(&ts, NULL);
+            pthread_mutex_lock(&m.mu);
+            m.stopping = 1;
+            pthread_cond_broadcast(&m.cv);
+            pthread_mutex_unlock(&m.mu);
+        }
+
+        /* Join all mock worker threads before freeing anything */
+        for (struct mock_job *j = m.jobs; j; ) {
+            struct mock_job *next = j->next;
+            if (j->started) pthread_join(j->tid, NULL);
+            free(j);
+            j = next;
+        }
+        pthread_cond_destroy(&m.cv);
+        pthread_mutex_destroy(&m.mu);
+        code_run_cancel_free(cancel);
+
+        json_object *o = json_object_new_object();
+        json_object_object_add(o, "rc", json_object_new_int(rc));
+        json_object_object_add(o, "is_error", json_object_new_int(out.is_error));
+        json_object_object_add(o, "retained_capped", json_object_new_int(out.retained_capped));
+        json_object_object_add(o, "result", json_object_new_string(out.result ? out.result : ""));
+        json_object_object_add(o, "logs", json_object_new_string(out.logs ? out.logs : ""));
+        json_object_object_add(o, "calls", json_object_new_string(out.calls ? out.calls : ""));
+        json_object_object_add(o, "denied", json_object_new_string(out.denied ? out.denied : ""));
+        json_object_object_add(o, "result_preview", json_object_new_string(out.result_preview ? out.result_preview : ""));
+        json_object_object_add(o, "logs_preview", json_object_new_string(out.logs_preview ? out.logs_preview : ""));
+        json_object_object_add(o, "calls_preview", json_object_new_string(out.calls_preview ? out.calls_preview : ""));
+        json_object_object_add(o, "denied_preview", json_object_new_string(out.denied_preview ? out.denied_preview : ""));
+        json_object_object_add(o, "peak_inflight", json_object_new_int(m.peak_inflight));
+        json_object_object_add(o, "cancel_count", json_object_new_int(m.cancel_count));
+        json_object_object_add(o, "late_completions", json_object_new_int(m.late_completions));
+        json_object_object_add(o, "lazy_dispatches", json_object_new_int(m.lazy_dispatches));
+        json_object_object_add(o, "fast_dispatches", json_object_new_int(m.fast_dispatches));
+        json_object_object_add(o, "elapsed_ms", json_object_new_int64(elapsed_ms));
+        printf("%s\n", json_object_to_json_string_ext(o, JSON_C_TO_STRING_PLAIN));
+        json_object_put(o);
+
+        code_run_out_free(&out);
+        json_object_put(s_fast);
+        json_object_put(s_write);
+        json_object_put(s_obj);
+        free(scope);
+        json_object_put(cfg);
+        return 0;
+    }
+    fprintf(stderr, "unknown _test-code-js subcmd: %s\n", sub);
+    return 2;
+}
+
+struct test_cancel_ctx { long long deadline_ms; };
+static int test_cancel_cb(void *ctx) {
+    struct test_cancel_ctx *c = ctx;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    long long now = (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL;
+    return now >= c->deadline_ms;
+}
+
+static int test_code_rpc_cmd(int argc, char **argv) {
+    int autostart = 1, timeout_ms = 30000, cancel_after = -1;
+    const char *json_arg = NULL;
+    for (int i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "--no-autostart")) autostart = 0;
+        else if (!strcmp(argv[i], "--timeout") && i + 1 < argc) timeout_ms = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--cancel-after") && i + 1 < argc) cancel_after = atoi(argv[++i]);
+        else if (!json_arg) json_arg = argv[i];
+        else {
+            fprintf(stderr, "usage: cntctr _test-code-rpc [--no-autostart] [--timeout ms] [--cancel-after ms] '<json>'\n");
+            return 2;
+        }
+    }
+    if (!json_arg) {
+        fprintf(stderr, "usage: cntctr _test-code-rpc [--no-autostart] [--timeout ms] [--cancel-after ms] '<json>|-'\n");
+        return 2;
+    }
+    char *stdin_buf = NULL;
+    if (!strcmp(json_arg, "-")) {
+        stdin_buf = test_read_stdin();
+        json_arg = stdin_buf;
+    }
+    json_object *req = json_tokener_parse(json_arg);
+    free(stdin_buf);
+    if (!req || !json_object_is_type(req, json_type_object)) {
+        if (req) json_object_put(req);
+        fprintf(stderr, "_test-code-rpc: invalid JSON object\n");
+        return 2;
+    }
+    struct test_cancel_ctx cctx = {0};
+    code_cancelled_fn cfn = NULL;
+    if (cancel_after >= 0) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        cctx.deadline_ms = (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000LL + cancel_after;
+        cfn = test_cancel_cb;
+    }
+    json_object *resp = NULL;
+    char *err = NULL;
+    int rc = code_client_rpc(req, autostart, &resp, NULL, cfn, &cctx, timeout_ms, &err);
+    json_object_put(req);
+    if (rc != 0) {
+        fprintf(stderr, "%s\n", err ? err : "rpc failed");
+        free(err);
+        return 1;
+    }
+    printf("%s\n", json_object_to_json_string_ext(resp, JSON_C_TO_STRING_PLAIN));
+    json_object *jok = NULL;
+    int ok_val = (!json_object_object_get_ex(resp, "ok", &jok) || json_object_get_boolean(jok)) ? 1 : 0;
+    json_object_put(resp);
+    return ok_val ? 0 : 1;
+}
+#endif
+
+#ifdef CNTCTR_TEST_HOOKS
+/* _test-code-rev <pane|-> <tool> <args-json> | burst <n> | late <n>: drive the reverse-RPC handler without a daemon. */
+struct rev_probe { pthread_mutex_t mu; pthread_cond_t cv; int replies; char *first; };
+
+static void rev_probe_reply(void *rctx, json_object *resp) {
+    struct rev_probe *p = rctx;
+    pthread_mutex_lock(&p->mu);
+    if (resp && !p->first) p->first = strdup(json_object_to_json_string_ext(resp, JSON_C_TO_STRING_PLAIN));
+    p->replies++;
+    pthread_cond_broadcast(&p->cv);
+    pthread_mutex_unlock(&p->mu);
+}
+
+static int rev_probe_wait(pthread_mutex_t *mu, pthread_cond_t *cv, int (*done)(void *), void *arg, int ms) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += ms / 1000;
+    int rc = 0;
+    pthread_mutex_lock(mu);
+    while (!done(arg) && rc == 0) rc = pthread_cond_timedwait(cv, mu, &ts);
+    int ok_now = done(arg);
+    pthread_mutex_unlock(mu);
+    return ok_now;
+}
+
+struct rev_probe_wait_replies { struct rev_probe *p; int want; };
+static int rev_probe_done_replies(void *a) { struct rev_probe_wait_replies *w = a; return w->p->replies >= w->want; }
+struct rev_probe_wait_active { struct rev_ctx *c; int want; };
+static int rev_probe_done_active(void *a) { struct rev_probe_wait_active *w = a; return w->c->active >= w->want; }
+
+static int test_code_rev_cmd(int argc, char **argv) {
+    if (argc < 5) { fprintf(stderr, "usage: cntctr _test-code-rev <pane|-> <tool> <args-json> | burst <n> | late <n>\n"); return 2; }
+    const char *pane = strcmp(argv[2], "-") ? argv[2] : "";
+    char *pn = *pane ? pane_name(pane) : NULL;
+    struct rev_ctx *c = rev_ctx_new(pane, pn ? pn : "probe");
+    free(pn);
+    struct rev_probe p;
+    memset(&p, 0, sizeof p);
+    pthread_mutex_init(&p.mu, NULL);
+    pthread_cond_init(&p.cv, NULL);
+    int mode_burst = !strcmp(argv[3], "burst"), mode_late = !strcmp(argv[3], "late");
+    int n = (mode_burst || mode_late) ? atoi(argv[4]) : 1;
+    if (n < 1 || n > 64) n = 1;
+    if (mode_burst || mode_late) { pthread_mutex_lock(&c->mu); c->hold = 1; pthread_mutex_unlock(&c->mu); }
+    for (int i = 0; i < n; i++) {
+        json_object *req = json_object_new_object();
+        json_object_object_add(req, "id", json_object_new_int64(100 + i));
+        json_object_object_add(req, "method", json_object_new_string("rev_call"));
+        json_object_object_add(req, "tool", json_object_new_string(mode_burst || mode_late ? "list" : argv[3]));
+        json_object *args = mode_burst || mode_late ? json_object_new_object() : json_tokener_parse(argv[4]);
+        json_object_object_add(req, "args", args ? args : json_object_new_object());
+        code_rev_handler(c, req, rev_probe_reply, &p);
+        json_object_put(req);   /* like code_client_rpc: the handler must have copied what it needs */
+    }
+    int rc = 0;
+    if (mode_burst || mode_late) {
+        struct rev_probe_wait_active wa = {c, n < CODE_REV_MAX_WORKERS ? n : CODE_REV_MAX_WORKERS};
+        rev_probe_wait(&c->mu, &c->cv, rev_probe_done_active, &wa, 10000);
+        if (mode_late) {
+            rev_ctx_close(c);   /* the owner lets go while workers are still held and replies are still pending */
+            c = NULL;
+        } else {
+            pthread_mutex_lock(&c->mu);
+            c->hold = 0;
+            pthread_cond_broadcast(&c->cv);
+            pthread_mutex_unlock(&c->mu);
+        }
+    }
+    struct rev_probe_wait_replies wr = {&p, n};
+    if (!rev_probe_wait(&p.mu, &p.cv, rev_probe_done_replies, &wr, 20000)) { fprintf(stderr, "timed out waiting for replies\n"); rc = 1; }
+    if (mode_burst) {
+        pthread_mutex_lock(&c->mu);
+        int peak = c->peak;
+        pthread_mutex_unlock(&c->mu);
+        printf("burst replies=%d peak=%d\n", p.replies, peak);
+    } else if (mode_late) {
+        printf("late=ok replies=%d\n", p.replies);
+    } else {
+        printf("%s\n", p.first ? p.first : "(no reply)");
+    }
+    if (c) rev_ctx_close(c);
+    /* workers may still be finishing their last unref; give them the replies they already sent */
+    free(p.first);
+    return rc;
+}
+#endif
+
 static int notify_cmd(const char *kind, const char *name, const char *pane) {
     const char *override = getenv("CNTCTR_NOTIFY_COMMAND");
     if (override && *override) {
@@ -5229,7 +8268,7 @@ int main(int argc, char **argv) {
     else if (!realpath(argv[0], notify_executable)) notify_executable[0] = '\0';
 #endif
     if (argc > 1 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
-        puts("usage: cntctr [call <tool> '<json args>' | stats [--since hours] [--all] | usage [--since hours] | hooks | tools]");
+        puts("usage: cntctr [call <tool> '<json args>' | stats [--since hours] [--all] | usage [--since hours] | hooks | tools | code]");
         return 0;
     }
     if (argc > 1 && strcmp(argv[1], "--version") == 0) {
@@ -5242,6 +8281,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     signal(SIGPIPE, SIG_IGN);
+    code_daemon_init(notify_executable, CNTCTR_VERSION, &fork_mu);
     const char *socket = getenv("CNTCTR_TMUX");
     if (socket && *socket) {
         char *tmux = fmt("%s,0,0", socket);
@@ -5249,6 +8289,7 @@ int main(int argc, char **argv) {
         free(tmux);
     }
     if (argc == 5 && !strcmp(argv[1], "_notify")) return notify_cmd(argv[2], argv[3], argv[4]);
+    if (argc == 4 && !strcmp(argv[1], "_code-daemon")) return code_daemon_main(argv[2], argv[3]);
 #ifdef CNTCTR_TEST_HOOKS
     if (argc == 2 && !strcmp(argv[1], "_test-notify")) {
         notify_permission("test-socket", "%42", "test-agent", 1);
@@ -5258,7 +8299,39 @@ int main(int argc, char **argv) {
         notify_reply("test-worker", "%42");
         return 0;
     }
+    if (argc == 2 && !strcmp(argv[1], "_test-qjs")) {
+        JSRuntime *rt = JS_NewRuntime();
+        if (!rt) return 1;
+        JS_SetMemoryLimit(rt, 2 * 1024 * 1024);
+        JSContext *ctx = JS_NewContext(rt);
+        if (!ctx) { JS_FreeRuntime(rt); return 1; }
+        int32_t res = 0;
+        const char *s1 = "1 + 2";
+        JSValue v1 = JS_Eval(ctx, s1, strlen(s1), "<test>", JS_EVAL_TYPE_GLOBAL);
+        if (JS_IsException(v1) || JS_ToInt32(ctx, &res, v1) != 0) {
+            JS_FreeValue(ctx, v1);
+            JS_FreeContext(ctx);
+            JS_FreeRuntime(rt);
+            return 1;
+        }
+        JS_FreeValue(ctx, v1);
+        const char *s2 = "let a=[]; for(;;) a.push(new Array(10000));";
+        JSValue v2 = JS_Eval(ctx, s2, strlen(s2), "<test>", JS_EVAL_TYPE_GLOBAL);
+        int capped = JS_IsException(v2);
+        if (capped) JS_FreeValue(ctx, JS_GetException(ctx));
+        JS_FreeValue(ctx, v2);
+        JS_FreeContext(ctx);
+        JS_FreeRuntime(rt);
+        if (!capped) return 1;
+        printf("ok %d mem_capped\n", (int)res);
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "_test-code-kb")) return test_code_kb_cmd(argc, argv);
+    if (argc > 1 && !strcmp(argv[1], "_test-code-js")) return test_code_js_cmd(argc, argv);
+    if (argc > 1 && !strcmp(argv[1], "_test-code-rpc")) return test_code_rpc_cmd(argc, argv);
+    if (argc > 1 && !strcmp(argv[1], "_test-code-rev")) return test_code_rev_cmd(argc, argv);
 #endif
+    if (argc > 1 && !strcmp(argv[1], "code")) return code_cmd(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "stats")) return stats_cmd(argc, argv);
     if (argc > 1 && !strcmp(argv[1], "usage")) {
         char cwd[PATH_MAX];
