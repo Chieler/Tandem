@@ -1,5 +1,6 @@
 #!/bin/bash
-set -eu
+set -euo pipefail
+export MallocNanoZone=0  # ASan on macOS: silences "nano zone abandoned"; sanitizers stay on
 root=$(cd "$(dirname "$0")" && pwd)
 BIN=${BIN:-$root/cntctr-test}
 case $BIN in /*) ;; *) BIN="$root/$BIN" ;; esac
