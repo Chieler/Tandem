@@ -11,6 +11,7 @@ Releases:
 - `0.5.3`: Sol-review hardening of route overrides (per-thread buffer, validated model and effort, reviewer harness avoids the author's model on every tier).
 - `0.5.4`: lease-based mail delivery (claim, `lease_until`, one reconcile scheduler, bounded idle watcher); retries no longer re-present full bodies; hook-race regressions run in the default suite.
 - `0.5.5`: `cntctr stats` (task turnaround), `cntctr usage` (Claude and Codex token counts per model for the repo and its worktrees), opt-in `CNTCTR_NOTIFY=1` for permission prompts and replies; agy routes to Gemini 4 Hydrogen, Neon for hard work.
+- `0.6.0`: code mode: agents call connected MCP servers from JS scripts (`code_find`, `code_run`, `code_expand`, `code_status`) through a per-user daemon; default-deny grants, orchestrator-only `code_server`/`code_grant`/`code_revoke`, human-only `--all-projects` policy. kb.db schema 8 to 9.
 
 Source: orchestrator feedback, 2026-11-07, ranked by cost.
 

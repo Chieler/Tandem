@@ -41,7 +41,7 @@
 #include "quickjs.h"
 #endif
 
-#define CNTCTR_VERSION "0.5.5"
+#define CNTCTR_VERSION "0.6.0"
 
 static pthread_mutex_t out_mu = PTHREAD_MUTEX_INITIALIZER;   /* one JSON line at a time on stdout */
 static pthread_mutex_t live_mu = PTHREAD_MUTEX_INITIALIZER;
