@@ -6496,6 +6496,7 @@ same "ping" "$out" '{"jsonrpc":"2.0","id":7,"result":{}}'
 out=$(rpc '{"jsonrpc":"2.0","id":2,"method":"tools/list"}')
 for tool in spawn send gather reply list kill note recall read forget project distill post board tool_define tool_verdict tool_revoke use code_find code_run code_expand code_status code_server code_grant code_revoke; do
     if [ "$tool" = tool_verdict ]; then refute "tools/list hides reviewer-only tool_verdict" "$out" "\"name\":\"$tool\""
+    elif [ "${tool#code_}" != "$tool" ]; then refute "tools/list hides $tool without a usable code server" "$out" "\"name\":\"$tool\""
     else check "tools/list has $tool" "$out" "\"name\":\"$tool\""; fi
 done
 out=$(rpc '{"jsonrpc":"2.0","id":3,"method":"nope"}')
@@ -8305,9 +8306,9 @@ idx_lines28=$(printf '%s\n' "$out28" | awk '/^Knowledge index/{flag=1; next} fla
 [ "$idx_lines28" -gt 0 ] && ok_ || bad "T28 instructions include a nonempty knowledge index"
 [ "$idx_lines28" -le 10 ] && ok_ || bad "T28 instructions hold at most 10 index lines" "got $idx_lines28 lines"
 
-# T29: byte budget of built-in tools/list plus instructions. A plain project (no usable code server, not an orchestrator) keeps the
+# T29: byte budget of built-in tools/list (fleet tools excluded) plus instructions. A plain project (no usable code server, not an orchestrator) keeps the
 # original budget; an orchestrator in a project with a granted server also sees the 7 code tools, so it gets its own.
-tools_bytes=$(rpc "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | tail -n 1 | jq -c '.result.tools' | wc -c | tr -d ' ')
+tools_bytes=$(rpc "$INIT" '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | tail -n 1 | jq -c '[.result.tools[] | select(.description | startswith("[fleet]") | not)]' | wc -c | tr -d ' ')
 guide_bytes=$(rpc "$INIT" | tail -n 1 | jq -r '.result.instructions' | awk '{print} /^Knowledge index/{exit}' | wc -c | tr -d ' ')
 total_bytes=$((tools_bytes + guide_bytes))
 [ "$total_bytes" -le 13455 ] && ok_ || bad "T29 byte budget holds" "got $total_bytes > 13455"
@@ -8319,7 +8320,7 @@ orch29_list=$(CNTCTR_TEST_PANE_ROOT_PID=$$ SKIP=1 session "$M3_P29" 2 "$INIT" '{
 orch29_guide=$(CNTCTR_TEST_PANE_ROOT_PID=$$ SKIP=1 session "$M3_P29" 1 "$INIT" | tail -n 1 | jq -r '.result.instructions' | awk '{print} /^Knowledge index/{exit}' | wc -c | tr -d ' ')
 sqx "$CNTCTR_DB" "DELETE FROM code_grants WHERE reg_id='t29reg'; DELETE FROM code_servers WHERE reg_id='t29reg'" >/dev/null
 same "T29 an orchestrator with a granted server lists all 7 code tools" "$(printf '%s' "$orch29_list" | jq -r '[.result.tools[].name | select(startswith("code_"))] | length')" 7
-orch29_total=$(( $(printf '%s' "$orch29_list" | jq -c '.result.tools' | wc -c | tr -d ' ') + orch29_guide ))
+orch29_total=$(( $(printf '%s' "$orch29_list" | jq -c '[.result.tools[] | select(.description | startswith("[fleet]") | not)]' | wc -c | tr -d ' ') + orch29_guide ))
 [ "$orch29_total" -le 16430 ] && ok_ || bad "T29 orchestrator byte budget holds" "got $orch29_total > 16430"
 
 # T30: reviewer's send to="parent" fails and mentions tool_verdict
